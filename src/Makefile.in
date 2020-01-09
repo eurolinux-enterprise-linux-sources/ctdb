@@ -1,0 +1,255 @@
+#!gmake
+
+
+CC = @CC@
+prefix = @prefix@
+exec_prefix = @exec_prefix@
+datarootdir = @datarootdir@
+includedir = @includedir@
+docdir = /usr/share/doc
+libdir = @libdir@
+bindir = @bindir@
+sbindir = @sbindir@
+mandir = @mandir@
+localstatedir = @localstatedir@
+logdir = @LOGDIR@
+VPATH = @srcdir@:@tdbdir@:@tallocdir@:@libreplacedir@:@poptdir@
+srcdir = @srcdir@
+etcdir = @sysconfdir@
+builddir = @builddir@
+DESTDIR = /
+EXTRA_OBJ=@EXTRA_OBJ@
+XSLTPROC = /usr/bin/xsltproc
+INSTALLCMD = @INSTALL@
+
+POPT_LIBS = @POPT_LIBS@
+POPT_CFLAGS = @POPT_CFLAGS@
+POPT_OBJ = @POPT_OBJ@
+
+CFLAGS=-g -I$(srcdir)/include -Iinclude -Ilib -Ilib/util -I$(srcdir) \
+       -I@tallocdir@ -I@tdbdir@/include -I@libreplacedir@ \
+	-DVARDIR=\"$(localstatedir)\" -DETCDIR=\"$(etcdir)\" \
+	-DLOGDIR=\"$(logdir)\" \
+	-DUSE_MMAP=1 @CFLAGS@ $(POPT_CFLAGS)
+
+LIB_FLAGS=@LDFLAGS@ -Llib @LIBS@ $(POPT_LIBS) @INFINIBAND_LIBS@ @CTDB_PCAP_LDFLAGS@
+
+UTIL_OBJ = lib/util/idtree.o lib/util/db_wrap.o lib/util/strlist.o lib/util/util.o \
+	lib/util/util_time.o lib/util/util_file.o lib/util/fault.o lib/util/substitute.o \
+	lib/util/signal.o
+
+CTDB_COMMON_OBJ =  common/ctdb_io.o common/ctdb_util.o \
+	common/ctdb_ltdb.o common/ctdb_message.o common/cmdline.o  \
+	lib/util/debug.o common/rb_tree.o @CTDB_SYSTEM_OBJ@ common/system_common.o \
+	common/ctdb_logging.c
+
+CTDB_TCP_OBJ = tcp/tcp_connect.o tcp/tcp_io.o tcp/tcp_init.o
+
+CTDB_CLIENT_OBJ = client/ctdb_client.o \
+	$(CTDB_COMMON_OBJ) $(POPT_OBJ) $(UTIL_OBJ) @TALLOC_OBJ@ @TDB_OBJ@ \
+	@LIBREPLACEOBJ@ $(EXTRA_OBJ) @EVENTS_OBJ@ 
+
+CTDB_SERVER_OBJ = server/ctdbd.o server/ctdb_daemon.o server/ctdb_lockwait.o \
+	server/ctdb_recoverd.o server/ctdb_recover.o server/ctdb_freeze.o \
+	server/ctdb_tunables.o server/ctdb_monitor.o server/ctdb_server.o \
+	server/ctdb_control.o server/ctdb_call.o server/ctdb_ltdb_server.o \
+	server/ctdb_traverse.o server/eventscript.o server/ctdb_takeover.o \
+	server/ctdb_serverids.o server/ctdb_persistent.o \
+	server/ctdb_keepalive.o server/ctdb_logging.o server/ctdb_uptime.o \
+	server/ctdb_vacuum.o server/ctdb_banning.o \
+	$(CTDB_CLIENT_OBJ) $(CTDB_TCP_OBJ) @INFINIBAND_WRAPPER_OBJ@
+
+TEST_BINS=tests/bin/ctdb_bench tests/bin/ctdb_fetch tests/bin/ctdb_fetch_one \
+	tests/bin/ctdb_store \
+	tests/bin/ctdb_randrec tests/bin/ctdb_persistent \
+	tests/bin/ctdb_traverse tests/bin/rb_test tests/bin/ctdb_transaction \
+	@INFINIBAND_BINS@
+
+BINS = bin/ctdb @CTDB_SCSI_IO@ bin/smnotify bin/ping_pong bin/ltdbtool
+SBINS = bin/ctdbd
+
+DIRS = lib bin tests/bin
+
+.SUFFIXES: .c .o .h .1 .1.xml .1.html
+
+all: showflags dirs doc $(CTDB_SERVER_OBJ) $(CTDB_CLIENT_OBJ) $(BINS) $(SBINS) $(TEST_BINS)
+
+showflags:
+	@echo 'ctdb will be compiled with flags:'
+	@echo '  CFLAGS = $(CFLAGS)'
+	@echo '  LIBS = $(LIBS)'
+
+showlayout::
+	@echo "ctdb will be installed into:"
+	@echo "  prefix:      $(prefix)"
+	@echo "  bindir:      $(bindir)"
+	@echo "  sbindir:     $(sbindir)"
+	@echo "  libdir:      $(libdir)"
+	@echo "  vardir:      $(localstatedir)"
+	@echo "  logdir:      $(logdir)"
+	@echo "  mandir:      $(mandir)"
+	@echo "  etcdir:      $(etcdir)"
+
+.c.o:
+	@echo Compiling $*.c
+	@mkdir -p `dirname $@`
+	@$(CC) $(CFLAGS) -c $< -o $@
+
+dirs:
+	@mkdir -p $(DIRS)
+
+bin/ctdbd: $(CTDB_SERVER_OBJ)
+	@echo Linking $@
+	@$(CC) $(CFLAGS) -o $@ $(CTDB_SERVER_OBJ) $(LIB_FLAGS)
+
+bin/scsi_io: $(CTDB_CLIENT_OBJ) utils/scsi_io/scsi_io.o 
+	@echo Linking $@
+	@$(CC) $(CFLAGS) -o $@ utils/scsi_io/scsi_io.o $(CTDB_CLIENT_OBJ) $(LIB_FLAGS)
+
+bin/ctdb: $(CTDB_CLIENT_OBJ) tools/ctdb.o tools/ctdb_vacuum.o
+	@echo Linking $@
+	@$(CC) $(CFLAGS) -o $@ tools/ctdb.o tools/ctdb_vacuum.o $(CTDB_CLIENT_OBJ) $(LIB_FLAGS)
+
+bin/ltdbtool: tools/ltdbtool.o @TDB_OBJ@
+	@echo Linking $@
+	@$(CC) $(CFLAGS) -o $@ $+
+
+bin/smnotify: utils/smnotify/gen_xdr.o utils/smnotify/gen_smnotify.o utils/smnotify/smnotify.o $(POPT_OBJ)
+	@echo Linking $@
+	@$(CC) $(CFLAGS) -o $@ utils/smnotify/smnotify.o utils/smnotify/gen_xdr.o utils/smnotify/gen_smnotify.o $(POPT_OBJ) $(LIB_FLAGS)
+
+utils/smnotify/smnotify.o: utils/smnotify/smnotify.c utils/smnotify/smnotify.h
+
+utils/smnotify/smnotify.h:  utils/smnotify/smnotify.x
+	@echo Generating $@
+	rpcgen -h utils/smnotify/smnotify.x > utils/smnotify/smnotify.h
+
+utils/smnotify/gen_xdr.c: utils/smnotify/smnotify.x utils/smnotify/smnotify.h
+	@echo Generating $@
+	rpcgen -c utils/smnotify/smnotify.x > utils/smnotify/gen_xdr.c 
+
+utils/smnotify/gen_smnotify.c: utils/smnotify/smnotify.x utils/smnotify/smnotify.h
+	@echo Generating $@
+	rpcgen -l utils/smnotify/smnotify.x > utils/smnotify/gen_smnotify.c 
+
+bin/ping_pong: utils/ping_pong/ping_pong.o
+	@echo Linking $@
+	@$(CC) $(CFLAGS) -o $@ utils/ping_pong/ping_pong.o
+
+
+tests/bin/rb_test: $(CTDB_CLIENT_OBJ) tests/src/rb_test.o 
+	@echo Linking $@
+	@$(CC) $(CFLAGS) -o $@ tests/src/rb_test.o $(CTDB_CLIENT_OBJ) $(LIB_FLAGS)
+
+tests/bin/ctdb_bench: $(CTDB_CLIENT_OBJ) tests/src/ctdb_bench.o 
+	@echo Linking $@
+	@$(CC) $(CFLAGS) -o $@ tests/src/ctdb_bench.o $(CTDB_CLIENT_OBJ) $(LIB_FLAGS)
+
+tests/bin/ctdb_fetch: $(CTDB_CLIENT_OBJ) tests/src/ctdb_fetch.o 
+	@echo Linking $@
+	@$(CC) $(CFLAGS) -o $@ tests/src/ctdb_fetch.o $(CTDB_CLIENT_OBJ) $(LIB_FLAGS)
+
+tests/bin/ctdb_fetch_one: $(CTDB_CLIENT_OBJ) tests/src/ctdb_fetch_one.o 
+	@echo Linking $@
+	@$(CC) $(CFLAGS) -o $@ tests/src/ctdb_fetch_one.o $(CTDB_CLIENT_OBJ) $(LIB_FLAGS)
+
+tests/bin/ctdb_store: $(CTDB_CLIENT_OBJ) tests/src/ctdb_store.o 
+	@echo Linking $@
+	@$(CC) $(CFLAGS) -o $@ tests/src/ctdb_store.o $(CTDB_CLIENT_OBJ) $(LIB_FLAGS)
+
+tests/bin/ctdb_traverse: $(CTDB_CLIENT_OBJ) tests/src/ctdb_traverse.o 
+	@echo Linking $@
+	@$(CC) $(CFLAGS) -o $@ tests/src/ctdb_traverse.o $(CTDB_CLIENT_OBJ) $(LIB_FLAGS)
+
+tests/bin/ctdb_randrec: $(CTDB_CLIENT_OBJ) tests/src/ctdb_randrec.o 
+	@echo Linking $@
+	@$(CC) $(CFLAGS) -o $@ tests/src/ctdb_randrec.o $(CTDB_CLIENT_OBJ) $(LIB_FLAGS)
+
+tests/bin/ctdb_persistent: $(CTDB_CLIENT_OBJ) tests/src/ctdb_persistent.o 
+	@echo Linking $@
+	@$(CC) $(CFLAGS) -o $@ tests/src/ctdb_persistent.o $(CTDB_CLIENT_OBJ) $(LIB_FLAGS)
+
+tests/bin/ctdb_transaction: $(CTDB_CLIENT_OBJ) tests/src/ctdb_transaction.o 
+	@echo Linking $@
+	@$(CC) $(CFLAGS) -o $@ tests/src/ctdb_transaction.o $(CTDB_CLIENT_OBJ) $(LIB_FLAGS)
+
+tests/bin/ibwrapper_test: $(CTDB_CLIENT_OBJ) ib/ibwrapper_test.o
+	@echo Linking $@
+	@$(CC) $(CFLAGS) -o $@ ib/ibwrapper_test.o $(CTDB_CLIENT_OBJ) $(LIB_FLAGS)
+
+.1.xml.1:
+	-test -z "$(XSLTPROC)" || $(XSLTPROC) -o $@ http://docbook.sourceforge.net/release/xsl/current/manpages/docbook.xsl $<
+
+.1.xml.1.html:
+	-test -z "$(XSLTPROC)" || $(XSLTPROC) -o $@ http://docbook.sourceforge.net/release/xsl/current/html/docbook.xsl $<
+
+doc: doc/ctdb.1 doc/ctdb.1.html \
+	doc/ctdbd.1 doc/ctdbd.1.html \
+	doc/onnode.1 doc/onnode.1.html \
+	doc/ltdbtool.1 doc/ltdbtool.1.html
+
+clean:
+	rm -f *.o */*.o */*/*.o */*~
+	rm -f utils/smnotify/gen_xdr.c
+	rm -f $(BINS) $(SBINS) $(TEST_BINS)
+
+distclean: clean
+	rm -f *~ */*~
+	rm -rf bin
+	rm -f config.log config.status config.cache config.h
+	rm -f Makefile
+
+install: all
+	mkdir -p $(DESTDIR)$(libdir)/pkgconfig
+	mkdir -p $(DESTDIR)$(bindir)
+	mkdir -p $(DESTDIR)$(sbindir)
+	mkdir -p $(DESTDIR)$(includedir)
+	mkdir -p $(DESTDIR)$(etcdir)/ctdb
+	mkdir -p $(DESTDIR)$(etcdir)/ctdb/events.d
+	mkdir -p $(DESTDIR)$(docdir)/ctdb
+	${INSTALLCMD} -m 644 ctdb.pc $(DESTDIR)$(libdir)/pkgconfig
+	${INSTALLCMD} -m 755 bin/ctdb $(DESTDIR)$(bindir)
+	${INSTALLCMD} -m 755 bin/ctdbd $(DESTDIR)$(sbindir)
+	${INSTALLCMD} -m 755 bin/smnotify $(DESTDIR)$(bindir)
+	$(INSTALLCMD) -m 755 bin/ping_pong $(DESTDIR)$(bindir)
+	$(INSTALLCMD) -m 755 bin/ltdbtool $(DESTDIR)$(bindir)
+	${INSTALLCMD} -m 644 include/ctdb.h $(DESTDIR)$(includedir)
+	${INSTALLCMD} -m 644 include/ctdb_private.h $(DESTDIR)$(includedir) # for samba3
+	${INSTALLCMD} -m 644 config/functions $(DESTDIR)$(etcdir)/ctdb
+	${INSTALLCMD} -m 755 config/statd-callout $(DESTDIR)$(etcdir)/ctdb
+	${INSTALLCMD} -m 755 config/interface_modify.sh $(DESTDIR)$(etcdir)/ctdb
+	${INSTALLCMD} -m 644 config/events.d/README $(DESTDIR)$(docdir)/ctdb/README.eventscripts
+	${INSTALLCMD} -m 644 doc/recovery-process.txt $(DESTDIR)$(docdir)/ctdb/recovery-process.txt
+	${INSTALLCMD} -m 755 config/events.d/00.ctdb $(DESTDIR)$(etcdir)/ctdb/events.d
+	${INSTALLCMD} -m 755 config/events.d/01.reclock $(DESTDIR)$(etcdir)/ctdb/events.d
+	${INSTALLCMD} -m 755 config/events.d/10.interface $(DESTDIR)$(etcdir)/ctdb/events.d
+	${INSTALLCMD} -m 755 config/events.d/11.natgw $(DESTDIR)$(etcdir)/ctdb/events.d
+	${INSTALLCMD} -m 755 config/events.d/11.routing $(DESTDIR)$(etcdir)/ctdb/events.d
+	${INSTALLCMD} -m 755 config/events.d/13.per_ip_routing $(DESTDIR)$(etcdir)/ctdb/events.d
+	${INSTALLCMD} -m 644 config/events.d/20.multipathd $(DESTDIR)$(etcdir)/ctdb/events.d
+	${INSTALLCMD} -m 644 config/events.d/31.clamd $(DESTDIR)$(etcdir)/ctdb/events.d
+	${INSTALLCMD} -m 755 config/events.d/40.vsftpd $(DESTDIR)$(etcdir)/ctdb/events.d
+	${INSTALLCMD} -m 755 config/events.d/41.httpd $(DESTDIR)$(etcdir)/ctdb/events.d
+	${INSTALLCMD} -m 755 config/events.d/50.samba $(DESTDIR)$(etcdir)/ctdb/events.d
+	${INSTALLCMD} -m 755 config/events.d/60.nfs $(DESTDIR)$(etcdir)/ctdb/events.d
+	${INSTALLCMD} -m 755 config/events.d/61.nfstickle $(DESTDIR)$(etcdir)/ctdb/events.d
+	${INSTALLCMD} -m 755 config/events.d/70.iscsi $(DESTDIR)$(etcdir)/ctdb/events.d
+	${INSTALLCMD} -m 755 config/events.d/91.lvs $(DESTDIR)$(etcdir)/ctdb/events.d
+	${INSTALLCMD} -m 755 tools/ctdb_diagnostics $(DESTDIR)$(bindir)
+	${INSTALLCMD} -m 755 tools/onnode $(DESTDIR)$(bindir)
+	if [ -f doc/ctdb.1 ];then ${INSTALLCMD} -d $(DESTDIR)$(mandir)/man1; fi
+	if [ -f doc/ctdb.1 ];then ${INSTALLCMD} -m 644 doc/ctdb.1 $(DESTDIR)$(mandir)/man1; fi
+	if [ -f doc/ctdbd.1 ];then ${INSTALLCMD} -m 644 doc/ctdbd.1 $(DESTDIR)$(mandir)/man1; fi
+	if [ -f doc/onnode.1 ];then ${INSTALLCMD} -m 644 doc/onnode.1 $(DESTDIR)$(mandir)/man1; fi
+	if [ -f doc/ltdbtool.1 ]; then ${INSTALLCMD} -m 644 doc/ltdbtool.1 $(DESTDIR)$(mandir)/man1; fi
+	if [ ! -f $(DESTDIR)$(etcdir)/ctdb/notify.sh ];then ${INSTALLCMD} -m 755 config/notify.sh $(DESTDIR)$(etcdir)/ctdb; fi
+
+test: all
+	tests/run_tests.sh
+
+valgrindtest: all
+	VALGRIND="valgrind -q --trace-children=yes" tests/run_tests.sh
+
+
+realdistclean: distclean
+	rm -f configure config.h.in ctdb.pc

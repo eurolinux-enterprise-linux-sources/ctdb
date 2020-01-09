@@ -1,0 +1,261 @@
+From 8fed31b23cfabb48aec6d0f296d1987bdd1679f2 Mon Sep 17 00:00:00 2001
+From: Sumit Bose <sbose@redhat.com>
+Date: Wed, 10 Aug 2011 17:53:56 +0200
+Subject: [PATCH] Fixes for various issues found by Coverity
+
+---
+ client/ctdb_client.c      |    2 +-
+ common/ctdb_logging.c     |   13 +++++++++++--
+ lib/tdb/common/tdb.c      |    2 +-
+ lib/util/idtree.c         |    2 +-
+ server/ctdb_banning.c     |    2 +-
+ server/ctdb_daemon.c      |    4 ++++
+ server/ctdb_logging.c     |    4 ++++
+ server/ctdb_ltdb_server.c |    5 ++++-
+ server/ctdb_recover.c     |    4 ++--
+ server/ctdb_recoverd.c    |    4 ++--
+ server/eventscript.c      |    4 +++-
+ tcp/tcp_connect.c         |   10 +++++++++-
+ tests/src/ctdb_fetch.c    |    5 +++++
+ 13 files changed, 48 insertions(+), 13 deletions(-)
+
+diff --git a/client/ctdb_client.c b/client/ctdb_client.c
+index 2d3c176..06c0eec 100644
+--- a/client/ctdb_client.c
++++ b/client/ctdb_client.c
+@@ -3015,7 +3015,7 @@ static void async_callback(struct ctdb_client_control_state *state)
+ 	struct ctdb_context *ctdb = talloc_get_type(state->ctdb, struct ctdb_context);
+ 	int ret;
+ 	TDB_DATA outdata;
+-	int32_t res;
++	int32_t res = -1;
+ 	uint32_t destnode = state->c->hdr.destnode;
+ 
+ 	/* one more node has responded with recmode data */
+diff --git a/common/ctdb_logging.c b/common/ctdb_logging.c
+index ea4d271..3296a17 100644
+--- a/common/ctdb_logging.c
++++ b/common/ctdb_logging.c
+@@ -124,7 +124,7 @@ static void ctdb_collect_log(struct ctdb_context *ctdb, struct ctdb_get_log_addr
+ 		tm = localtime(&log_entries[tmp_entry].t.tv_sec);
+ 		strftime(tbuf, sizeof(tbuf)-1,"%Y/%m/%d %H:%M:%S", tm);
+ 
+-		if (log_entries[tmp_entry].message) {
++		if (log_entries[tmp_entry].message[0] != '\0') {
+ 			count += fprintf(f, "%s:%s %s", tbuf, get_debug_by_level(log_entries[tmp_entry].level), log_entries[tmp_entry].message);
+ 		}
+ 
+@@ -135,9 +135,18 @@ static void ctdb_collect_log(struct ctdb_context *ctdb, struct ctdb_get_log_addr
+ 	}
+ 
+ 	fsize = ftell(f);
++	if (fsize < 0) {
++		fclose(f);
++		DEBUG(DEBUG_ERR,("Cannot get current file position\n"));
++                return;
++	}
+ 	rewind(f);
+ 	data.dptr = talloc_size(NULL, fsize);
+-	CTDB_NO_MEMORY_VOID(ctdb, data.dptr);
++
++	if (data.dptr == NULL) {
++		fclose(f);
++		CTDB_NO_MEMORY_VOID(ctdb, data.dptr);
++	}
+ 	data.dsize = fread(data.dptr, 1, fsize, f);
+ 	fclose(f);
+ 
+diff --git a/lib/tdb/common/tdb.c b/lib/tdb/common/tdb.c
+index 4d8c5fc..eeadf2f 100644
+--- a/lib/tdb/common/tdb.c
++++ b/lib/tdb/common/tdb.c
+@@ -993,7 +993,7 @@ int tdb_repack(struct tdb_context *tdb)
+ bool tdb_write_all(int fd, const void *buf, size_t count)
+ {
+ 	while (count) {
+-		size_t ret;
++		ssize_t ret;
+ 		ret = write(fd, buf, count);
+ 		if (ret < 0)
+ 			return false;
+diff --git a/lib/util/idtree.c b/lib/util/idtree.c
+index 06544e1..108523b 100644
+--- a/lib/util/idtree.c
++++ b/lib/util/idtree.c
+@@ -104,7 +104,7 @@ static int sub_alloc(struct idr_context *idp, void *ptr, int *starting_id)
+ {
+ 	int n, m, sh;
+ 	struct idr_layer *p, *new;
+-	struct idr_layer *pa[MAX_LEVEL];
++	struct idr_layer *pa[MAX_LEVEL+1];
+ 	int l, id, oid;
+ 	uint32_t bm;
+ 
+diff --git a/server/ctdb_banning.c b/server/ctdb_banning.c
+index 35f1784..e7d97c0 100644
+--- a/server/ctdb_banning.c
++++ b/server/ctdb_banning.c
+@@ -74,7 +74,7 @@ int32_t ctdb_control_set_ban_state(struct ctdb_context *ctdb, TDB_DATA indata)
+ 	DEBUG(DEBUG_INFO,("SET BAN STATE\n"));
+ 
+ 	if (bantime->pnn != ctdb->pnn) {
+-		if (bantime->pnn < 0 || bantime->pnn >= ctdb->num_nodes) {
++		if (bantime->pnn >= ctdb->num_nodes) {
+ 			DEBUG(DEBUG_ERR,(__location__ " ERROR: Invalid ban request. PNN:%d is invalid. Max nodes %d\n", bantime->pnn, ctdb->num_nodes));
+ 			return -1;
+ 		}
+diff --git a/server/ctdb_daemon.c b/server/ctdb_daemon.c
+index fdec5ab..0620f04 100644
+--- a/server/ctdb_daemon.c
++++ b/server/ctdb_daemon.c
+@@ -813,6 +813,10 @@ int ctdb_start_daemon(struct ctdb_context *ctdb, bool do_fork, bool use_syslog)
+ 	fde = event_add_fd(ctdb->ev, ctdb, ctdb->daemon.sd, 
+ 			   EVENT_FD_READ|EVENT_FD_AUTOCLOSE, 
+ 			   ctdb_accept_client, ctdb);
++	if (fde == NULL) {
++		DEBUG(DEBUG_CRIT,("Failed to add daemon socket to event loop\n"));
++		exit(1);
++	}
+ 
+ 	/* release any IPs we hold from previous runs of the daemon */
+ 	ctdb_release_all_ips(ctdb);
+diff --git a/server/ctdb_logging.c b/server/ctdb_logging.c
+index a7ca1a1..61c38f6 100644
+--- a/server/ctdb_logging.c
++++ b/server/ctdb_logging.c
+@@ -502,6 +502,10 @@ int ctdb_set_child_logging(struct ctdb_context *ctdb)
+ 	/* We'll fail if stderr/stdout not already open; it's simpler. */
+ 	old_stdout = dup(STDOUT_FILENO);
+ 	old_stderr = dup(STDERR_FILENO);
++        if (old_stdout < 0 || old_stderr < 0) {
++		DEBUG(DEBUG_ERR,(__location__ " Failed to copy files descriptors\n"));
++		return -1;
++        }
+ 	if (dup2(p[1], STDOUT_FILENO) < 0 || dup2(p[1], STDERR_FILENO) < 0) {
+ 		int saved_errno = errno;
+ 		dup2(old_stdout, STDOUT_FILENO);
+diff --git a/server/ctdb_ltdb_server.c b/server/ctdb_ltdb_server.c
+index f7eee75..6856d78 100644
+--- a/server/ctdb_ltdb_server.c
++++ b/server/ctdb_ltdb_server.c
+@@ -1030,7 +1030,10 @@ static int ctdb_attach_persistent(struct ctdb_context *ctdb,
+ 		int invalid_name = 0;
+ 		
+ 		s = talloc_strdup(ctdb, de->d_name);
+-		CTDB_NO_MEMORY(ctdb, s);
++		if (s == NULL) {
++			closedir(d);
++			CTDB_NO_MEMORY(ctdb, s);
++		}
+ 
+ 		/* only accept names ending in .tdb */
+ 		p = strstr(s, ".tdb.");
+diff --git a/server/ctdb_recover.c b/server/ctdb_recover.c
+index ed5c22b..60a0339 100644
+--- a/server/ctdb_recover.c
++++ b/server/ctdb_recover.c
+@@ -340,8 +340,8 @@ static int traverse_pulldb(struct tdb_context *tdb, TDB_DATA key, TDB_DATA data,
+ 	}
+ 	params->pulldata = talloc_realloc_size(NULL, params->pulldata, rec->length + params->len);
+ 	if (params->pulldata == NULL) {
+-		DEBUG(DEBUG_ERR,(__location__ " Failed to expand pulldb_data to %u (%u records)\n", 
+-			 rec->length + params->len, params->pulldata->count));
++		DEBUG(DEBUG_ERR,(__location__ " Failed to expand pulldb_data to %u\n",
++			 rec->length + params->len));
+ 		params->failed = true;
+ 		return -1;
+ 	}
+diff --git a/server/ctdb_recoverd.c b/server/ctdb_recoverd.c
+index 93af64e..18696c5 100644
+--- a/server/ctdb_recoverd.c
++++ b/server/ctdb_recoverd.c
+@@ -1079,8 +1079,8 @@ static int traverse_recdb(struct tdb_context *tdb, TDB_DATA key, TDB_DATA data,
+ 	}
+ 	params->recdata = talloc_realloc_size(NULL, params->recdata, rec->length + params->len);
+ 	if (params->recdata == NULL) {
+-		DEBUG(DEBUG_CRIT,(__location__ " Failed to expand recdata to %u (%u records)\n", 
+-			 rec->length + params->len, params->recdata->count));
++		DEBUG(DEBUG_CRIT,(__location__ " Failed to expand recdata to %u\n",
++			 rec->length + params->len));
+ 		params->failed = true;
+ 		return -1;
+ 	}
+diff --git a/server/eventscript.c b/server/eventscript.c
+index 757b254..182aed6 100644
+--- a/server/eventscript.c
++++ b/server/eventscript.c
+@@ -222,6 +222,7 @@ static struct ctdb_scripts_wire *ctdb_get_script_list(struct ctdb_context *ctdb,
+ 		tree_item = talloc(tree, struct ctdb_script_tree_item);
+ 		if (tree_item == NULL) {
+ 			DEBUG(DEBUG_ERR, (__location__ " Failed to allocate new tree item\n"));
++			closedir(dir);
+ 			talloc_free(tmp_ctx);
+ 			return NULL;
+ 		}
+@@ -234,6 +235,7 @@ static struct ctdb_scripts_wire *ctdb_get_script_list(struct ctdb_context *ctdb,
+ 		tree_item->name = talloc_strdup(tree_item, de->d_name);
+ 		if (tree_item->name == NULL) {
+ 			DEBUG(DEBUG_ERR,(__location__ " Failed to allocate script name.\n"));
++			closedir(dir);
+ 			talloc_free(tmp_ctx);
+ 			return NULL;
+ 		}
+@@ -777,10 +779,10 @@ int ctdb_event_script_args(struct ctdb_context *ctdb, enum ctdb_eventscript_call
+ 	va_start(ap, fmt);
+ 	ret = ctdb_event_script_callback_v(ctdb,
+ 			event_script_callback, &status, false, call, fmt, ap);
++	va_end(ap);
+ 	if (ret != 0) {
+ 		return ret;
+ 	}
+-	va_end(ap);
+ 
+ 	status.status = -1;
+ 	status.done = false;
+diff --git a/tcp/tcp_connect.c b/tcp/tcp_connect.c
+index 43ce850..e3d837a 100644
+--- a/tcp/tcp_connect.c
++++ b/tcp/tcp_connect.c
+@@ -155,6 +155,10 @@ void ctdb_tcp_node_connect(struct event_context *ev, struct timed_event *te,
+ 	}
+ 
+ 	tnode->fd = socket(sock_out.sa.sa_family, SOCK_STREAM, IPPROTO_TCP);
++	if (tnode->fd == -1) {
++		DEBUG(DEBUG_ERR, (__location__ " Failed to create socket.\n"));
++		return;
++	}
+ 	set_nonblocking(tnode->fd);
+ 	set_close_on_exec(tnode->fd);
+ 
+@@ -197,7 +201,11 @@ void ctdb_tcp_node_connect(struct event_context *ev, struct timed_event *te,
+ 	sock_in.ip.sin_len = sockin_size;
+ 	sock_out.ip.sin_len = sockout_size;
+ #endif
+-	bind(tnode->fd, (struct sockaddr *)&sock_in, sockin_size);
++	if (bind(tnode->fd, (struct sockaddr *)&sock_in, sockin_size) != 0) {
++		DEBUG(DEBUG_ERR,(__location__ " Failed to bind() to socket. %s(%d)\n", strerror(errno), errno));
++		close(tnode->fd);
++		return;
++	}
+ 
+ 	if (connect(tnode->fd, (struct sockaddr *)&sock_out, sockout_size) != 0 &&
+ 	    errno != EINPROGRESS) {
+diff --git a/tests/src/ctdb_fetch.c b/tests/src/ctdb_fetch.c
+index 35257e2..6487dc0 100644
+--- a/tests/src/ctdb_fetch.c
++++ b/tests/src/ctdb_fetch.c
+@@ -84,6 +84,11 @@ static void bench_fetch_1node(struct ctdb_context *ctdb)
+ 	data.dptr = (uint8_t *)talloc_asprintf_append((char *)data.dptr, 
+ 						      "msg_count=%d on node %d\n",
+ 						      msg_count, ctdb_get_pnn(ctdb));
++	if (data.dptr == NULL) {
++		printf("Failed to create record\n");
++		talloc_free(tmp_ctx);
++		return;
++	}
+ 	data.dsize = strlen((const char *)data.dptr)+1;
+ 
+ 	ret = ctdb_record_store(h, data);
+-- 
+1.7.6
+

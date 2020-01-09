@@ -1,0 +1,60 @@
+#!/bin/sh
+# ctdb event script for TGTD based iSCSI
+
+. $CTDB_BASE/functions
+
+service_name="iscsi"
+
+ctdb_start_stop_service
+
+[ -z "$CTDB_START_ISCSI_SCRIPTS" ] && {
+	echo "No iscsi start script directory found"
+	exit 0
+}
+
+case "$1" in 
+    recovered)
+	# block the iscsi port
+	iptables -I INPUT 1 -p tcp --dport 3260 -j DROP
+	
+	# shut down the iscsi service
+	killall -9 tgtd >/dev/null 2>/dev/null
+
+	THIS_NODE=`ctdb status | grep "THIS NODE" | sed -e "s/pnn://" -e "s/ .*//"`
+	[ -z $THIS_NODE ] && {
+		echo "70.iscsi: Failed to get node pnn"
+		exit 0
+	}
+
+	# start the iscsi daemon
+	tgtd >/dev/null 2>/dev/null
+
+	for NODE in `ctdb ip | grep -v "Public" | egrep " ${THIS_NODE}$" | sed -e "s/ .*//"`; do
+		[ -f $CTDB_START_ISCSI_SCRIPTS/${NODE}.sh ] && {
+			echo Starting iscsi service for public address $NODE
+			$CTDB_START_ISCSI_SCRIPTS/${NODE}.sh
+		}
+	done
+
+	# remove all iptables rules
+	while iptables -D INPUT -p tcp --dport 3260 -j DROP 2>/dev/null >/dev/null ;  do
+	    :
+	done
+
+	;;
+
+    shutdown)
+	# shutdown iscsi when ctdb goes down
+	killall -9 tgtd >/dev/null 2>/dev/null
+	;;
+
+    monitor)
+	ctdb_check_tcp_ports 3260 || exit $?
+	;;
+
+    *)
+	ctdb_standard_event_handler "$@"
+	;;
+esac
+
+exit 0
