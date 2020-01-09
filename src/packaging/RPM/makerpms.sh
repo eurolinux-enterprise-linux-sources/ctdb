@@ -32,7 +32,7 @@
 #   /usr/src/redhat directory
 #
 
-EXTRA_OPTIONS="$1"
+EXTRA_OPTIONS="$*"
 
 DIRNAME=$(dirname $0)
 TOPDIR=${DIRNAME}/../..
@@ -44,34 +44,30 @@ SPECFILE="ctdb.spec"
 SPECFILE_IN="ctdb.spec.in"
 RPMBUILD="rpmbuild"
 
-GITHASH=".$(git log --pretty=format:%h -1)"
+mkdir -p `rpm --eval %_specdir`
+mkdir -p `rpm --eval %_sourcedir`
+mkdir -p `rpm --eval %_builddir`
+mkdir -p `rpm --eval %_srcrpmdir`
+mkdir -p `rpm --eval %_rpmdir`/noarch
+mkdir -p `rpm --eval %_rpmdir`/i386
+mkdir -p `rpm --eval %_rpmdir`/x86_64
 
-if test "x$USE_GITHASH" = "xno" ; then
-	GITHASH=""
+set -- $(${TOPDIR}/packaging/mkversion.sh ${TOPDIR}/include/ctdb_version.h)
+VERSION=$1
+RELEASE=$2
+if [ -z "$VERSION" -o -z "$RELEASE" ]; then
+    exit 1
 fi
 
-sed -e s/GITHASH/${GITHASH}/g \
+sed -e "s/@VERSION@/$VERSION/g" \
+    -e "s/@RELEASE@/$RELEASE/g" \
 	< ${DIRNAME}/${SPECFILE_IN} \
 	> ${DIRNAME}/${SPECFILE}
 
-VERSION=$(grep ^Version ${DIRNAME}/${SPECFILE} | sed -e 's/^Version:\ \+//')
-RELEASE=$(grep ^Release ${DIRNAME}/${SPECFILE} | sed -e 's/^Release:\ \+//')
-
-if echo | gzip -c --rsyncable - > /dev/null 2>&1 ; then
-	GZIP="gzip -9 --rsyncable"
-else
-	GZIP="gzip -9"
-fi
-
-pushd ${TOPDIR}
-echo -n "Creating ctdb-${VERSION}.tar.gz ... "
-git archive --prefix=ctdb-${VERSION}/ HEAD | ${GZIP} > ${SRCDIR}/ctdb-${VERSION}.tar.gz
-RC=$?
-popd
-echo "Done."
-if [ $RC -ne 0 ]; then
-        echo "Build failed!"
-        exit 1
+${TOPDIR}/packaging/maketarball.sh ${SRCDIR}
+if [ $? -ne 0 ]; then
+	echo "Build failed!"
+	exit 1
 fi
 
 # At this point the SPECDIR and SRCDIR vaiables must have a value!

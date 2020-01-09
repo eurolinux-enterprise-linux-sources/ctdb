@@ -26,7 +26,7 @@ Expected results:
 EOF
 }
 
-. ctdb_test_functions.bash
+. "${TEST_SCRIPTS_DIR}/integration.bash"
 
 ctdb_test_init "$@"
 
@@ -38,9 +38,9 @@ try_command_on_node 0 "$CTDB listnodes"
 num_nodes=$(echo "$out" | wc -l)
 
 echo "Running ctdb_fetch on all $num_nodes nodes."
-try_command_on_node -v -pq all $CTDB_TEST_WRAPPER $VALGRIND ctdb_fetch -n $num_nodes
+try_command_on_node -v -p all $CTDB_TEST_WRAPPER $VALGRIND ctdb_fetch -n $num_nodes
 
-pat='^(Fetch: [[:digit:]]+(\.[[:digit:]]+)? msgs/sec[[:space:]]?|msg_count=[[:digit:]]+ on node [[:digit:]]|Fetching final record|DATA:|Test data|Waiting for cluster[[:space:]]?|)+$'
+pat='^(Fetch: [[:digit:]]+(\.[[:digit:]]+)? msgs/sec[[:space:]]?|msg_count=[[:digit:]]+ on node [[:digit:]]|Fetching final record|DATA:|Test data|Waiting for cluster[[:space:]]?|.*: Reqid wrap!|Sleeping for [[:digit:]]+ seconds|)+$'
 sanity_check_output 1 "$pat" "$out"
 
 # Filter out the performance figures:

@@ -34,7 +34,7 @@ Expected results:
 EOF
 }
 
-. ctdb_test_functions.bash
+. "${TEST_SCRIPTS_DIR}/integration.bash"
 
 ctdb_test_init "$@"
 
@@ -73,7 +73,7 @@ add_ip=""
 # loop through the possible IP addreses.
 for i in $test_node_ips ; do
     prefix="${i%.*}"
-    for j in $(seq 1 254) ; do
+    for j in $(seq 101 199) ; do
 	try="${prefix}.${j}"
 	# Try to make sure it isn't used anywhere!
 
@@ -92,25 +92,29 @@ for i in $test_node_ips ; do
 	# Get the interface details for $i, which our address is a
 	# close relative of.  This should never fail but it can't hurt
 	# to be careful...
-	for k in $all_test_node_ips ; do
-	    if [ "$i" = "${k%/*}" ] ; then
-			# Found one!
-		add_ip="${try}/${k#*/}"
+	try_command_on_node $test_node "ctdb ip -v -Y"
+	while IFS=":" read x ip pnn iface x ; do
+	    if [ "$i" = "$ip" ]; then
+		add_ip="$try/32:$iface"
 		break 3
 	    fi
-	done
+	done <<<"$out"
     done
 done
 
-if [ -n "$add_ip" ] ; then
-    echo "Adding IP: ${add_ip/:/ on interface }"
-    try_command_on_node $test_node $CTDB addip ${add_ip/:/ }
+if [ -z "$add_ip" ] ; then
+    echo "BAD: Unable to find IP address to add."
+    exit 1
+fi
 
-    echo "Waiting for IP to be added..."
-    wait_until 60 ips_are_on_nodeglob $test_node $test_node_ips ${add_ip%/*}
+echo "Adding IP: ${add_ip/:/ on interface }"
+try_command_on_node $test_node $CTDB addip ${add_ip/:/ }
 
+echo "Waiting for IP to be added..."
+if wait_until 60 ips_are_on_nodeglob $test_node ${add_ip%/*} ; then
     echo "That worked!"
 else
-    echo "BAD: Unable to find IP address to add."
-    testfailures=1
+    echo "BAD: IP didn't get added."
+    try_command_on_node $test_node $CTDB ip -n all
+    exit 1
 fi

@@ -20,6 +20,8 @@
 
 #include "includes.h"
 #include "system/network.h"
+#include "system/filesys.h"
+#include <libgen.h>
 
 /*
   uint16 checksum for n bytes
@@ -50,13 +52,16 @@ bool ctdb_sys_have_ip(ctdb_sock_addr *_addr)
 	int ret;
 	ctdb_sock_addr __addr = *_addr;
 	ctdb_sock_addr *addr = &__addr;
+	socklen_t addrlen = 0;
 
 	switch (addr->sa.sa_family) {
 	case AF_INET:
 		addr->ip.sin_port = 0;
+		addrlen = sizeof(struct sockaddr_in);
 		break;
 	case AF_INET6:
 		addr->ip6.sin6_port = 0;
+		addrlen = sizeof(struct sockaddr_in6);
 		break;
 	}
 
@@ -65,8 +70,118 @@ bool ctdb_sys_have_ip(ctdb_sock_addr *_addr)
 		return false;
 	}
 
-	ret = bind(s, (struct sockaddr *)addr, sizeof(ctdb_sock_addr));
+	ret = bind(s, (struct sockaddr *)addr, addrlen);
 
 	close(s);
 	return ret == 0;
+}
+
+
+/* find which interface an ip address is currently assigned to */
+char *ctdb_sys_find_ifname(ctdb_sock_addr *addr)
+{
+	int s;
+	int size;
+	struct ifconf ifc;
+	char *ptr;
+
+	s = socket(AF_INET, SOCK_RAW, htons(IPPROTO_RAW));
+	if (s == -1) {
+		DEBUG(DEBUG_CRIT,(__location__ " failed to open raw socket (%s)\n",
+			 strerror(errno)));
+		return NULL;
+	}
+
+
+	size = sizeof(struct ifreq);
+	ifc.ifc_buf = NULL;
+	ifc.ifc_len = size;
+
+	while(ifc.ifc_len > (size - sizeof(struct ifreq))) {
+		size *= 2;
+
+		free(ifc.ifc_buf);	
+		ifc.ifc_len = size;
+		ifc.ifc_buf = malloc(size);
+		memset(ifc.ifc_buf, 0, size);
+		if (ioctl(s, SIOCGIFCONF, (caddr_t)&ifc) < 0) {
+			DEBUG(DEBUG_CRIT,("Failed to read ifc buffer from socket\n"));
+			free(ifc.ifc_buf);	
+			close(s);
+			return NULL;
+		}
+	}
+
+	for (ptr =(char *)ifc.ifc_buf; ptr < ((char *)ifc.ifc_buf) + ifc.ifc_len; ) {
+		char *ifname;
+		struct ifreq *ifr;
+
+		ifr = (struct ifreq *)ptr;
+
+#ifdef HAVE_SOCKADDR_LEN
+		if (ifr->ifr_addr.sa_len > sizeof(struct sockaddr)) {
+			ptr += sizeof(ifr->ifr_name) + ifr->ifr_addr.sa_len;
+		} else {
+			ptr += sizeof(ifr->ifr_name) + sizeof(struct sockaddr);
+		}
+#else
+		ptr += sizeof(struct ifreq);
+#endif
+
+		if (ifr->ifr_addr.sa_family != addr->sa.sa_family) {
+			continue;
+		}
+
+		switch (addr->sa.sa_family) {
+		case AF_INET:
+
+
+			if (memcmp(&addr->ip.sin_addr, &((struct sockaddr_in *)&ifr->ifr_addr)->sin_addr, sizeof(addr->ip.sin_addr))) {
+				continue;
+			}
+			break;
+		case AF_INET6:
+			if (memcmp(&addr->ip6.sin6_addr, &((struct sockaddr_in6 *)&ifr->ifr_addr)->sin6_addr, sizeof(addr->ip6.sin6_addr))) {
+				continue;
+			}
+			break;
+		}
+
+		ifname = strdup(ifr->ifr_name);
+		free(ifc.ifc_buf);	
+		close(s);
+		return ifname;
+	}
+
+
+	free(ifc.ifc_buf);	
+	close(s);
+
+	return NULL;
+}
+
+int mkdir_p(const char *dir, int mode)
+{
+	char * t;
+	int ret;
+
+	if (strcmp(dir, "/") == 0) {
+		return 0;
+	}
+
+	t = talloc_strdup(NULL, dir);
+	if (t == NULL) {
+		return ENOMEM;
+	}
+	ret = mkdir_p(dirname(t), mode);
+	talloc_free(t);
+
+	if (ret == 0) {
+		ret = mkdir(dir, mode);
+		if ((ret == -1) &&  (errno == EEXIST)) {
+			ret = 0;
+		}
+	}
+
+	return ret;
 }

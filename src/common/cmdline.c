@@ -18,10 +18,9 @@
 */
 
 #include "includes.h"
-#include "lib/events/events.h"
 #include "system/filesys.h"
 #include "popt.h"
-#include "../include/ctdb.h"
+#include "../include/ctdb_client.h"
 #include "../include/ctdb_private.h"
 #include "../common/rb_tree.h"
 #include <ctype.h>
@@ -111,7 +110,8 @@ struct ctdb_context *ctdb_cmdline_init(struct event_context *ev)
 /*
   startup a client only ctdb context
  */
-struct ctdb_context *ctdb_cmdline_client(struct event_context *ev)
+struct ctdb_context *ctdb_cmdline_client(struct tevent_context *ev,
+					 struct timeval req_timeout)
 {
 	struct ctdb_context *ctdb;
 	char *socket_name;
@@ -144,6 +144,13 @@ struct ctdb_context *ctdb_cmdline_client(struct event_context *ev)
 		}
 	}
 
+	/* Set the debug level */
+	if (isalpha(ctdb_cmdline.debuglevel[0]) || ctdb_cmdline.debuglevel[0] == '-') { 
+		LogLevel = get_debug_by_desc(ctdb_cmdline.debuglevel);
+	} else {
+		LogLevel = strtol(ctdb_cmdline.debuglevel, NULL, 0);
+	}
+
 	ret = ctdb_socket_connect(ctdb);
 	if (ret != 0) {
 		fprintf(stderr, __location__ " Failed to connect to daemon\n");
@@ -152,7 +159,7 @@ struct ctdb_context *ctdb_cmdline_client(struct event_context *ev)
 	}
 
 	/* get our pnn */
-	ctdb->pnn = ctdb_ctrl_getpnn(ctdb, timeval_current_ofs(3, 0), CTDB_CURRENT_NODE);
+	ctdb->pnn = ctdb_ctrl_getpnn(ctdb, req_timeout, CTDB_CURRENT_NODE);
 	if (ctdb->pnn == (uint32_t)-1) {
 		DEBUG(DEBUG_CRIT,(__location__ " Failed to get ctdb pnn\n"));
 		talloc_free(ctdb);

@@ -109,8 +109,7 @@ _PUBLIC_ void call_backtrace(void)
      }
 #undef NAMESIZE
 #else
-	DEBUG(0, ("call_backstrace: not implemented\n"));
-#error bla
+	DEBUG(0, ("call_backtrace: not implemented\n"));
 #endif
 }
 
@@ -158,7 +157,7 @@ _PUBLIC_ void smb_panic(const char *why)
 	call_backtrace();
 
 #ifdef SIGABRT
-	CatchSignal(SIGABRT,SIGNAL_CAST SIG_DFL);
+	CatchSignal(SIGABRT, SIG_DFL);
 #endif
 	abort();
 }
@@ -204,16 +203,16 @@ _PUBLIC_ void fault_setup(const char *pname)
 		progname = pname;
 	}
 #ifdef SIGSEGV
-	CatchSignal(SIGSEGV,SIGNAL_CAST sig_fault);
+	CatchSignal(SIGSEGV, sig_fault);
 #endif
 #ifdef SIGBUS
-	CatchSignal(SIGBUS,SIGNAL_CAST sig_fault);
+	CatchSignal(SIGBUS, sig_fault);
 #endif
 #ifdef SIGABRT
-	CatchSignal(SIGABRT,SIGNAL_CAST sig_fault);
+	CatchSignal(SIGABRT, sig_fault);
 #endif
 #ifdef SIGFPE
-	CatchSignal(SIGFPE,SIGNAL_CAST sig_fault);
+	CatchSignal(SIGFPE, sig_fault);
 #endif
 }
 

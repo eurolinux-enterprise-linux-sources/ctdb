@@ -18,10 +18,9 @@
 */
 
 #include "includes.h"
-#include "lib/events/events.h"
 #include "system/filesys.h"
 #include "system/network.h"
-#include "../include/ctdb.h"
+#include "../include/ctdb_client.h"
 #include "../include/ctdb_private.h"
 #include "../common/rb_tree.h"
 #include "db_wrap.h"
@@ -30,16 +29,7 @@
 #define TIMELIMIT() timeval_current_ofs(10, 0)
 
 
-/*
-  vacuum all our databases
- */
-int ctdb_vacuum(struct ctdb_context *ctdb, int argc, const char **argv)
-{
-	printf("\"ctdb vacuum\" is not implemented any more.\n");
-	return 0;
-}
-
-struct traverse_state {
+struct vacuum_traverse_state {
 	bool error;
 	struct tdb_context *dest_db;
 };
@@ -49,7 +39,7 @@ struct traverse_state {
  */
 static int repack_traverse(struct tdb_context *tdb, TDB_DATA key, TDB_DATA data, void *private)
 {
-	struct traverse_state *state = (struct traverse_state *)private;
+	struct vacuum_traverse_state *state = (struct vacuum_traverse_state *)private;
 	if (tdb_store(state->dest_db, key, data, TDB_INSERT) != 0) {
 		state->error = true;
 		return -1;
@@ -63,7 +53,7 @@ static int repack_traverse(struct tdb_context *tdb, TDB_DATA key, TDB_DATA data,
 static int ctdb_repack_tdb(struct tdb_context *tdb)
 {
 	struct tdb_context *tmp_db;
-	struct traverse_state state;
+	struct vacuum_traverse_state state;
 
 	if (tdb_transaction_start(tdb) != 0) {
 		DEBUG(DEBUG_ERR,(__location__ " Failed to start transaction\n"));
@@ -144,7 +134,7 @@ static int ctdb_repack_db(struct ctdb_context *ctdb, uint32_t db_id,
 		return -1;
 	}
 
-	ctdb_db = ctdb_attach(ctdb, name, persistent, 0);
+	ctdb_db = ctdb_attach(ctdb, TIMELIMIT(), name, persistent, 0);
 	if (ctdb_db == NULL) {
 		DEBUG(DEBUG_ERR,(__location__ " Failed to attach to database '%s'\n", name));
 		return -1;
@@ -193,7 +183,7 @@ int ctdb_repack(struct ctdb_context *ctdb, int argc, const char **argv)
 
 	for (i=0;i<dbmap->num;i++) {
 		if (ctdb_repack_db(ctdb, dbmap->dbs[i].dbid, 
-				   dbmap->dbs[i].persistent, repack_limit) != 0) {
+				   dbmap->dbs[i].flags & CTDB_DB_FLAGS_PERSISTENT, repack_limit) != 0) {
 			DEBUG(DEBUG_ERR,("Failed to repack db 0x%x\n", dbmap->dbs[i].dbid));
 			return -1;
 		}

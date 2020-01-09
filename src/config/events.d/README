@@ -13,6 +13,8 @@ As a special case, any eventscript that ends with a '~' character will be
 ignored since this is a common postfix that some editors will append to 
 older versions of a file.
 
+Only event scripts with executable permissions are run from CTDB. Any event
+script that does not have executable permission is ignored.
 
 The eventscripts are called with varying number of arguments.
 The first argument is the "event" and the rest of the arguments depend
@@ -29,15 +31,13 @@ init
 	and prepare the basic setup.
 	At this stage 'ctdb' commands won't work.
 
-	Example: 00.ctdb cleans up $CTDB_BASE/state
+	Example: 00.ctdb cleans up $CTDB_VARDIR/state
 
 setup
 	This event does not take any additional arguments.
-	This event is only invoked once, when ctdb is starting up.
-	This event is used to do some cleanup work from earlier runs
-	and prepare the basic setup.
-
-	Example: 00.ctdb cleans up $CTDB_BASE/state
+	This event is only invoked once, after init event is completed.
+	This event is used to do setup any tunables defined in ctdb 
+        configuration file.
 
 startup
 	This event does not take any additional arguments.
@@ -146,12 +146,11 @@ recovered
 	service and also send out statd notifications to all registered 
 	clients.
 	
-stopped
-	This event is called when a node is STOPPED and can be used to
-	perform additional cleanup that is required.
-	Note that a stopped node is considered inactive, so it will not
-	be issuing the recovered event once the cluster has recovered.
-	See 91.lvs for a use of this event.
+ipreallocated
+
+	This event is triggered after releaseip and takeip events in a
+	takeover run.  It can be used to reconfigure services, update
+	routing and many other things.
 
 Additional note for takeip, releaseip, recovered:
 

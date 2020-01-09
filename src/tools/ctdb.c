@@ -19,14 +19,14 @@
 */
 
 #include "includes.h"
-#include "lib/events/events.h"
 #include "system/time.h"
 #include "system/filesys.h"
 #include "system/network.h"
 #include "system/locale.h"
 #include "popt.h"
 #include "cmdline.h"
-#include "../include/ctdb.h"
+#include "../include/ctdb_version.h"
+#include "../include/ctdb_client.h"
 #include "../include/ctdb_private.h"
 #include "../common/rb_tree.h"
 #include "db_wrap.h"
@@ -40,6 +40,7 @@ static void usage(void);
 static struct {
 	int timelimit;
 	uint32_t pnn;
+	uint32_t *nodes;
 	int machinereadable;
 	int verbose;
 	int maxruntime;
@@ -50,88 +51,309 @@ static struct {
 	int printrecordflags;
 } options;
 
-#define TIMELIMIT() timeval_current_ofs(options.timelimit, 0)
-#define LONGTIMELIMIT() timeval_current_ofs(options.timelimit*10, 0)
+#define LONGTIMEOUT options.timelimit*10
 
-#ifdef CTDB_VERS
+#define TIMELIMIT() timeval_current_ofs(options.timelimit, 0)
+#define LONGTIMELIMIT() timeval_current_ofs(LONGTIMEOUT, 0)
+
 static int control_version(struct ctdb_context *ctdb, int argc, const char **argv)
 {
-#define STR(x) #x
-#define XSTR(x) STR(x)
-	printf("CTDB version: %s\n", XSTR(CTDB_VERS));
+	printf("CTDB version: %s\n", CTDB_VERSION_STRING);
 	return 0;
 }
-#endif
 
+#define CTDB_NOMEM_ABORT(p) do { if (!(p)) {				\
+		DEBUG(DEBUG_ALERT,("ctdb fatal error: %s\n",		\
+				   "Out of memory in " __location__ ));	\
+		abort();						\
+	}} while (0)
 
-/*
-  verify that a node exists and is reachable
- */
-static void verify_node(struct ctdb_context *ctdb)
+static uint32_t getpnn(struct ctdb_context *ctdb)
 {
-	int ret;
-	struct ctdb_node_map *nodemap=NULL;
+	if ((options.pnn == CTDB_BROADCAST_ALL) ||
+	    (options.pnn == CTDB_MULTICAST)) {
+		DEBUG(DEBUG_ERR,
+		      ("Cannot get PNN for node %u\n", options.pnn));
+		exit(1);
+	}
 
 	if (options.pnn == CTDB_CURRENT_NODE) {
-		return;
+		return ctdb_get_pnn(ctdb);
+	} else {
+		return options.pnn;
 	}
-	if (options.pnn == CTDB_BROADCAST_ALL) {
-		return;
+}
+
+static void assert_single_node_only(void)
+{
+	if ((options.pnn == CTDB_BROADCAST_ALL) ||
+	    (options.pnn == CTDB_MULTICAST)) {
+		DEBUG(DEBUG_ERR,
+		      ("This control can not be applied to multiple PNNs\n"));
+		exit(1);
+	}
+}
+
+/* Pretty print the flags to a static buffer in human-readable format.
+ * This never returns NULL!
+ */
+static const char *pretty_print_flags(uint32_t flags)
+{
+	int j;
+	static const struct {
+		uint32_t flag;
+		const char *name;
+	} flag_names[] = {
+		{ NODE_FLAGS_DISCONNECTED,	    "DISCONNECTED" },
+		{ NODE_FLAGS_PERMANENTLY_DISABLED,  "DISABLED" },
+		{ NODE_FLAGS_BANNED,		    "BANNED" },
+		{ NODE_FLAGS_UNHEALTHY,		    "UNHEALTHY" },
+		{ NODE_FLAGS_DELETED,		    "DELETED" },
+		{ NODE_FLAGS_STOPPED,		    "STOPPED" },
+		{ NODE_FLAGS_INACTIVE,		    "INACTIVE" },
+	};
+	static char flags_str[512]; /* Big enough to contain all flag names */
+
+	flags_str[0] = '\0';
+	for (j=0;j<ARRAY_SIZE(flag_names);j++) {
+		if (flags & flag_names[j].flag) {
+			if (flags_str[0] == '\0') {
+				(void) strcpy(flags_str, flag_names[j].name);
+			} else {
+				(void) strncat(flags_str, "|", sizeof(flags_str)-1);
+				(void) strncat(flags_str, flag_names[j].name,
+					       sizeof(flags_str)-1);
+			}
+		}
+	}
+	if (flags_str[0] == '\0') {
+		(void) strcpy(flags_str, "OK");
 	}
 
-	/* verify the node exists */
-	if (ctdb_ctrl_getnodemap(ctdb, TIMELIMIT(), CTDB_CURRENT_NODE, ctdb, &nodemap) != 0) {
+	return flags_str;
+}
+
+static int h2i(char h)
+{
+	if (h >= 'a' && h <= 'f') return h - 'a' + 10;
+	if (h >= 'A' && h <= 'F') return h - 'f' + 10;
+	return h - '0';
+}
+
+static TDB_DATA hextodata(TALLOC_CTX *mem_ctx, const char *str)
+{
+	int i, len;
+	TDB_DATA key = {NULL, 0};
+
+	len = strlen(str);
+	if (len & 0x01) {
+		DEBUG(DEBUG_ERR,("Key specified with odd number of hexadecimal digits\n"));
+		return key;
+	}
+
+	key.dsize = len>>1;
+	key.dptr  = talloc_size(mem_ctx, key.dsize);
+
+	for (i=0; i < len/2; i++) {
+		key.dptr[i] = h2i(str[i*2]) << 4 | h2i(str[i*2+1]);
+	}
+	return key;
+}
+
+/* Parse a nodestring.  Parameter dd_ok controls what happens to nodes
+ * that are disconnected or deleted.  If dd_ok is true those nodes are
+ * included in the output list of nodes.  If dd_ok is false, those
+ * nodes are filtered from the "all" case and cause an error if
+ * explicitly specified.
+ */
+static bool parse_nodestring(struct ctdb_context *ctdb,
+			     TALLOC_CTX *mem_ctx,
+			     const char * nodestring,
+			     uint32_t current_pnn,
+			     bool dd_ok,
+			     uint32_t **nodes,
+			     uint32_t *pnn_mode)
+{
+	TALLOC_CTX *tmp_ctx = talloc_new(mem_ctx);
+	int n;
+	uint32_t i;
+	struct ctdb_node_map *nodemap;
+	int ret;
+
+	*nodes = NULL;
+
+	ret = ctdb_ctrl_getnodemap(ctdb, TIMELIMIT(), CTDB_CURRENT_NODE, tmp_ctx, &nodemap);
+	if (ret != 0) {
 		DEBUG(DEBUG_ERR, ("Unable to get nodemap from local node\n"));
+		talloc_free(tmp_ctx);
 		exit(10);
-	}
-	if (options.pnn >= nodemap->num) {
-		DEBUG(DEBUG_ERR, ("Node %u does not exist\n", options.pnn));
-		exit(ERR_NONODE);
-	}
-	if (nodemap->nodes[options.pnn].flags & NODE_FLAGS_DELETED) {
-		DEBUG(DEBUG_ERR, ("Node %u is DELETED\n", options.pnn));
-		exit(ERR_DISNODE);
-	}
-	if (nodemap->nodes[options.pnn].flags & NODE_FLAGS_DISCONNECTED) {
-		DEBUG(DEBUG_ERR, ("Node %u is DISCONNECTED\n", options.pnn));
-		exit(ERR_DISNODE);
 	}
 
-	/* verify we can access the node */
-	ret = ctdb_ctrl_getpnn(ctdb, TIMELIMIT(), options.pnn);
-	if (ret == -1) {
-		DEBUG(DEBUG_ERR,("Can not ban node. Node is not operational.\n"));
-		exit(10);
+	if (nodestring != NULL) {
+		*nodes = talloc_array(mem_ctx, uint32_t, 0);
+		if (*nodes == NULL) {
+			goto failed;
+		}
+
+		n = 0;
+
+		if (strcmp(nodestring, "all") == 0) {
+			*pnn_mode = CTDB_BROADCAST_ALL;
+
+			/* all */
+			for (i = 0; i < nodemap->num; i++) {
+				if ((nodemap->nodes[i].flags &
+				     (NODE_FLAGS_DISCONNECTED |
+				      NODE_FLAGS_DELETED)) && !dd_ok) {
+					continue;
+				}
+				*nodes = talloc_realloc(mem_ctx, *nodes,
+							uint32_t, n+1);
+				if (*nodes == NULL) {
+					goto failed;
+				}
+				(*nodes)[n] = i;
+				n++;
+			}
+		} else {
+			/* x{,y...} */
+			char *ns, *tok;
+
+			ns = talloc_strdup(tmp_ctx, nodestring);
+			tok = strtok(ns, ",");
+			while (tok != NULL) {
+				uint32_t pnn;
+				char *endptr;
+				i = (uint32_t)strtoul(tok, &endptr, 0);
+				if (i == 0 && tok == endptr) {
+					DEBUG(DEBUG_ERR,
+					      ("Invalid node %s\n", tok));
+					talloc_free(tmp_ctx);
+					exit(ERR_NONODE);
+				}
+				if (i >= nodemap->num) {
+					DEBUG(DEBUG_ERR, ("Node %u does not exist\n", i));
+					talloc_free(tmp_ctx);
+					exit(ERR_NONODE);
+				}
+				if ((nodemap->nodes[i].flags & 
+				     (NODE_FLAGS_DISCONNECTED |
+				      NODE_FLAGS_DELETED)) && !dd_ok) {
+					DEBUG(DEBUG_ERR, ("Node %u has status %s\n", i, pretty_print_flags(nodemap->nodes[i].flags)));
+					talloc_free(tmp_ctx);
+					exit(ERR_DISNODE);
+				}
+				if ((pnn = ctdb_ctrl_getpnn(ctdb, TIMELIMIT(), i)) < 0) {
+					DEBUG(DEBUG_ERR, ("Can not access node %u. Node is not operational.\n", i));
+					talloc_free(tmp_ctx);
+					exit(10);
+				}
+
+				*nodes = talloc_realloc(mem_ctx, *nodes,
+							uint32_t, n+1);
+				if (*nodes == NULL) {
+					goto failed;
+				}
+
+				(*nodes)[n] = i;
+				n++;
+
+				tok = strtok(NULL, ",");
+			}
+			talloc_free(ns);
+
+			if (n == 1) {
+				*pnn_mode = (*nodes)[0];
+			} else {
+				*pnn_mode = CTDB_MULTICAST;
+			}
+		}
+	} else {
+		/* default - no nodes specified */
+		*nodes = talloc_array(mem_ctx, uint32_t, 1);
+		if (*nodes == NULL) {
+			goto failed;
+		}
+		*pnn_mode = CTDB_CURRENT_NODE;
+
+		if (((*nodes)[0] = ctdb_ctrl_getpnn(ctdb, TIMELIMIT(), current_pnn)) < 0) {
+			goto failed;
+		}
 	}
+
+	talloc_free(tmp_ctx);
+	return true;
+
+failed:
+	talloc_free(tmp_ctx);
+	return false;
 }
 
 /*
  check if a database exists
 */
-static int db_exists(struct ctdb_context *ctdb, const char *db_name, bool *persistent)
+static bool db_exists(struct ctdb_context *ctdb, const char *dbarg,
+		      uint32_t *dbid, const char **dbname, uint8_t *flags)
 {
 	int i, ret;
 	struct ctdb_dbid_map *dbmap=NULL;
+	bool dbid_given = false, found = false;
+	uint32_t id;
+	TALLOC_CTX *tmp_ctx = talloc_new(ctdb);
+	const char *name;
 
-	ret = ctdb_ctrl_getdbmap(ctdb, TIMELIMIT(), options.pnn, ctdb, &dbmap);
+	ret = ctdb_ctrl_getdbmap(ctdb, TIMELIMIT(), options.pnn, tmp_ctx, &dbmap);
 	if (ret != 0) {
 		DEBUG(DEBUG_ERR, ("Unable to get dbids from node %u\n", options.pnn));
-		return -1;
+		goto fail;
 	}
 
-	for(i=0;i<dbmap->num;i++){
-		const char *name;
+	if (strncmp(dbarg, "0x", 2) == 0) {
+		id = strtoul(dbarg, NULL, 0);
+		dbid_given = true;
+	}
 
-		ctdb_ctrl_getdbname(ctdb, TIMELIMIT(), options.pnn, dbmap->dbs[i].dbid, ctdb, &name);
-		if (!strcmp(name, db_name)) {
-			if (persistent) {
-				*persistent = dbmap->dbs[i].persistent;
+	for(i=0; i<dbmap->num; i++) {
+		if (dbid_given) {
+			if (id == dbmap->dbs[i].dbid) {
+				found = true;
+				break;
 			}
-			return 0;
+		} else {
+			ret = ctdb_ctrl_getdbname(ctdb, TIMELIMIT(), options.pnn, dbmap->dbs[i].dbid, tmp_ctx, &name);
+			if (ret != 0) {
+				DEBUG(DEBUG_ERR, ("Unable to get dbname from dbid %u\n", dbmap->dbs[i].dbid));
+				goto fail;
+			}
+
+			if (strcmp(name, dbarg) == 0) {
+				id = dbmap->dbs[i].dbid;
+				found = true;
+				break;
+			}
 		}
 	}
 
-	return -1;
+	if (found && dbid_given && dbname != NULL) {
+		ret = ctdb_ctrl_getdbname(ctdb, TIMELIMIT(), options.pnn, dbmap->dbs[i].dbid, tmp_ctx, &name);
+		if (ret != 0) {
+			DEBUG(DEBUG_ERR, ("Unable to get dbname from dbid %u\n", dbmap->dbs[i].dbid));
+			found = false;
+			goto fail;
+		}
+	}
+
+	if (found) {
+		if (dbid) *dbid = id;
+		if (dbname) *dbname = talloc_strdup(ctdb, name);
+		if (flags) *flags = dbmap->dbs[i].flags;
+	} else {
+		DEBUG(DEBUG_ERR,("No database matching '%s' found\n", dbarg));
+	}
+
+fail:
+	talloc_free(tmp_ctx);
+	return found;
 }
 
 /*
@@ -162,12 +384,13 @@ static int control_process_exists(struct ctdb_context *ctdb, int argc, const cha
 /*
   display statistics structure
  */
-static void show_statistics(struct ctdb_statistics *s)
+static void show_statistics(struct ctdb_statistics *s, int show_header)
 {
 	TALLOC_CTX *tmp_ctx = talloc_new(NULL);
 	int i;
 	const char *prefix=NULL;
 	int preflen=0;
+	int tmp, days, hours, minutes, seconds;
 	const struct {
 		const char *name;
 		uint32_t offset;
@@ -176,6 +399,7 @@ static void show_statistics(struct ctdb_statistics *s)
 		STATISTICS_FIELD(num_clients),
 		STATISTICS_FIELD(frozen),
 		STATISTICS_FIELD(recovering),
+		STATISTICS_FIELD(num_recoveries),
 		STATISTICS_FIELD(client_packets_sent),
 		STATISTICS_FIELD(client_packets_recv),
 		STATISTICS_FIELD(node_packets_sent),
@@ -196,38 +420,130 @@ static void show_statistics(struct ctdb_statistics *s)
 		STATISTICS_FIELD(timeouts.call),
 		STATISTICS_FIELD(timeouts.control),
 		STATISTICS_FIELD(timeouts.traverse),
+		STATISTICS_FIELD(locks.num_calls),
+		STATISTICS_FIELD(locks.num_current),
+		STATISTICS_FIELD(locks.num_pending),
+		STATISTICS_FIELD(locks.num_failed),
 		STATISTICS_FIELD(total_calls),
 		STATISTICS_FIELD(pending_calls),
-		STATISTICS_FIELD(lockwait_calls),
-		STATISTICS_FIELD(pending_lockwait_calls),
 		STATISTICS_FIELD(childwrite_calls),
 		STATISTICS_FIELD(pending_childwrite_calls),
 		STATISTICS_FIELD(memory_used),
 		STATISTICS_FIELD(max_hop_count),
+		STATISTICS_FIELD(total_ro_delegations),
+		STATISTICS_FIELD(total_ro_revokes),
 	};
-	printf("CTDB version %u\n", CTDB_VERSION);
-	for (i=0;i<ARRAY_SIZE(fields);i++) {
-		if (strchr(fields[i].name, '.')) {
-			preflen = strcspn(fields[i].name, ".")+1;
-			if (!prefix || strncmp(prefix, fields[i].name, preflen) != 0) {
-				prefix = fields[i].name;
-				printf(" %*.*s\n", preflen-1, preflen-1, fields[i].name);
-			}
-		} else {
-			preflen = 0;
-		}
-		printf(" %*s%-22s%*s%10u\n", 
-		       preflen?4:0, "",
-		       fields[i].name+preflen, 
-		       preflen?0:4, "",
-		       *(uint32_t *)(fields[i].offset+(uint8_t *)s));
-	}
-	printf(" %-30s     %.6f sec\n", "max_reclock_ctdbd", s->reclock.ctdbd);
-	printf(" %-30s     %.6f sec\n", "max_reclock_recd", s->reclock.recd);
+	
+	tmp = s->statistics_current_time.tv_sec - s->statistics_start_time.tv_sec;
+	seconds = tmp%60;
+	tmp    /= 60;
+	minutes = tmp%60;
+	tmp    /= 60;
+	hours   = tmp%24;
+	tmp    /= 24;
+	days    = tmp;
 
-	printf(" %-30s     %.6f sec\n", "max_call_latency", s->max_call_latency);
-	printf(" %-30s     %.6f sec\n", "max_lockwait_latency", s->max_lockwait_latency);
-	printf(" %-30s     %.6f sec\n", "max_childwrite_latency", s->max_childwrite_latency);
+	if (options.machinereadable){
+		if (show_header) {
+			printf("CTDB version:");
+			printf("Current time of statistics:");
+			printf("Statistics collected since:");
+			for (i=0;i<ARRAY_SIZE(fields);i++) {
+				printf("%s:", fields[i].name);
+			}
+			printf("num_reclock_ctdbd_latency:");
+			printf("min_reclock_ctdbd_latency:");
+			printf("avg_reclock_ctdbd_latency:");
+			printf("max_reclock_ctdbd_latency:");
+
+			printf("num_reclock_recd_latency:");
+			printf("min_reclock_recd_latency:");
+			printf("avg_reclock_recd_latency:");
+			printf("max_reclock_recd_latency:");
+
+			printf("num_call_latency:");
+			printf("min_call_latency:");
+			printf("avg_call_latency:");
+			printf("max_call_latency:");
+
+			printf("num_lockwait_latency:");
+			printf("min_lockwait_latency:");
+			printf("avg_lockwait_latency:");
+			printf("max_lockwait_latency:");
+
+			printf("num_childwrite_latency:");
+			printf("min_childwrite_latency:");
+			printf("avg_childwrite_latency:");
+			printf("max_childwrite_latency:");
+			printf("\n");
+		}
+		printf("%d:", CTDB_VERSION);
+		printf("%d:", (int)s->statistics_current_time.tv_sec);
+		printf("%d:", (int)s->statistics_start_time.tv_sec);
+		for (i=0;i<ARRAY_SIZE(fields);i++) {
+			printf("%d:", *(uint32_t *)(fields[i].offset+(uint8_t *)s));
+		}
+		printf("%d:", s->reclock.ctdbd.num);
+		printf("%.6f:", s->reclock.ctdbd.min);
+		printf("%.6f:", s->reclock.ctdbd.num?s->reclock.ctdbd.total/s->reclock.ctdbd.num:0.0);
+		printf("%.6f:", s->reclock.ctdbd.max);
+
+		printf("%d:", s->reclock.recd.num);
+		printf("%.6f:", s->reclock.recd.min);
+		printf("%.6f:", s->reclock.recd.num?s->reclock.recd.total/s->reclock.recd.num:0.0);
+		printf("%.6f:", s->reclock.recd.max);
+
+		printf("%d:", s->call_latency.num);
+		printf("%.6f:", s->call_latency.min);
+		printf("%.6f:", s->call_latency.num?s->call_latency.total/s->call_latency.num:0.0);
+		printf("%.6f:", s->call_latency.max);
+
+		printf("%d:", s->childwrite_latency.num);
+		printf("%.6f:", s->childwrite_latency.min);
+		printf("%.6f:", s->childwrite_latency.num?s->childwrite_latency.total/s->childwrite_latency.num:0.0);
+		printf("%.6f:", s->childwrite_latency.max);
+		printf("\n");
+	} else {
+		printf("CTDB version %u\n", CTDB_VERSION);
+		printf("Current time of statistics  :                %s", ctime(&s->statistics_current_time.tv_sec));
+		printf("Statistics collected since  : (%03d %02d:%02d:%02d) %s", days, hours, minutes, seconds, ctime(&s->statistics_start_time.tv_sec));
+
+		for (i=0;i<ARRAY_SIZE(fields);i++) {
+			if (strchr(fields[i].name, '.')) {
+				preflen = strcspn(fields[i].name, ".")+1;
+				if (!prefix || strncmp(prefix, fields[i].name, preflen) != 0) {
+					prefix = fields[i].name;
+					printf(" %*.*s\n", preflen-1, preflen-1, fields[i].name);
+				}
+			} else {
+				preflen = 0;
+			}
+			printf(" %*s%-22s%*s%10u\n", 
+			       preflen?4:0, "",
+			       fields[i].name+preflen, 
+			       preflen?0:4, "",
+			       *(uint32_t *)(fields[i].offset+(uint8_t *)s));
+		}
+		printf(" hop_count_buckets:");
+		for (i=0;i<MAX_COUNT_BUCKETS;i++) {
+			printf(" %d", s->hop_count_bucket[i]);
+		}
+		printf("\n");
+		printf(" lock_buckets:");
+		for (i=0; i<MAX_COUNT_BUCKETS; i++) {
+			printf(" %d", s->locks.buckets[i]);
+		}
+		printf("\n");
+		printf(" %-30s     %.6f/%.6f/%.6f sec out of %d\n", "locks_latency      MIN/AVG/MAX", s->locks.latency.min, s->locks.latency.num?s->locks.latency.total/s->locks.latency.num:0.0, s->locks.latency.max, s->locks.latency.num);
+
+		printf(" %-30s     %.6f/%.6f/%.6f sec out of %d\n", "reclock_ctdbd      MIN/AVG/MAX", s->reclock.ctdbd.min, s->reclock.ctdbd.num?s->reclock.ctdbd.total/s->reclock.ctdbd.num:0.0, s->reclock.ctdbd.max, s->reclock.ctdbd.num);
+
+		printf(" %-30s     %.6f/%.6f/%.6f sec out of %d\n", "reclock_recd       MIN/AVG/MAX", s->reclock.recd.min, s->reclock.recd.num?s->reclock.recd.total/s->reclock.recd.num:0.0, s->reclock.recd.max, s->reclock.recd.num);
+
+		printf(" %-30s     %.6f/%.6f/%.6f sec out of %d\n", "call_latency       MIN/AVG/MAX", s->call_latency.min, s->call_latency.num?s->call_latency.total/s->call_latency.num:0.0, s->call_latency.max, s->call_latency.num);
+		printf(" %-30s     %.6f/%.6f/%.6f sec out of %d\n", "childwrite_latency MIN/AVG/MAX", s->childwrite_latency.min, s->childwrite_latency.num?s->childwrite_latency.total/s->childwrite_latency.num:0.0, s->childwrite_latency.max, s->childwrite_latency.num);
+	}
+
 	talloc_free(tmp_ctx);
 }
 
@@ -263,14 +579,12 @@ static int control_statistics_all(struct ctdb_context *ctdb)
 		}
 		statistics.max_hop_count = 
 			MAX(statistics.max_hop_count, s1.max_hop_count);
-		statistics.max_call_latency = 
-			MAX(statistics.max_call_latency, s1.max_call_latency);
-		statistics.max_lockwait_latency = 
-			MAX(statistics.max_lockwait_latency, s1.max_lockwait_latency);
+		statistics.call_latency.max = 
+			MAX(statistics.call_latency.max, s1.call_latency.max);
 	}
 	talloc_free(nodes);
 	printf("Gathered statistics for %u nodes\n", num_nodes);
-	show_statistics(&statistics);
+	show_statistics(&statistics, 1);
 	return 0;
 }
 
@@ -291,7 +605,7 @@ static int control_statistics(struct ctdb_context *ctdb, int argc, const char **
 		DEBUG(DEBUG_ERR, ("Unable to get statistics from node %u\n", options.pnn));
 		return ret;
 	}
-	show_statistics(&statistics);
+	show_statistics(&statistics, 1);
 	return 0;
 }
 
@@ -311,6 +625,120 @@ static int control_statistics_reset(struct ctdb_context *ctdb, int argc, const c
 	return 0;
 }
 
+
+/*
+  display remote ctdb rolling statistics
+ */
+static int control_stats(struct ctdb_context *ctdb, int argc, const char **argv)
+{
+	int ret;
+	struct ctdb_statistics_wire *stats;
+	int i, num_records = -1;
+
+	assert_single_node_only();
+
+	if (argc ==1) {
+		num_records = atoi(argv[0]) - 1;
+	}
+
+	ret = ctdb_ctrl_getstathistory(ctdb, TIMELIMIT(), options.pnn, ctdb, &stats);
+	if (ret != 0) {
+		DEBUG(DEBUG_ERR, ("Unable to get rolling statistics from node %u\n", options.pnn));
+		return ret;
+	}
+	for (i=0;i<stats->num;i++) {
+		if (stats->stats[i].statistics_start_time.tv_sec == 0) {
+			continue;
+		}
+		show_statistics(&stats->stats[i], i==0);
+		if (i == num_records) {
+			break;
+		}
+	}
+	return 0;
+}
+
+
+/*
+  display remote ctdb db statistics
+ */
+static int control_dbstatistics(struct ctdb_context *ctdb, int argc, const char **argv)
+{
+	TALLOC_CTX *tmp_ctx = talloc_new(ctdb);
+	struct ctdb_db_statistics *dbstat;
+	int i;
+	uint32_t db_id;
+	int num_hot_keys;
+	int ret;
+
+	if (argc < 1) {
+		usage();
+	}
+
+	if (!db_exists(ctdb, argv[0], &db_id, NULL, NULL)) {
+		return -1;
+	}
+
+	ret = ctdb_ctrl_dbstatistics(ctdb, options.pnn, db_id, tmp_ctx, &dbstat);
+	if (ret != 0) {
+		DEBUG(DEBUG_ERR,("Failed to read db statistics from node\n"));
+		talloc_free(tmp_ctx);
+		return -1;
+	}
+
+	printf("DB Statistics: %s\n", argv[0]);
+	printf(" %*s%-22s%*s%10u\n", 0, "", "ro_delegations", 4, "",
+		dbstat->db_ro_delegations);
+	printf(" %*s%-22s%*s%10u\n", 0, "", "ro_revokes", 4, "",
+		dbstat->db_ro_delegations);
+	printf(" %s\n", "locks");
+	printf(" %*s%-22s%*s%10u\n", 4, "", "total", 0, "",
+		dbstat->locks.num_calls);
+	printf(" %*s%-22s%*s%10u\n", 4, "", "failed", 0, "",
+		dbstat->locks.num_failed);
+	printf(" %*s%-22s%*s%10u\n", 4, "", "current", 0, "",
+		dbstat->locks.num_current);
+	printf(" %*s%-22s%*s%10u\n", 4, "", "pending", 0, "",
+		dbstat->locks.num_pending);
+	printf(" %s", "hop_count_buckets:");
+	for (i=0; i<MAX_COUNT_BUCKETS; i++) {
+		printf(" %d", dbstat->hop_count_bucket[i]);
+	}
+	printf("\n");
+	printf(" %s", "lock_buckets:");
+	for (i=0; i<MAX_COUNT_BUCKETS; i++) {
+		printf(" %d", dbstat->locks.buckets[i]);
+	}
+	printf("\n");
+	printf(" %-30s     %.6f/%.6f/%.6f sec out of %d\n",
+		"locks_latency      MIN/AVG/MAX",
+		dbstat->locks.latency.min,
+		(dbstat->locks.latency.num ?
+		 dbstat->locks.latency.total /dbstat->locks.latency.num :
+		 0.0),
+		dbstat->locks.latency.max,
+		dbstat->locks.latency.num);
+	num_hot_keys = 0;
+	for (i=0; i<dbstat->num_hot_keys; i++) {
+		if (dbstat->hot_keys[i].count > 0) {
+			num_hot_keys++;
+		}
+	}
+	dbstat->num_hot_keys = num_hot_keys;
+
+	printf(" Num Hot Keys:     %d\n", dbstat->num_hot_keys);
+	for (i = 0; i < dbstat->num_hot_keys; i++) {
+		int j;
+		printf("     Count:%d Key:", dbstat->hot_keys[i].count);
+		for (j = 0; j < dbstat->hot_keys[i].key.dsize; j++) {
+			printf("%02x", dbstat->hot_keys[i].key.dptr[j]&0xff);
+		}
+		printf("\n");
+	}
+
+	talloc_free(tmp_ctx);
+	return 0;
+}
 
 /*
   display uptime of remote node
@@ -373,13 +801,9 @@ static int control_uptime(struct ctdb_context *ctdb, int argc, const char **argv
  */
 static int control_pnn(struct ctdb_context *ctdb, int argc, const char **argv)
 {
-	int mypnn;
+	uint32_t mypnn;
 
-	mypnn = ctdb_ctrl_getpnn(ctdb, TIMELIMIT(), options.pnn);
-	if (mypnn == -1) {
-		DEBUG(DEBUG_ERR, ("Unable to get pnn from local node."));
-		return -1;
-	}
+	mypnn = getpnn(ctdb);
 
 	printf("PNN:%d\n", mypnn);
 	return 0;
@@ -405,7 +829,12 @@ static struct pnn_node *read_nodes_file(TALLOC_CTX *mem_ctx)
 	/* read the nodes file */
 	nodes_list = getenv("CTDB_NODES");
 	if (nodes_list == NULL) {
-		nodes_list = "/etc/ctdb/nodes";
+		nodes_list = talloc_asprintf(mem_ctx, "%s/nodes",
+					     getenv("CTDB_BASE"));
+		if (nodes_list == NULL) {
+			DEBUG(DEBUG_ALERT,(__location__ " Out of memory\n"));
+			exit(1);
+		}
 	}
 	lines = file_lines_load(nodes_list, &nlines, mem_ctx);
 	if (lines == NULL) {
@@ -461,6 +890,8 @@ static int control_xpnn(struct ctdb_context *ctdb, int argc, const char **argv)
 	struct pnn_node *pnn_nodes;
 	struct pnn_node *pnn_node;
 
+	assert_single_node_only();
+
 	pnn_nodes = read_nodes_file(mem_ctx);
 	if (pnn_nodes == NULL) {
 		DEBUG(DEBUG_ERR,("Failed to read nodes file\n"));
@@ -489,130 +920,125 @@ static int control_xpnn(struct ctdb_context *ctdb, int argc, const char **argv)
 	return -1;
 }
 
+/* Helpers for ctdb status
+ */
+static bool is_partially_online(struct ctdb_context *ctdb, struct ctdb_node_and_flags *node)
+{
+	TALLOC_CTX *tmp_ctx = talloc_new(NULL);
+	int j;
+	bool ret = false;
+
+	if (node->flags == 0) {
+		struct ctdb_control_get_ifaces *ifaces;
+
+		if (ctdb_ctrl_get_ifaces(ctdb, TIMELIMIT(), node->pnn,
+					 tmp_ctx, &ifaces) == 0) {
+			for (j=0; j < ifaces->num; j++) {
+				if (ifaces->ifaces[j].link_state != 0) {
+					continue;
+				}
+				ret = true;
+				break;
+			}
+		}
+	}
+	talloc_free(tmp_ctx);
+
+	return ret;
+}
+
+static void control_status_header_machine(void)
+{
+	printf(":Node:IP:Disconnected:Banned:Disabled:Unhealthy:Stopped"
+	       ":Inactive:PartiallyOnline:ThisNode:\n");
+}
+
+static int control_status_1_machine(struct ctdb_context *ctdb, int mypnn,
+				    struct ctdb_node_and_flags *node)
+{
+	printf(":%d:%s:%d:%d:%d:%d:%d:%d:%d:%c:\n", node->pnn,
+	       ctdb_addr_to_str(&node->addr),
+	       !!(node->flags&NODE_FLAGS_DISCONNECTED),
+	       !!(node->flags&NODE_FLAGS_BANNED),
+	       !!(node->flags&NODE_FLAGS_PERMANENTLY_DISABLED),
+	       !!(node->flags&NODE_FLAGS_UNHEALTHY),
+	       !!(node->flags&NODE_FLAGS_STOPPED),
+	       !!(node->flags&NODE_FLAGS_INACTIVE),
+	       is_partially_online(ctdb, node) ? 1 : 0,
+	       (node->pnn == mypnn)?'Y':'N');
+
+	return node->flags;
+}
+
+static int control_status_1_human(struct ctdb_context *ctdb, int mypnn,
+				  struct ctdb_node_and_flags *node)
+{
+       printf("pnn:%d %-16s %s%s\n", node->pnn,
+              ctdb_addr_to_str(&node->addr),
+              is_partially_online(ctdb, node) ? "PARTIALLYONLINE" : pretty_print_flags(node->flags),
+              node->pnn == mypnn?" (THIS NODE)":"");
+
+       return node->flags;
+}
+
 /*
   display remote ctdb status
  */
 static int control_status(struct ctdb_context *ctdb, int argc, const char **argv)
 {
-	int i, ret;
+	TALLOC_CTX *tmp_ctx = talloc_new(ctdb);
+	int i;
 	struct ctdb_vnn_map *vnnmap=NULL;
 	struct ctdb_node_map *nodemap=NULL;
-	uint32_t recmode, recmaster;
-	int mypnn;
+	uint32_t recmode, recmaster, mypnn;
+	int num_deleted_nodes = 0;
+	int ret;
 
-	mypnn = ctdb_ctrl_getpnn(ctdb, TIMELIMIT(), options.pnn);
-	if (mypnn == -1) {
+	mypnn = getpnn(ctdb);
+
+	ret = ctdb_ctrl_getnodemap(ctdb, TIMELIMIT(), options.pnn, tmp_ctx, &nodemap);
+	if (ret != 0) {
+		DEBUG(DEBUG_ERR, ("Unable to get nodemap from node %u\n", options.pnn));
+		talloc_free(tmp_ctx);
 		return -1;
 	}
 
-	ret = ctdb_ctrl_getnodemap(ctdb, TIMELIMIT(), options.pnn, ctdb, &nodemap);
-	if (ret != 0) {
-		DEBUG(DEBUG_ERR, ("Unable to get nodemap from node %u\n", options.pnn));
-		return ret;
-	}
-
-	if(options.machinereadable){
-		printf(":Node:IP:Disconnected:Banned:Disabled:Unhealthy:Stopped:Inactive:PartiallyOnline:\n");
-		for(i=0;i<nodemap->num;i++){
-			int partially_online = 0;
-			int j;
-
+	if (options.machinereadable) {
+		control_status_header_machine();
+		for (i=0;i<nodemap->num;i++) {
 			if (nodemap->nodes[i].flags & NODE_FLAGS_DELETED) {
 				continue;
 			}
-			if (nodemap->nodes[i].flags == 0) {
-				struct ctdb_control_get_ifaces *ifaces;
-
-				ret = ctdb_ctrl_get_ifaces(ctdb, TIMELIMIT(),
-							   nodemap->nodes[i].pnn,
-							   ctdb, &ifaces);
-				if (ret == 0) {
-					for (j=0; j < ifaces->num; j++) {
-						if (ifaces->ifaces[j].link_state != 0) {
-							continue;
-						}
-						partially_online = 1;
-						break;
-					}
-					talloc_free(ifaces);
-				}
-			}
-			printf(":%d:%s:%d:%d:%d:%d:%d:%d:%d:\n", nodemap->nodes[i].pnn,
-				ctdb_addr_to_str(&nodemap->nodes[i].addr),
-			       !!(nodemap->nodes[i].flags&NODE_FLAGS_DISCONNECTED),
-			       !!(nodemap->nodes[i].flags&NODE_FLAGS_BANNED),
-			       !!(nodemap->nodes[i].flags&NODE_FLAGS_PERMANENTLY_DISABLED),
-			       !!(nodemap->nodes[i].flags&NODE_FLAGS_UNHEALTHY),
-			       !!(nodemap->nodes[i].flags&NODE_FLAGS_STOPPED),
-			       !!(nodemap->nodes[i].flags&NODE_FLAGS_INACTIVE),
-			       partially_online);
+			(void) control_status_1_machine(ctdb, mypnn,
+							&nodemap->nodes[i]);
 		}
+		talloc_free(tmp_ctx);
 		return 0;
 	}
 
-	printf("Number of nodes:%d\n", nodemap->num);
+	for (i=0; i<nodemap->num; i++) {
+		if (nodemap->nodes[i].flags & NODE_FLAGS_DELETED) {
+			num_deleted_nodes++;
+		}
+	}
+	if (num_deleted_nodes == 0) {
+		printf("Number of nodes:%d\n", nodemap->num);
+	} else {
+		printf("Number of nodes:%d (including %d deleted nodes)\n",
+		       nodemap->num, num_deleted_nodes);
+	}
 	for(i=0;i<nodemap->num;i++){
-		static const struct {
-			uint32_t flag;
-			const char *name;
-		} flag_names[] = {
-			{ NODE_FLAGS_DISCONNECTED,          "DISCONNECTED" },
-			{ NODE_FLAGS_PERMANENTLY_DISABLED,  "DISABLED" },
-			{ NODE_FLAGS_BANNED,                "BANNED" },
-			{ NODE_FLAGS_UNHEALTHY,             "UNHEALTHY" },
-			{ NODE_FLAGS_DELETED,               "DELETED" },
-			{ NODE_FLAGS_STOPPED,               "STOPPED" },
-			{ NODE_FLAGS_INACTIVE,              "INACTIVE" },
-		};
-		char *flags_str = NULL;
-		int j;
-
 		if (nodemap->nodes[i].flags & NODE_FLAGS_DELETED) {
 			continue;
 		}
-		if (nodemap->nodes[i].flags == 0) {
-			struct ctdb_control_get_ifaces *ifaces;
-
-			ret = ctdb_ctrl_get_ifaces(ctdb, TIMELIMIT(),
-						   nodemap->nodes[i].pnn,
-						   ctdb, &ifaces);
-			if (ret == 0) {
-				for (j=0; j < ifaces->num; j++) {
-					if (ifaces->ifaces[j].link_state != 0) {
-						continue;
-					}
-					flags_str = talloc_strdup(ctdb, "PARTIALLYONLINE");
-					break;
-				}
-				talloc_free(ifaces);
-			}
-		}
-		for (j=0;j<ARRAY_SIZE(flag_names);j++) {
-			if (nodemap->nodes[i].flags & flag_names[j].flag) {
-				if (flags_str == NULL) {
-					flags_str = talloc_strdup(ctdb, flag_names[j].name);
-				} else {
-					flags_str = talloc_asprintf_append(flags_str, "|%s",
-									   flag_names[j].name);
-				}
-				CTDB_NO_MEMORY_FATAL(ctdb, flags_str);
-			}
-		}
-		if (flags_str == NULL) {
-			flags_str = talloc_strdup(ctdb, "OK");
-			CTDB_NO_MEMORY_FATAL(ctdb, flags_str);
-		}
-		printf("pnn:%d %-16s %s%s\n", nodemap->nodes[i].pnn,
-		       ctdb_addr_to_str(&nodemap->nodes[i].addr),
-		       flags_str,
-		       nodemap->nodes[i].pnn == mypnn?" (THIS NODE)":"");
-		talloc_free(flags_str);
+		(void) control_status_1_human(ctdb, mypnn, &nodemap->nodes[i]);
 	}
 
-	ret = ctdb_ctrl_getvnnmap(ctdb, TIMELIMIT(), options.pnn, ctdb, &vnnmap);
+	ret = ctdb_ctrl_getvnnmap(ctdb, TIMELIMIT(), options.pnn, tmp_ctx, &vnnmap);
 	if (ret != 0) {
 		DEBUG(DEBUG_ERR, ("Unable to get vnnmap from node %u\n", options.pnn));
-		return ret;
+		talloc_free(tmp_ctx);
+		return -1;
 	}
 	if (vnnmap->generation == INVALID_GENERATION) {
 		printf("Generation:INVALID\n");
@@ -624,34 +1050,115 @@ static int control_status(struct ctdb_context *ctdb, int argc, const char **argv
 		printf("hash:%d lmaster:%d\n", i, vnnmap->map[i]);
 	}
 
-	ret = ctdb_ctrl_getrecmode(ctdb, ctdb, TIMELIMIT(), options.pnn, &recmode);
+	ret = ctdb_ctrl_getrecmode(ctdb, tmp_ctx, TIMELIMIT(), options.pnn, &recmode);
 	if (ret != 0) {
 		DEBUG(DEBUG_ERR, ("Unable to get recmode from node %u\n", options.pnn));
-		return ret;
+		talloc_free(tmp_ctx);
+		return -1;
 	}
 	printf("Recovery mode:%s (%d)\n",recmode==CTDB_RECOVERY_NORMAL?"NORMAL":"RECOVERY",recmode);
 
-	ret = ctdb_ctrl_getrecmaster(ctdb, ctdb, TIMELIMIT(), options.pnn, &recmaster);
+	ret = ctdb_ctrl_getrecmaster(ctdb, tmp_ctx, TIMELIMIT(), options.pnn, &recmaster);
 	if (ret != 0) {
 		DEBUG(DEBUG_ERR, ("Unable to get recmaster from node %u\n", options.pnn));
-		return ret;
+		talloc_free(tmp_ctx);
+		return -1;
 	}
 	printf("Recovery master:%d\n",recmaster);
 
+	talloc_free(tmp_ctx);
 	return 0;
 }
 
+static int control_nodestatus(struct ctdb_context *ctdb, int argc, const char **argv)
+{
+	TALLOC_CTX *tmp_ctx = talloc_new(ctdb);
+	int i, ret;
+	struct ctdb_node_map *nodemap=NULL;
+	uint32_t * nodes;
+	uint32_t pnn_mode, mypnn;
+
+	if (argc > 1) {
+		usage();
+	}
+
+	if (!parse_nodestring(ctdb, tmp_ctx, argc == 1 ? argv[0] : NULL,
+			      options.pnn, true, &nodes, &pnn_mode)) {
+		return -1;
+	}
+
+	if (options.machinereadable) {
+		control_status_header_machine();
+	} else if (pnn_mode == CTDB_BROADCAST_ALL) {
+		printf("Number of nodes:%d\n", (int) talloc_array_length(nodes));
+	}
+
+	mypnn = getpnn(ctdb);
+
+	ret = ctdb_ctrl_getnodemap(ctdb, TIMELIMIT(), options.pnn, tmp_ctx, &nodemap);
+	if (ret != 0) {
+		DEBUG(DEBUG_ERR, ("Unable to get nodemap from node %u\n", options.pnn));
+		talloc_free(tmp_ctx);
+		return -1;
+	}
+
+	ret = 0;
+
+	for (i = 0; i < talloc_array_length(nodes); i++) {
+		if (options.machinereadable) {
+			ret |= control_status_1_machine(ctdb, mypnn,
+							&nodemap->nodes[nodes[i]]);
+		} else {
+			ret |= control_status_1_human(ctdb, mypnn,
+						      &nodemap->nodes[nodes[i]]);
+		}
+	}
+
+	talloc_free(tmp_ctx);
+	return ret;
+}
 
 struct natgw_node {
 	struct natgw_node *next;
 	const char *addr;
 };
 
+static int find_natgw(struct ctdb_context *ctdb,
+		       struct ctdb_node_map *nodemap, uint32_t flags,
+		       uint32_t *pnn, const char **ip)
+{
+	int i;
+	uint32_t capabilities;
+	int ret;
+
+	for (i=0;i<nodemap->num;i++) {
+		if (!(nodemap->nodes[i].flags & flags)) {
+			ret = ctdb_ctrl_getcapabilities(ctdb, TIMELIMIT(),
+						        nodemap->nodes[i].pnn,
+						        &capabilities);
+			if (ret != 0) {
+				DEBUG(DEBUG_ERR, ("Unable to get capabilities from node %u\n",
+						  nodemap->nodes[i].pnn));
+				return -1;
+			}
+			if (!(capabilities&CTDB_CAP_NATGW)) {
+				continue;
+			}
+			*pnn = nodemap->nodes[i].pnn;
+			*ip = ctdb_addr_to_str(&nodemap->nodes[i].addr);
+			return 0;
+		}
+	}
+
+	return 2; /* matches ENOENT */
+}
+
 /*
   display the list of nodes belonging to this natgw configuration
  */
 static int control_natgwlist(struct ctdb_context *ctdb, int argc, const char **argv)
 {
+	TALLOC_CTX *tmp_ctx = talloc_new(ctdb);
 	int i, ret;
 	const char *natgw_list;
 	int nlines;
@@ -659,20 +1166,38 @@ static int control_natgwlist(struct ctdb_context *ctdb, int argc, const char **a
 	struct natgw_node *natgw_nodes = NULL;
 	struct natgw_node *natgw_node;
 	struct ctdb_node_map *nodemap=NULL;
+	uint32_t mypnn, pnn;
+	const char *ip;
 
+	/* When we have some nodes that could be the NATGW, make a
+	 * series of attempts to find the first node that doesn't have
+	 * certain status flags set.
+	 */
+	uint32_t exclude_flags[] = {
+		/* Look for a nice healthy node */
+		NODE_FLAGS_DISCONNECTED|NODE_FLAGS_STOPPED|NODE_FLAGS_DELETED|NODE_FLAGS_BANNED|NODE_FLAGS_UNHEALTHY,
+		/* If not found, an UNHEALTHY/BANNED node will do */
+		NODE_FLAGS_DISCONNECTED|NODE_FLAGS_STOPPED|NODE_FLAGS_DELETED,
+		/* If not found, a STOPPED node will do */
+		NODE_FLAGS_DISCONNECTED|NODE_FLAGS_DELETED,
+		0,
+	};
 
 	/* read the natgw nodes file into a linked list */
-	natgw_list = getenv("NATGW_NODES");
+	natgw_list = getenv("CTDB_NATGW_NODES");
 	if (natgw_list == NULL) {
-		natgw_list = "/etc/ctdb/natgw_nodes";
+		natgw_list = talloc_asprintf(tmp_ctx, "%s/natgw_nodes",
+					     getenv("CTDB_BASE"));
+		if (natgw_list == NULL) {
+			DEBUG(DEBUG_ALERT,(__location__ " Out of memory\n"));
+			exit(1);
+		}
 	}
 	lines = file_lines_load(natgw_list, &nlines, ctdb);
 	if (lines == NULL) {
 		ctdb_set_error(ctdb, "Failed to load natgw node list '%s'\n", natgw_list);
+		talloc_free(tmp_ctx);
 		return -1;
-	}
-	while (nlines > 0 && strcmp(lines[nlines-1], "") == 0) {
-		nlines--;
 	}
 	for (i=0;i<nlines;i++) {
 		char *node;
@@ -695,12 +1220,16 @@ static int control_natgwlist(struct ctdb_context *ctdb, int argc, const char **a
 		natgw_nodes = natgw_node;
 	}
 
-	ret = ctdb_ctrl_getnodemap(ctdb, TIMELIMIT(), CTDB_CURRENT_NODE, ctdb, &nodemap);
+	ret = ctdb_ctrl_getnodemap(ctdb, TIMELIMIT(), CTDB_CURRENT_NODE, tmp_ctx, &nodemap);
 	if (ret != 0) {
 		DEBUG(DEBUG_ERR, ("Unable to get nodemap from local node.\n"));
-		return ret;
+		talloc_free(tmp_ctx);
+		return -1;
 	}
 
+	/* Trim the nodemap so it only includes connected nodes in the
+	 * current natgw group.
+	 */
 	i=0;
 	while(i<nodemap->num) {
 		for(natgw_node=natgw_nodes;natgw_node;natgw_node=natgw_node->next) {
@@ -724,55 +1253,51 @@ static int control_natgwlist(struct ctdb_context *ctdb, int argc, const char **a
 		}
 
 		i++;
-	}		
+	}
 
-	/* pick a node to be natgwmaster
-	 * we dont allow STOPPED, DELETED, BANNED or UNHEALTHY nodes to become the natgwmaster
-	 */
-	for(i=0;i<nodemap->num;i++){
-		if (!(nodemap->nodes[i].flags & (NODE_FLAGS_DISCONNECTED|NODE_FLAGS_STOPPED|NODE_FLAGS_DELETED|NODE_FLAGS_BANNED|NODE_FLAGS_UNHEALTHY))) {
-			printf("%d %s\n", nodemap->nodes[i].pnn,ctdb_addr_to_str(&nodemap->nodes[i].addr));
+	ret = 2; /* matches ENOENT */
+	pnn = -1;
+	ip = "0.0.0.0";
+	for (i = 0; exclude_flags[i] != 0; i++) {
+		ret = find_natgw(ctdb, nodemap,
+				 exclude_flags[i],
+				 &pnn, &ip);
+		if (ret == -1) {
+			goto done;
+		}
+		if (ret == 0) {
 			break;
 		}
 	}
-	/* we couldnt find any healthy node, try unhealthy ones */
-	if (i == nodemap->num) {
-		for(i=0;i<nodemap->num;i++){
-			if (!(nodemap->nodes[i].flags & (NODE_FLAGS_DISCONNECTED|NODE_FLAGS_STOPPED|NODE_FLAGS_DELETED))) {
-				printf("%d %s\n", nodemap->nodes[i].pnn,ctdb_addr_to_str(&nodemap->nodes[i].addr));
-				break;
-			}
-		}
-	}
-	/* unless all nodes are STOPPED, when we pick one anyway */
-	if (i == nodemap->num) {
-		for(i=0;i<nodemap->num;i++){
-			if (!(nodemap->nodes[i].flags & (NODE_FLAGS_DISCONNECTED|NODE_FLAGS_DELETED))) {
-				printf("%d %s\n", nodemap->nodes[i].pnn, ctdb_addr_to_str(&nodemap->nodes[i].addr));
-				break;
-			}
-		}
-		/* or if we still can not find any */
-		if (i == nodemap->num) {
-			printf("-1 0.0.0.0\n");
-		}
+
+	if (options.machinereadable) {
+		printf(":Node:IP:\n");
+		printf(":%d:%s:\n", pnn, ip);
+	} else {
+		printf("%d %s\n", pnn, ip);
 	}
 
 	/* print the pruned list of nodes belonging to this natgw list */
+	mypnn = getpnn(ctdb);
+	if (options.machinereadable) {
+		control_status_header_machine();
+	} else {
+		printf("Number of nodes:%d\n", nodemap->num);
+	}
 	for(i=0;i<nodemap->num;i++){
 		if (nodemap->nodes[i].flags & NODE_FLAGS_DELETED) {
 			continue;
 		}
-		printf(":%d:%s:%d:%d:%d:%d:%d\n", nodemap->nodes[i].pnn,
-			ctdb_addr_to_str(&nodemap->nodes[i].addr),
-		       !!(nodemap->nodes[i].flags&NODE_FLAGS_DISCONNECTED),
-		       !!(nodemap->nodes[i].flags&NODE_FLAGS_BANNED),
-		       !!(nodemap->nodes[i].flags&NODE_FLAGS_PERMANENTLY_DISABLED),
-		       !!(nodemap->nodes[i].flags&NODE_FLAGS_UNHEALTHY),
-		       !!(nodemap->nodes[i].flags&NODE_FLAGS_STOPPED));
+		if (options.machinereadable) {
+			control_status_1_machine(ctdb, mypnn, &(nodemap->nodes[i]));
+		} else {
+			control_status_1_human(ctdb, mypnn, &(nodemap->nodes[i]));
+		}
 	}
 
-	return 0;
+done:
+	talloc_free(tmp_ctx);
+	return ret;
 }
 
 /*
@@ -822,7 +1347,7 @@ static int control_one_scriptstatus(struct ctdb_context *ctdb,
 			break;
 		}
 		if (options.machinereadable) {
-			printf("%s:%s:%i:%s:%lu.%06lu:%lu.%06lu:%s:\n",
+			printf(":%s:%s:%i:%s:%lu.%06lu:%lu.%06lu:%s:\n",
 			       ctdb_eventscript_call_names[type],
 			       script_status->scripts[i].name,
 			       script_status->scripts[i].status,
@@ -956,18 +1481,96 @@ static int control_disablescript(struct ctdb_context *ctdb, int argc, const char
  */
 static int control_recmaster(struct ctdb_context *ctdb, int argc, const char **argv)
 {
-	int ret;
 	uint32_t recmaster;
+	int ret;
 
 	ret = ctdb_ctrl_getrecmaster(ctdb, ctdb, TIMELIMIT(), options.pnn, &recmaster);
 	if (ret != 0) {
 		DEBUG(DEBUG_ERR, ("Unable to get recmaster from node %u\n", options.pnn));
-		return ret;
+		return -1;
 	}
 	printf("%d\n",recmaster);
 
 	return 0;
 }
+
+/*
+  add a tickle to a public address
+ */
+static int control_add_tickle(struct ctdb_context *ctdb, int argc, const char **argv)
+{
+	struct ctdb_tcp_connection t;
+	TDB_DATA data;
+	int ret;
+
+	assert_single_node_only();
+
+	if (argc < 2) {
+		usage();
+	}
+
+	if (parse_ip_port(argv[0], &t.src_addr) == 0) {
+		DEBUG(DEBUG_ERR,("Wrongly formed ip address '%s'\n", argv[0]));
+		return -1;
+	}
+	if (parse_ip_port(argv[1], &t.dst_addr) == 0) {
+		DEBUG(DEBUG_ERR,("Wrongly formed ip address '%s'\n", argv[1]));
+		return -1;
+	}
+
+	data.dptr = (uint8_t *)&t;
+	data.dsize = sizeof(t);
+
+	/* tell all nodes about this tcp connection */
+	ret = ctdb_control(ctdb, options.pnn, 0, CTDB_CONTROL_TCP_ADD_DELAYED_UPDATE,
+			   0, data, ctdb, NULL, NULL, NULL, NULL);
+	if (ret != 0) {
+		DEBUG(DEBUG_ERR,("Failed to add tickle\n"));
+		return -1;
+	}
+	
+	return 0;
+}
+
+
+/*
+  delete a tickle from a node
+ */
+static int control_del_tickle(struct ctdb_context *ctdb, int argc, const char **argv)
+{
+	struct ctdb_tcp_connection t;
+	TDB_DATA data;
+	int ret;
+
+	assert_single_node_only();
+
+	if (argc < 2) {
+		usage();
+	}
+
+	if (parse_ip_port(argv[0], &t.src_addr) == 0) {
+		DEBUG(DEBUG_ERR,("Wrongly formed ip address '%s'\n", argv[0]));
+		return -1;
+	}
+	if (parse_ip_port(argv[1], &t.dst_addr) == 0) {
+		DEBUG(DEBUG_ERR,("Wrongly formed ip address '%s'\n", argv[1]));
+		return -1;
+	}
+
+	data.dptr = (uint8_t *)&t;
+	data.dsize = sizeof(t);
+
+	/* tell all nodes about this tcp connection */
+	ret = ctdb_control(ctdb, options.pnn, 0, CTDB_CONTROL_TCP_REMOVE,
+			   0, data, ctdb, NULL, NULL, NULL, NULL);
+	if (ret != 0) {
+		DEBUG(DEBUG_ERR,("Failed to remove tickle\n"));
+		return -1;
+	}
+	
+	return 0;
+}
+
 
 /*
   get a list of all tickles for this pnn
@@ -977,9 +1580,16 @@ static int control_get_tickles(struct ctdb_context *ctdb, int argc, const char *
 	struct ctdb_control_tcp_tickle_list *list;
 	ctdb_sock_addr addr;
 	int i, ret;
+	unsigned port = 0;
+
+	assert_single_node_only();
 
 	if (argc < 1) {
 		usage();
+	}
+
+	if (argc == 2) {
+		port = atoi(argv[1]);
 	}
 
 	if (parse_ip(argv[0], NULL, 0, &addr) == 0) {
@@ -993,11 +1603,25 @@ static int control_get_tickles(struct ctdb_context *ctdb, int argc, const char *
 		return -1;
 	}
 
-	printf("Tickles for ip:%s\n", ctdb_addr_to_str(&list->addr));
-	printf("Num tickles:%u\n", list->tickles.num);
-	for (i=0;i<list->tickles.num;i++) {
-		printf("SRC: %s:%u   ", ctdb_addr_to_str(&list->tickles.connections[i].src_addr), ntohs(list->tickles.connections[i].src_addr.ip.sin_port));
-		printf("DST: %s:%u\n", ctdb_addr_to_str(&list->tickles.connections[i].dst_addr), ntohs(list->tickles.connections[i].dst_addr.ip.sin_port));
+	if (options.machinereadable){
+		printf(":source ip:port:destination ip:port:\n");
+		for (i=0;i<list->tickles.num;i++) {
+			if (port && port != ntohs(list->tickles.connections[i].dst_addr.ip.sin_port)) {
+				continue;
+			}
+			printf(":%s:%u", ctdb_addr_to_str(&list->tickles.connections[i].src_addr), ntohs(list->tickles.connections[i].src_addr.ip.sin_port));
+			printf(":%s:%u:\n", ctdb_addr_to_str(&list->tickles.connections[i].dst_addr), ntohs(list->tickles.connections[i].dst_addr.ip.sin_port));
+		}
+	} else {
+		printf("Tickles for ip:%s\n", ctdb_addr_to_str(&list->addr));
+		printf("Num tickles:%u\n", list->tickles.num);
+		for (i=0;i<list->tickles.num;i++) {
+			if (port && port != ntohs(list->tickles.connections[i].dst_addr.ip.sin_port)) {
+				continue;
+			}
+			printf("SRC: %s:%u   ", ctdb_addr_to_str(&list->tickles.connections[i].src_addr), ntohs(list->tickles.connections[i].src_addr.ip.sin_port));
+			printf("DST: %s:%u\n", ctdb_addr_to_str(&list->tickles.connections[i].dst_addr), ntohs(list->tickles.connections[i].dst_addr.ip.sin_port));
+		}
 	}
 
 	talloc_free(list);
@@ -1020,7 +1644,7 @@ static int move_ip(struct ctdb_context *ctdb, ctdb_sock_addr *addr, uint32_t pnn
 	disable_time = 30;
 	data.dptr  = (uint8_t*)&disable_time;
 	data.dsize = sizeof(disable_time);
-	ret = ctdb_send_message(ctdb, CTDB_BROADCAST_CONNECTED, CTDB_SRVID_DISABLE_IP_CHECK, data);
+	ret = ctdb_client_send_message(ctdb, CTDB_BROADCAST_CONNECTED, CTDB_SRVID_DISABLE_IP_CHECK, data);
 	if (ret != 0) {
 		DEBUG(DEBUG_ERR,("Failed to send message to disable ipcheck\n"));
 		return -1;
@@ -1061,7 +1685,7 @@ static int move_ip(struct ctdb_context *ctdb, ctdb_sock_addr *addr, uint32_t pnn
 		return ret;
 	}
 
-       	nodes = list_of_active_nodes_except_pnn(ctdb, nodemap, tmp_ctx, pnn);
+	nodes = list_of_nodes(ctdb, nodemap, tmp_ctx, NODE_FLAGS_INACTIVE, pnn);
 	ret = ctdb_client_async_control(ctdb, CTDB_CONTROL_RELEASE_IP,
 					nodes, 0,
 					LONGTIMELIMIT(),
@@ -1081,9 +1705,94 @@ static int move_ip(struct ctdb_context *ctdb, ctdb_sock_addr *addr, uint32_t pnn
 		return -1;
 	}
 
+	/* update the recovery daemon so it now knows to expect the new
+	   node assignment for this ip.
+	*/
+	ret = ctdb_client_send_message(ctdb, CTDB_BROADCAST_CONNECTED, CTDB_SRVID_RECD_UPDATE_IP, data);
+	if (ret != 0) {
+		DEBUG(DEBUG_ERR,("Failed to send message to update the ip on the recovery master.\n"));
+		return -1;
+	}
+
 	talloc_free(tmp_ctx);
 	return 0;
 }
+
+
+/* 
+ * scans all other nodes and returns a pnn for another node that can host this 
+ * ip address or -1
+ */
+static int
+find_other_host_for_public_ip(struct ctdb_context *ctdb, ctdb_sock_addr *addr)
+{
+	TALLOC_CTX *tmp_ctx = talloc_new(ctdb);
+	struct ctdb_all_public_ips *ips;
+	struct ctdb_node_map *nodemap=NULL;
+	int i, j, ret;
+
+	ret = ctdb_ctrl_getnodemap(ctdb, TIMELIMIT(), CTDB_CURRENT_NODE, tmp_ctx, &nodemap);
+	if (ret != 0) {
+		DEBUG(DEBUG_ERR, ("Unable to get nodemap from node %u\n", options.pnn));
+		talloc_free(tmp_ctx);
+		return ret;
+	}
+
+	for(i=0;i<nodemap->num;i++){
+		if (nodemap->nodes[i].flags & NODE_FLAGS_INACTIVE) {
+			continue;
+		}
+		if (nodemap->nodes[i].pnn == options.pnn) {
+			continue;
+		}
+
+		/* read the public ip list from this node */
+		ret = ctdb_ctrl_get_public_ips(ctdb, TIMELIMIT(), nodemap->nodes[i].pnn, tmp_ctx, &ips);
+		if (ret != 0) {
+			DEBUG(DEBUG_ERR, ("Unable to get public ip list from node %u\n", nodemap->nodes[i].pnn));
+			return -1;
+		}
+
+		for (j=0;j<ips->num;j++) {
+			if (ctdb_same_ip(addr, &ips->ips[j].addr)) {
+				talloc_free(tmp_ctx);
+				return nodemap->nodes[i].pnn;
+			}
+		}
+		talloc_free(ips);
+	}
+
+	talloc_free(tmp_ctx);
+	return -1;
+}
+
+/* If pnn is -1 then try to find a node to move IP to... */
+static bool try_moveip(struct ctdb_context *ctdb, ctdb_sock_addr *addr, uint32_t pnn)
+{
+	bool pnn_specified = (pnn == -1 ? false : true);
+	int retries = 0;
+
+	while (retries < 5) {
+		if (!pnn_specified) {
+			pnn = find_other_host_for_public_ip(ctdb, addr);
+			if (pnn == -1) {
+				return false;
+			}
+			DEBUG(DEBUG_NOTICE,
+			      ("Trying to move public IP to node %u\n", pnn));
+		}
+
+		if (move_ip(ctdb, addr, pnn) == 0) {
+			return true;
+		}
+
+		sleep(3);
+		retries++;
+	}
+
+	return false;
+}
+
 
 /*
   move/failover an ip address to a specific node
@@ -1092,6 +1801,8 @@ static int control_moveip(struct ctdb_context *ctdb, int argc, const char **argv
 {
 	uint32_t pnn;
 	ctdb_sock_addr addr;
+
+	assert_single_node_only();
 
 	if (argc < 2) {
 		usage();
@@ -1109,8 +1820,136 @@ static int control_moveip(struct ctdb_context *ctdb, int argc, const char **argv
 		return -1;
 	}
 
-	if (move_ip(ctdb, &addr, pnn) != 0) {
-		DEBUG(DEBUG_ERR,("Failed to move ip to node %d\n", pnn));
+	if (!try_moveip(ctdb, &addr, pnn)) {
+		DEBUG(DEBUG_ERR,("Failed to move IP to node %d.\n", pnn));
+		return -1;
+	}
+
+	return 0;
+}
+
+static int rebalance_node(struct ctdb_context *ctdb, uint32_t pnn)
+{
+	TDB_DATA data;
+
+	data.dptr  = (uint8_t *)&pnn;
+	data.dsize = sizeof(uint32_t);
+	if (ctdb_client_send_message(ctdb, CTDB_BROADCAST_CONNECTED, CTDB_SRVID_REBALANCE_NODE, data) != 0) {
+		DEBUG(DEBUG_ERR,
+		      ("Failed to send message to force node %u to be a rebalancing target\n",
+		       pnn));
+		return -1;
+	}
+
+	return 0;
+}
+
+
+/*
+  rebalance a node by setting it to allow failback and triggering a
+  takeover run
+ */
+static int control_rebalancenode(struct ctdb_context *ctdb, int argc, const char **argv)
+{
+	TALLOC_CTX *tmp_ctx = talloc_new(ctdb);
+	uint32_t *nodes;
+	uint32_t pnn_mode;
+	int i, ret;
+
+	assert_single_node_only();
+
+	if (argc > 1) {
+		usage();
+	}
+
+	/* Determine the nodes where IPs need to be reloaded */
+	if (!parse_nodestring(ctdb, tmp_ctx, argc == 1 ? argv[0] : NULL,
+			      options.pnn, true, &nodes, &pnn_mode)) {
+		ret = -1;
+		goto done;
+	}
+
+	for (i = 0; i < talloc_array_length(nodes); i++) {
+		if (!rebalance_node(ctdb, nodes[i])) {
+			ret = -1;
+		}
+	}
+
+done:
+	talloc_free(tmp_ctx);
+	return ret;
+}
+
+static int rebalance_ip(struct ctdb_context *ctdb, ctdb_sock_addr *addr)
+{
+	struct ctdb_public_ip ip;
+	int ret;
+	uint32_t *nodes;
+	uint32_t disable_time;
+	TDB_DATA data;
+	struct ctdb_node_map *nodemap=NULL;
+	TALLOC_CTX *tmp_ctx = talloc_new(ctdb);
+
+	disable_time = 30;
+	data.dptr  = (uint8_t*)&disable_time;
+	data.dsize = sizeof(disable_time);
+	ret = ctdb_client_send_message(ctdb, CTDB_BROADCAST_CONNECTED, CTDB_SRVID_DISABLE_IP_CHECK, data);
+	if (ret != 0) {
+		DEBUG(DEBUG_ERR,("Failed to send message to disable ipcheck\n"));
+		return -1;
+	}
+
+	ip.pnn  = -1;
+	ip.addr = *addr;
+
+	data.dptr  = (uint8_t *)&ip;
+	data.dsize = sizeof(ip);
+
+	ret = ctdb_ctrl_getnodemap(ctdb, TIMELIMIT(), options.pnn, tmp_ctx, &nodemap);
+	if (ret != 0) {
+		DEBUG(DEBUG_ERR, ("Unable to get nodemap from node %u\n", options.pnn));
+		talloc_free(tmp_ctx);
+		return ret;
+	}
+
+       	nodes = list_of_active_nodes(ctdb, nodemap, tmp_ctx, true);
+	ret = ctdb_client_async_control(ctdb, CTDB_CONTROL_RELEASE_IP,
+					nodes, 0,
+					LONGTIMELIMIT(),
+					false, data,
+					NULL, NULL,
+					NULL);
+	if (ret != 0) {
+		DEBUG(DEBUG_ERR,("Failed to release IP on nodes\n"));
+		talloc_free(tmp_ctx);
+		return -1;
+	}
+
+	talloc_free(tmp_ctx);
+	return 0;
+}
+
+/*
+  release an ip form all nodes and have it re-assigned by recd
+ */
+static int control_rebalanceip(struct ctdb_context *ctdb, int argc, const char **argv)
+{
+	ctdb_sock_addr addr;
+
+	assert_single_node_only();
+
+	if (argc < 1) {
+		usage();
+		return -1;
+	}
+
+	if (parse_ip(argv[0], NULL, 0, &addr) == 0) {
+		DEBUG(DEBUG_ERR,("Wrongly formed ip address '%s'\n", argv[0]));
+		return -1;
+	}
+
+	if (rebalance_ip(ctdb, &addr) != 0) {
+		DEBUG(DEBUG_ERR,("Error when trying to reassign ip\n"));
 		return -1;
 	}
 
@@ -1148,12 +1987,14 @@ static uint32_t *ip_key(ctdb_sock_addr *ip)
 	case AF_INET:
 		key[0]	= ip->ip.sin_addr.s_addr;
 		break;
-	case AF_INET6:
-		key[0]	= ip->ip6.sin6_addr.s6_addr32[3];
-		key[1]	= ip->ip6.sin6_addr.s6_addr32[2];
-		key[2]	= ip->ip6.sin6_addr.s6_addr32[1];
-		key[3]	= ip->ip6.sin6_addr.s6_addr32[0];
+	case AF_INET6: {
+		uint32_t *s6_a32 = (uint32_t *)&(ip->ip6.sin6_addr.s6_addr);
+		key[0]	= s6_a32[3];
+		key[1]	= s6_a32[2];
+		key[2]	= s6_a32[1];
+		key[3]	= s6_a32[0];
 		break;
+	}
 	default:
 		DEBUG(DEBUG_ERR, (__location__ " ERROR, unknown family passed :%u\n", ip->sa.sa_family));
 		return key;
@@ -1229,51 +2070,185 @@ control_get_all_public_ips(struct ctdb_context *ctdb, TALLOC_CTX *tmp_ctx, struc
 }
 
 
-/* 
- * scans all other nodes and returns a pnn for another node that can host this 
- * ip address or -1
- */
-static int
-find_other_host_for_public_ip(struct ctdb_context *ctdb, ctdb_sock_addr *addr)
+static void ctdb_every_second(struct event_context *ev, struct timed_event *te, struct timeval t, void *p)
 {
-	TALLOC_CTX *tmp_ctx = talloc_new(ctdb);
-	struct ctdb_all_public_ips *ips;
-	struct ctdb_node_map *nodemap=NULL;
-	int i, j, ret;
+	struct ctdb_context *ctdb = talloc_get_type(p, struct ctdb_context);
 
-	ret = ctdb_ctrl_getnodemap(ctdb, TIMELIMIT(), CTDB_CURRENT_NODE, tmp_ctx, &nodemap);
-	if (ret != 0) {
-		DEBUG(DEBUG_ERR, ("Unable to get nodemap from node %u\n", options.pnn));
-		talloc_free(tmp_ctx);
-		return ret;
+	event_add_timed(ctdb->ev, ctdb, 
+				timeval_current_ofs(1, 0),
+				ctdb_every_second, ctdb);
+}
+
+struct srvid_reply_handler_data {
+	bool done;
+	bool wait_for_all;
+	uint32_t *nodes;
+	const char *srvid_str;
+};
+
+static void srvid_broadcast_reply_handler(struct ctdb_context *ctdb,
+					 uint64_t srvid,
+					 TDB_DATA data,
+					 void *private_data)
+{
+	struct srvid_reply_handler_data *d =
+		(struct srvid_reply_handler_data *)private_data;
+	int i;
+	int32_t ret;
+
+	if (data.dsize != sizeof(ret)) {
+		DEBUG(DEBUG_ERR, (__location__ " Wrong reply size\n"));
+		return;
 	}
 
-	for(i=0;i<nodemap->num;i++){
-		if (nodemap->nodes[i].flags & NODE_FLAGS_INACTIVE) {
-			continue;
-		}
-		if (nodemap->nodes[i].pnn == options.pnn) {
-			continue;
-		}
+	/* ret will be a PNN (i.e. >=0) on success, or negative on error */
+	ret = *(int32_t *)data.dptr;
+	if (ret < 0) {
+		DEBUG(DEBUG_ERR,
+		      ("%s failed with result %d\n", d->srvid_str, ret));
+		return;
+	}
 
-		/* read the public ip list from this node */
-		ret = ctdb_ctrl_get_public_ips(ctdb, TIMELIMIT(), nodemap->nodes[i].pnn, tmp_ctx, &ips);
+	if (!d->wait_for_all) {
+		d->done = true;
+		return;
+	}
+
+	/* Wait for all replies */
+	d->done = true;
+	for (i = 0; i < talloc_array_length(d->nodes); i++) {
+		if (d->nodes[i] == ret) {
+			DEBUG(DEBUG_INFO,
+			      ("%s reply received from node %u\n",
+			       d->srvid_str, ret));
+			d->nodes[i] = -1;
+		}
+		if (d->nodes[i] != -1) {
+			/* Found a node that hasn't yet replied */
+			d->done = false;
+		}
+	}
+}
+
+/* Broadcast the given SRVID to all connected nodes.  Wait for 1 reply
+ * or replies from all connected nodes.  arg is the data argument to
+ * pass in the srvid_request structure - pass 0 if this isn't needed.
+ */
+static int srvid_broadcast(struct ctdb_context *ctdb,
+			   uint64_t srvid, uint32_t *arg,
+			   const char *srvid_str, bool wait_for_all)
+{
+	int ret;
+	TDB_DATA data;
+	uint32_t pnn;
+	uint64_t reply_srvid;
+	struct srvid_request request;
+	struct srvid_request_data request_data;
+	struct srvid_reply_handler_data reply_data;
+	struct timeval tv;
+
+	ZERO_STRUCT(request);
+
+	/* Time ticks to enable timeouts to be processed */
+	event_add_timed(ctdb->ev, ctdb, 
+				timeval_current_ofs(1, 0),
+				ctdb_every_second, ctdb);
+
+	pnn = ctdb_get_pnn(ctdb);
+	reply_srvid = getpid();
+
+	if (arg == NULL) {
+		request.pnn = pnn;
+		request.srvid = reply_srvid;
+
+		data.dptr = (uint8_t *)&request;
+		data.dsize = sizeof(request);
+	} else {
+		request_data.pnn = pnn;
+		request_data.srvid = reply_srvid;
+		request_data.data = *arg;
+
+		data.dptr = (uint8_t *)&request_data;
+		data.dsize = sizeof(request_data);
+	}
+
+	/* Register message port for reply from recovery master */
+	ctdb_client_set_message_handler(ctdb, reply_srvid,
+					srvid_broadcast_reply_handler,
+					&reply_data);
+
+	reply_data.wait_for_all = wait_for_all;
+	reply_data.nodes = NULL;
+	reply_data.srvid_str = srvid_str;
+
+again:
+	reply_data.done = false;
+
+	if (wait_for_all) {
+		struct ctdb_node_map *nodemap;
+
+		ret = ctdb_ctrl_getnodemap(ctdb, TIMELIMIT(),
+					   CTDB_CURRENT_NODE, ctdb, &nodemap);
 		if (ret != 0) {
-			DEBUG(DEBUG_ERR, ("Unable to get public ip list from node %u\n", nodemap->nodes[i].pnn));
-			return -1;
+			DEBUG(DEBUG_ERR,
+			      ("Unable to get nodemap from current node, try again\n"));
+			sleep(1);
+			goto again;
 		}
 
-		for (j=0;j<ips->num;j++) {
-			if (ctdb_same_ip(addr, &ips->ips[j].addr)) {
-				talloc_free(tmp_ctx);
-				return nodemap->nodes[i].pnn;
-			}
+		if (reply_data.nodes != NULL) {
+			talloc_free(reply_data.nodes);
 		}
-		talloc_free(ips);
+		reply_data.nodes = list_of_connected_nodes(ctdb, nodemap,
+							   NULL, true);
+
+		talloc_free(nodemap);
 	}
 
-	talloc_free(tmp_ctx);
-	return -1;
+	/* Send to all connected nodes. Only recmaster replies */
+	ret = ctdb_client_send_message(ctdb, CTDB_BROADCAST_CONNECTED,
+				       srvid, data);
+	if (ret != 0) {
+		/* This can only happen if the socket is closed and
+		 * there's no way to recover from that, so don't try
+		 * again.
+		 */
+		DEBUG(DEBUG_ERR,
+		      ("Failed to send %s request to connected nodes\n",
+		       srvid_str));
+		return -1;
+	}
+
+	tv = timeval_current();
+	/* This loop terminates the reply is received */
+	while (timeval_elapsed(&tv) < 5.0 && !reply_data.done) {
+		event_loop_once(ctdb->ev);
+	}
+
+	if (!reply_data.done) {
+		DEBUG(DEBUG_NOTICE,
+		      ("Still waiting for confirmation of %s\n", srvid_str));
+		sleep(1);
+		goto again;
+	}
+
+	ctdb_client_remove_message_handler(ctdb, reply_srvid, &reply_data);
+
+	talloc_free(reply_data.nodes);
+
+	return 0;
+}
+
+static int ipreallocate(struct ctdb_context *ctdb)
+{
+	return srvid_broadcast(ctdb, CTDB_SRVID_TAKEOVER_RUN, NULL,
+			       "IP reallocation", false);
+}
+
+
+static int control_ipreallocate(struct ctdb_context *ctdb, int argc, const char **argv)
+{
+	return ipreallocate(ctdb);
 }
 
 /*
@@ -1282,8 +2257,7 @@ find_other_host_for_public_ip(struct ctdb_context *ctdb, ctdb_sock_addr *addr)
 static int control_addip(struct ctdb_context *ctdb, int argc, const char **argv)
 {
 	int i, ret;
-	int len;
-	uint32_t pnn;
+	int len, retries = 0;
 	unsigned mask;
 	ctdb_sock_addr addr;
 	struct ctdb_control_ip_iface *pub;
@@ -1302,22 +2276,27 @@ static int control_addip(struct ctdb_context *ctdb, int argc, const char **argv)
 		return -1;
 	}
 
-	ret = control_get_all_public_ips(ctdb, tmp_ctx, &ips);
+	/* read the public ip list from the node */
+	ret = ctdb_ctrl_get_public_ips(ctdb, TIMELIMIT(), options.pnn, tmp_ctx, &ips);
 	if (ret != 0) {
-		DEBUG(DEBUG_ERR, ("Unable to get public ip list from cluster\n"));
+		DEBUG(DEBUG_ERR, ("Unable to get public ip list from node %u\n", options.pnn));
 		talloc_free(tmp_ctx);
-		return ret;
+		return -1;
 	}
-
-
-	/* check if some other node is already serving this ip, if not,
-	 * we will claim it
-	 */
 	for (i=0;i<ips->num;i++) {
 		if (ctdb_same_ip(&addr, &ips->ips[i].addr)) {
-			break;
+			DEBUG(DEBUG_ERR,("Can not add ip to node. Node already hosts this ip\n"));
+			return 0;
 		}
 	}
+
+
+
+	/* Dont timeout. This command waits for an ip reallocation
+	   which sometimes can take wuite a while if there has
+	   been a recent recovery
+	*/
+	alarm(0);
 
 	len = offsetof(struct ctdb_control_ip_iface, iface) + strlen(argv[1]) + 1;
 	pub = talloc_size(tmp_ctx, len); 
@@ -1328,26 +2307,47 @@ static int control_addip(struct ctdb_context *ctdb, int argc, const char **argv)
 	pub->len   = strlen(argv[1])+1;
 	memcpy(&pub->iface[0], argv[1], strlen(argv[1])+1);
 
-	ret = ctdb_ctrl_add_public_ip(ctdb, TIMELIMIT(), options.pnn, pub);
+	do {
+		ret = ctdb_ctrl_add_public_ip(ctdb, TIMELIMIT(), options.pnn, pub);
+		if (ret != 0) {
+			DEBUG(DEBUG_ERR, ("Unable to add public ip to node %u. Wait 3 seconds and try again.\n", options.pnn));
+			sleep(3);
+			retries++;
+		}
+	} while (retries < 5 && ret != 0);
 	if (ret != 0) {
-		DEBUG(DEBUG_ERR, ("Unable to add public ip to node %u\n", options.pnn));
+		DEBUG(DEBUG_ERR, ("Unable to add public ip to node %u. Giving up.\n", options.pnn));
 		talloc_free(tmp_ctx);
 		return ret;
 	}
 
-	if (i == ips->num) {
-		/* no one has this ip so we claim it */
-		pnn  = options.pnn;
-	} else {
-		pnn  = ips->ips[i].pnn;
-	}
-
-	if (move_ip(ctdb, &addr, pnn) != 0) {
-		DEBUG(DEBUG_ERR,("Failed to move ip to node %d\n", pnn));
-		return -1;
+	if (rebalance_node(ctdb, options.pnn) != 0) {
+		DEBUG(DEBUG_ERR,("Error when trying to rebalance node\n"));
+		return ret;
 	}
 
 	talloc_free(tmp_ctx);
+	return 0;
+}
+
+/*
+  add a public ip address to a node
+ */
+static int control_ipiface(struct ctdb_context *ctdb, int argc, const char **argv)
+{
+	ctdb_sock_addr addr;
+
+	if (argc != 1) {
+		usage();
+	}
+
+	if (!parse_ip(argv[0], NULL, 0, &addr)) {
+		printf("Badly formed ip : %s\n", argv[0]);
+		return -1;
+	}
+
+	printf("IP on interface %s\n", ctdb_sys_find_ifname(&addr));
+
 	return 0;
 }
 
@@ -1371,7 +2371,8 @@ static int control_delip_all(struct ctdb_context *ctdb, int argc, const char **a
 		if (nodemap->nodes[i].flags & NODE_FLAGS_INACTIVE) {
 			continue;
 		}
-		if (ctdb_ctrl_get_public_ips(ctdb, TIMELIMIT(), nodemap->nodes[i].pnn, tmp_ctx, &ips) != 0) {
+		ret = ctdb_ctrl_get_public_ips(ctdb, TIMELIMIT(), nodemap->nodes[i].pnn, tmp_ctx, &ips);
+		if (ret != 0) {
 			DEBUG(DEBUG_ERR, ("Unable to get public ip list from node %d\n", nodemap->nodes[i].pnn));
 			continue;
 		}
@@ -1399,7 +2400,8 @@ static int control_delip_all(struct ctdb_context *ctdb, int argc, const char **a
 		if (nodemap->nodes[i].flags & NODE_FLAGS_INACTIVE) {
 			continue;
 		}
-		if (ctdb_ctrl_get_public_ips(ctdb, TIMELIMIT(), nodemap->nodes[i].pnn, tmp_ctx, &ips) != 0) {
+		ret = ctdb_ctrl_get_public_ips(ctdb, TIMELIMIT(), nodemap->nodes[i].pnn, tmp_ctx, &ips);
+		if (ret != 0) {
 			DEBUG(DEBUG_ERR, ("Unable to get public ip list from node %d\n", nodemap->nodes[i].pnn));
 			continue;
 		}
@@ -1470,14 +2472,12 @@ static int control_delip(struct ctdb_context *ctdb, int argc, const char **argv)
 		return -1;
 	}
 
+	/* This is an optimisation.  If this node is hosting the IP
+	 * then try to move it somewhere else without invoking a full
+	 * takeover run.  We don't care if this doesn't work!
+	 */
 	if (ips->ips[i].pnn == options.pnn) {
-		ret = find_other_host_for_public_ip(ctdb, &addr);
-		if (ret != -1) {
-			if (move_ip(ctdb, &addr, ret) != 0) {
-				DEBUG(DEBUG_ERR,("Failed to move ip to node %d\n", ret));
-				return -1;
-			}
-		}
+		(void) try_moveip(ctdb, &addr, -1);
 	}
 
 	ret = ctdb_ctrl_del_public_ip(ctdb, TIMELIMIT(), options.pnn, &pub);
@@ -1491,6 +2491,106 @@ static int control_delip(struct ctdb_context *ctdb, int argc, const char **argv)
 	return 0;
 }
 
+static int kill_tcp_from_file(struct ctdb_context *ctdb,
+			      int argc, const char **argv)
+{
+	struct ctdb_control_killtcp *killtcp;
+	int max_entries, current, i;
+	struct timeval timeout;
+	char line[128], src[128], dst[128];
+	int linenum;
+	TDB_DATA data;
+	struct client_async_data *async_data;
+	struct ctdb_client_control_state *state;
+
+	if (argc != 0) {
+		usage();
+	}
+
+	linenum = 1;
+	killtcp = NULL;
+	max_entries = 0;
+	current = 0;
+	while (!feof(stdin)) {
+		if (fgets(line, sizeof(line), stdin) == NULL) {
+			continue;
+		}
+
+		/* Silently skip empty lines */
+		if (line[0] == '\n') {
+			continue;
+		}
+
+		if (sscanf(line, "%s %s\n", src, dst) != 2) {
+			DEBUG(DEBUG_ERR, ("Bad line [%d]: '%s'\n",
+					  linenum, line));
+			talloc_free(killtcp);
+			return -1;
+		}
+
+		if (current >= max_entries) {
+			max_entries += 1024;
+			killtcp = talloc_realloc(ctdb, killtcp,
+						 struct ctdb_control_killtcp,
+						 max_entries);
+			CTDB_NO_MEMORY(ctdb, killtcp);
+		}
+
+		if (!parse_ip_port(src, &killtcp[current].src_addr)) {
+			DEBUG(DEBUG_ERR, ("Bad IP:port on line [%d]: '%s'\n",
+					  linenum, src));
+			talloc_free(killtcp);
+			return -1;
+		}
+
+		if (!parse_ip_port(dst, &killtcp[current].dst_addr)) {
+			DEBUG(DEBUG_ERR, ("Bad IP:port on line [%d]: '%s'\n",
+					  linenum, dst));
+			talloc_free(killtcp);
+			return -1;
+		}
+
+		current++;
+	}
+
+	async_data = talloc_zero(ctdb, struct client_async_data);
+	if (async_data == NULL) {
+		talloc_free(killtcp);
+		return -1;
+	}
+
+	for (i = 0; i < current; i++) {
+
+		data.dsize = sizeof(struct ctdb_control_killtcp);
+		data.dptr  = (unsigned char *)&killtcp[i];
+
+		timeout = TIMELIMIT();
+		state = ctdb_control_send(ctdb, options.pnn, 0,
+					  CTDB_CONTROL_KILL_TCP, 0, data,
+					  async_data, &timeout, NULL);
+
+		if (state == NULL) {
+			DEBUG(DEBUG_ERR,
+			      ("Failed to call async killtcp control to node %u\n",
+			       options.pnn));
+			talloc_free(killtcp);
+			return -1;
+		}
+		
+		ctdb_client_async_add(async_data, state);
+	}
+
+	if (ctdb_client_async_wait(ctdb, async_data) != 0) {
+		DEBUG(DEBUG_ERR,("killtcp failed\n"));
+		talloc_free(killtcp);
+		return -1;
+	}
+
+	talloc_free(killtcp);
+	return 0;
+}
+
+
 /*
   kill a tcp connection
  */
@@ -1498,6 +2598,12 @@ static int kill_tcp(struct ctdb_context *ctdb, int argc, const char **argv)
 {
 	int ret;
 	struct ctdb_control_killtcp killtcp;
+
+	assert_single_node_only();
+
+	if (argc == 0) {
+		return kill_tcp_from_file(ctdb, argc, argv);
+	}
 
 	if (argc < 2) {
 		usage();
@@ -1530,6 +2636,8 @@ static int control_gratious_arp(struct ctdb_context *ctdb, int argc, const char 
 {
 	int ret;
 	ctdb_sock_addr addr;
+
+	assert_single_node_only();
 
 	if (argc < 2) {
 		usage();
@@ -1655,6 +2763,44 @@ static int getsrvids(struct ctdb_context *ctdb, int argc, const char **argv)
 }
 
 /*
+  check if a server id exists
+ */
+static int check_srvids(struct ctdb_context *ctdb, int argc, const char **argv)
+{
+	TALLOC_CTX *tmp_ctx = talloc_new(NULL);
+	uint64_t *ids;
+	uint8_t *result;
+	int i;
+
+	if (argc < 1) {
+		talloc_free(tmp_ctx);
+		usage();
+	}
+
+	ids    = talloc_array(tmp_ctx, uint64_t, argc);
+	result = talloc_array(tmp_ctx, uint8_t, argc);
+
+	for (i = 0; i < argc; i++) {
+		ids[i] = strtoull(argv[i], NULL, 0);
+	}
+
+	if (!ctdb_client_check_message_handlers(ctdb, ids, argc, result)) {
+		DEBUG(DEBUG_ERR, ("Unable to check server_id from node %u\n",
+				  options.pnn));
+		talloc_free(tmp_ctx);
+		return -1;
+	}
+
+	for (i=0; i < argc; i++) {
+		printf("Server id %d:%llu %s\n", options.pnn, (long long)ids[i],
+		       result[i] ? "exists" : "does not exist");
+	}
+
+	talloc_free(tmp_ctx);
+	return 0;
+}
+
+/*
   send a tcp tickle ack
  */
 static int tickle_tcp(struct ctdb_context *ctdb, int argc, const char **argv)
@@ -1709,7 +2855,11 @@ static int control_ip(struct ctdb_context *ctdb, int argc, const char **argv)
 	}
 
 	if (options.machinereadable){
-		printf(":Public IP:Node:ActiveInterface:AvailableInterfaces:ConfiguredInterfaces:\n");
+		printf(":Public IP:Node:");
+		if (options.verbose){
+			printf("ActiveInterface:AvailableInterfaces:ConfiguredInterfaces:");
+		}
+		printf("\n");
 	} else {
 		if (options.pnn == CTDB_BROADCAST_ALL) {
 			printf("Public IPs on ALL nodes\n");
@@ -1769,19 +2919,29 @@ static int control_ip(struct ctdb_context *ctdb, int argc, const char **argv)
 		}
 
 		if (options.machinereadable){
-			printf(":%s:%d:%s:%s:%s:\n",
-			       ctdb_addr_to_str(&ips->ips[ips->num-i].addr),
-			       ips->ips[ips->num-i].pnn,
-			       aciface?aciface:"",
-			       avifaces?avifaces:"",
-			       cifaces?cifaces:"");
+			printf(":%s:%d:",
+				ctdb_addr_to_str(&ips->ips[ips->num-i].addr),
+				ips->ips[ips->num-i].pnn);
+			if (options.verbose){
+				printf("%s:%s:%s:",
+					aciface?aciface:"",
+					avifaces?avifaces:"",
+					cifaces?cifaces:"");
+			}
+			printf("\n");
 		} else {
-			printf("%s node[%d] active[%s] available[%s] configured[%s]\n",
-			       ctdb_addr_to_str(&ips->ips[ips->num-i].addr),
-			       ips->ips[ips->num-i].pnn,
-			       aciface?aciface:"",
-			       avifaces?avifaces:"",
-			       cifaces?cifaces:"");
+			if (options.verbose) {
+				printf("%s node[%d] active[%s] available[%s] configured[%s]\n",
+					ctdb_addr_to_str(&ips->ips[ips->num-i].addr),
+					ips->ips[ips->num-i].pnn,
+					aciface?aciface:"",
+					avifaces?avifaces:"",
+					cifaces?cifaces:"");
+			} else {
+				printf("%s %d\n",
+					ctdb_addr_to_str(&ips->ips[ips->num-i].addr),
+					ips->ips[ips->num-i].pnn);
+			}
 		}
 		talloc_free(info);
 	}
@@ -1847,18 +3007,18 @@ static int control_ipinfo(struct ctdb_context *ctdb, int argc, const char **argv
  */
 static int control_ifaces(struct ctdb_context *ctdb, int argc, const char **argv)
 {
-	int i, ret;
 	TALLOC_CTX *tmp_ctx = talloc_new(ctdb);
+	int i;
 	struct ctdb_control_get_ifaces *ifaces;
+	int ret;
 
 	/* read the public ip list from this node */
-	ret = ctdb_ctrl_get_ifaces(ctdb, TIMELIMIT(), options.pnn,
-				   tmp_ctx, &ifaces);
+	ret = ctdb_ctrl_get_ifaces(ctdb, TIMELIMIT(), options.pnn, tmp_ctx, &ifaces);
 	if (ret != 0) {
 		DEBUG(DEBUG_ERR, ("Unable to get interfaces from node %u\n",
 				  options.pnn));
 		talloc_free(tmp_ctx);
-		return ret;
+		return -1;
 	}
 
 	if (options.machinereadable){
@@ -1952,309 +3112,139 @@ static int control_getpid(struct ctdb_context *ctdb, int argc, const char **argv
 	return 0;
 }
 
-static uint32_t ipreallocate_finished;
+typedef bool update_flags_handler_t(struct ctdb_context *ctdb, void *data);
 
-/*
-  handler for receiving the response to ipreallocate
-*/
-static void ip_reallocate_handler(struct ctdb_context *ctdb, uint64_t srvid, 
-			     TDB_DATA data, void *private_data)
+static int update_flags_and_ipreallocate(struct ctdb_context *ctdb,
+					      void *data,
+					      update_flags_handler_t handler,
+					      uint32_t flag,
+					      const char *desc,
+					      bool set_flag)
 {
-	ipreallocate_finished = 1;
-}
+	struct ctdb_node_map *nodemap = NULL;
+	bool flag_is_set;
+	int ret;
 
-static void ctdb_every_second(struct event_context *ev, struct timed_event *te, struct timeval t, void *p)
-{
-	struct ctdb_context *ctdb = talloc_get_type(p, struct ctdb_context);
-
-	event_add_timed(ctdb->ev, ctdb, 
-				timeval_current_ofs(1, 0),
-				ctdb_every_second, ctdb);
-}
-
-/*
-  ask the recovery daemon on the recovery master to perform a ip reallocation
- */
-static int control_ipreallocate(struct ctdb_context *ctdb, int argc, const char **argv)
-{
-	int i, ret;
-	TDB_DATA data;
-	struct takeover_run_reply rd;
-	uint32_t recmaster;
-	struct ctdb_node_map *nodemap=NULL;
-	int retries=0;
-	struct timeval tv = timeval_current();
-
-	/* we need some events to trigger so we can timeout and restart
-	   the loop
-	*/
-	event_add_timed(ctdb->ev, ctdb, 
-				timeval_current_ofs(1, 0),
-				ctdb_every_second, ctdb);
-
-	rd.pnn = ctdb_ctrl_getpnn(ctdb, TIMELIMIT(), CTDB_CURRENT_NODE);
-	if (rd.pnn == -1) {
-		DEBUG(DEBUG_ERR, ("Failed to get pnn of local node\n"));
-		return -1;
-	}
-	rd.srvid = getpid();
-
-	/* register a message port for receiveing the reply so that we
-	   can receive the reply
-	*/
-	ctdb_set_message_handler(ctdb, rd.srvid, ip_reallocate_handler, NULL);
-
-	data.dptr = (uint8_t *)&rd;
-	data.dsize = sizeof(rd);
-
-again:
-	if (retries>5) {
-		DEBUG(DEBUG_ERR,("Failed waiting for cluster convergense\n"));
-		exit(10);
-	}
-
-	/* check that there are valid nodes available */
-	if (ctdb_ctrl_getnodemap(ctdb, TIMELIMIT(), options.pnn, ctdb, &nodemap) != 0) {
+	/* Check if the node is already in the desired state */
+	ret = ctdb_ctrl_getnodemap(ctdb, TIMELIMIT(), CTDB_CURRENT_NODE, ctdb, &nodemap);
+	if (ret != 0) {
 		DEBUG(DEBUG_ERR, ("Unable to get nodemap from local node\n"));
 		exit(10);
 	}
-	for (i=0; i<nodemap->num;i++) {
-		if ((nodemap->nodes[i].flags & (NODE_FLAGS_DELETED|NODE_FLAGS_BANNED|NODE_FLAGS_STOPPED)) == 0) {
-			break;
+	flag_is_set = nodemap->nodes[options.pnn].flags & flag;
+	if (set_flag == flag_is_set) {
+		DEBUG(DEBUG_NOTICE, ("Node %d is %s %s\n", options.pnn,
+				     (set_flag ? "already" : "not"), desc));
+		return 0;
+	}
+
+	do {
+		if (!handler(ctdb, data)) {
+			DEBUG(DEBUG_WARNING,
+			      ("Failed to send control to set state %s on node %u, try again\n",
+			       desc, options.pnn));
 		}
-	}
-	if (i==nodemap->num) {
-		DEBUG(DEBUG_ERR,("No recmaster available, no need to wait for cluster convergence\n"));
-		return 0;
-	}
 
+		sleep(1);
 
-	ret = ctdb_ctrl_getrecmaster(ctdb, ctdb, TIMELIMIT(), options.pnn, &recmaster);
-	if (ret != 0) {
-		DEBUG(DEBUG_ERR, ("Unable to get recmaster from node %u\n", options.pnn));
-		return ret;
-	}
-
-	/* verify the node exists */
-	if (ctdb_ctrl_getnodemap(ctdb, TIMELIMIT(), recmaster, ctdb, &nodemap) != 0) {
-		DEBUG(DEBUG_ERR, ("Unable to get nodemap from local node\n"));
-		exit(10);
-	}
-
-
-	/* check tha there are nodes available that can act as a recmaster */
-	for (i=0; i<nodemap->num; i++) {
-		if (nodemap->nodes[i].flags & (NODE_FLAGS_DELETED|NODE_FLAGS_BANNED|NODE_FLAGS_STOPPED)) {
-			continue;
+		/* Read the nodemap and verify the change took effect.
+		 * Even if the above control/hanlder timed out then it
+		 * could still have worked!
+		 */
+		ret = ctdb_ctrl_getnodemap(ctdb, TIMELIMIT(), CTDB_CURRENT_NODE,
+					 ctdb, &nodemap);
+		if (ret != 0) {
+			DEBUG(DEBUG_WARNING,
+			      ("Unable to get nodemap from local node, try again\n"));
 		}
-		break;
-	}
-	if (i == nodemap->num) {
-		DEBUG(DEBUG_ERR,("No possible nodes to host addresses.\n"));
-		return 0;
-	}
+		flag_is_set = nodemap->nodes[options.pnn].flags & flag;
+	} while (nodemap == NULL || (set_flag != flag_is_set));
 
-	/* verify the recovery master is not STOPPED, nor BANNED */
-	if (nodemap->nodes[recmaster].flags & (NODE_FLAGS_DELETED|NODE_FLAGS_BANNED|NODE_FLAGS_STOPPED)) {
-		DEBUG(DEBUG_ERR,("No suitable recmaster found. Try again\n"));
-		retries++;
-		sleep(1);
-		goto again;
-	} 
-
-	
-	/* verify the recovery master is not STOPPED, nor BANNED */
-	if (nodemap->nodes[recmaster].flags & (NODE_FLAGS_DELETED|NODE_FLAGS_BANNED|NODE_FLAGS_STOPPED)) {
-		DEBUG(DEBUG_ERR,("No suitable recmaster found. Try again\n"));
-		retries++;
-		sleep(1);
-		goto again;
-	} 
-
-	ipreallocate_finished = 0;
-	ret = ctdb_send_message(ctdb, recmaster, CTDB_SRVID_TAKEOVER_RUN, data);
-	if (ret != 0) {
-		DEBUG(DEBUG_ERR,("Failed to send ip takeover run request message to %u\n", options.pnn));
-		return -1;
-	}
-
-	tv = timeval_current();
-	/* this loop will terminate when we have received the reply */
-	while (timeval_elapsed(&tv) < 3.0) {	
-		event_loop_once(ctdb->ev);
-	}
-	if (ipreallocate_finished == 1) {
-		return 0;
-	}
-
-	DEBUG(DEBUG_INFO,("Timed out waiting for recmaster ipreallocate. Trying again\n"));
-	retries++;
-	sleep(1);
-	goto again;
-
-	return 0;
+	return ipreallocate(ctdb);
 }
 
+/* Administratively disable a node */
+static bool update_flags_disabled(struct ctdb_context *ctdb, void *data)
+{
+	int ret;
 
-/*
-  disable a remote node
- */
+	ret = ctdb_ctrl_modflags(ctdb, TIMELIMIT(), options.pnn,
+				 NODE_FLAGS_PERMANENTLY_DISABLED, 0);
+	return ret == 0;
+}
+
 static int control_disable(struct ctdb_context *ctdb, int argc, const char **argv)
 {
-	int ret;
-	struct ctdb_node_map *nodemap=NULL;
-
-	/* check if the node is already disabled */
-	if (ctdb_ctrl_getnodemap(ctdb, TIMELIMIT(), CTDB_CURRENT_NODE, ctdb, &nodemap) != 0) {
-		DEBUG(DEBUG_ERR, ("Unable to get nodemap from local node\n"));
-		exit(10);
-	}
-	if (nodemap->nodes[options.pnn].flags & NODE_FLAGS_PERMANENTLY_DISABLED) {
-		DEBUG(DEBUG_ERR,("Node %d is already disabled.\n", options.pnn));
-		return 0;
-	}
-
-	do {
-		ret = ctdb_ctrl_modflags(ctdb, TIMELIMIT(), options.pnn, NODE_FLAGS_PERMANENTLY_DISABLED, 0);
-		if (ret != 0) {
-			DEBUG(DEBUG_ERR, ("Unable to disable node %u\n", options.pnn));
-			return ret;
-		}
-
-		sleep(1);
-
-		/* read the nodemap and verify the change took effect */
-		if (ctdb_ctrl_getnodemap(ctdb, TIMELIMIT(), CTDB_CURRENT_NODE, ctdb, &nodemap) != 0) {
-			DEBUG(DEBUG_ERR, ("Unable to get nodemap from local node\n"));
-			exit(10);
-		}
-
-	} while (!(nodemap->nodes[options.pnn].flags & NODE_FLAGS_PERMANENTLY_DISABLED));
-	ret = control_ipreallocate(ctdb, argc, argv);
-	if (ret != 0) {
-		DEBUG(DEBUG_ERR, ("IP Reallocate failed on node %u\n", options.pnn));
-		return ret;
-	}
-
-	return 0;
+	return update_flags_and_ipreallocate(ctdb, NULL,
+						  update_flags_disabled,
+						  NODE_FLAGS_PERMANENTLY_DISABLED,
+						  "disabled",
+						  true /* set_flag*/);
 }
 
-/*
-  enable a disabled remote node
- */
-static int control_enable(struct ctdb_context *ctdb, int argc, const char **argv)
+/* Administratively re-enable a node */
+static bool update_flags_not_disabled(struct ctdb_context *ctdb, void *data)
 {
 	int ret;
 
-	struct ctdb_node_map *nodemap=NULL;
-
-
-	/* check if the node is already enabled */
-	if (ctdb_ctrl_getnodemap(ctdb, TIMELIMIT(), CTDB_CURRENT_NODE, ctdb, &nodemap) != 0) {
-		DEBUG(DEBUG_ERR, ("Unable to get nodemap from local node\n"));
-		exit(10);
-	}
-	if (!(nodemap->nodes[options.pnn].flags & NODE_FLAGS_PERMANENTLY_DISABLED)) {
-		DEBUG(DEBUG_ERR,("Node %d is already enabled.\n", options.pnn));
-		return 0;
-	}
-
-	do {
-		ret = ctdb_ctrl_modflags(ctdb, TIMELIMIT(), options.pnn, 0, NODE_FLAGS_PERMANENTLY_DISABLED);
-		if (ret != 0) {
-			DEBUG(DEBUG_ERR, ("Unable to enable node %u\n", options.pnn));
-			return ret;
-		}
-
-		sleep(1);
-
-		/* read the nodemap and verify the change took effect */
-		if (ctdb_ctrl_getnodemap(ctdb, TIMELIMIT(), CTDB_CURRENT_NODE, ctdb, &nodemap) != 0) {
-			DEBUG(DEBUG_ERR, ("Unable to get nodemap from local node\n"));
-			exit(10);
-		}
-
-	} while (nodemap->nodes[options.pnn].flags & NODE_FLAGS_PERMANENTLY_DISABLED);
-
-	ret = control_ipreallocate(ctdb, argc, argv);
-	if (ret != 0) {
-		DEBUG(DEBUG_ERR, ("IP Reallocate failed on node %u\n", options.pnn));
-		return ret;
-	}
-
-	return 0;
+	ret = ctdb_ctrl_modflags(ctdb, TIMELIMIT(), options.pnn,
+				 0, NODE_FLAGS_PERMANENTLY_DISABLED);
+	return ret == 0;
 }
 
-/*
-  stop a remote node
- */
+static int control_enable(struct ctdb_context *ctdb,  int argc, const char **argv)
+{
+	return update_flags_and_ipreallocate(ctdb, NULL,
+						  update_flags_not_disabled,
+						  NODE_FLAGS_PERMANENTLY_DISABLED,
+						  "disabled",
+						  false /* set_flag*/);
+}
+
+/* Stop a node */
+static bool update_flags_stopped(struct ctdb_context *ctdb, void *data)
+{
+	int ret;
+
+	ret = ctdb_ctrl_stop_node(ctdb, TIMELIMIT(), options.pnn);
+
+	return ret == 0;
+}
+
 static int control_stop(struct ctdb_context *ctdb, int argc, const char **argv)
 {
-	int ret;
-	struct ctdb_node_map *nodemap=NULL;
-
-	do {
-		ret = ctdb_ctrl_stop_node(ctdb, TIMELIMIT(), options.pnn);
-		if (ret != 0) {
-			DEBUG(DEBUG_ERR, ("Unable to stop node %u   try again\n", options.pnn));
-		}
-	
-		sleep(1);
-
-		/* read the nodemap and verify the change took effect */
-		if (ctdb_ctrl_getnodemap(ctdb, TIMELIMIT(), CTDB_CURRENT_NODE, ctdb, &nodemap) != 0) {
-			DEBUG(DEBUG_ERR, ("Unable to get nodemap from local node\n"));
-			exit(10);
-		}
-
-	} while (!(nodemap->nodes[options.pnn].flags & NODE_FLAGS_STOPPED));
-	ret = control_ipreallocate(ctdb, argc, argv);
-	if (ret != 0) {
-		DEBUG(DEBUG_ERR, ("IP Reallocate failed on node %u\n", options.pnn));
-		return ret;
-	}
-
-	return 0;
+	return update_flags_and_ipreallocate(ctdb, NULL,
+						  update_flags_stopped,
+						  NODE_FLAGS_STOPPED,
+						  "stopped",
+						  true /* set_flag*/);
 }
 
-/*
-  restart a stopped remote node
- */
-static int control_continue(struct ctdb_context *ctdb, int argc, const char **argv)
+/* Continue a stopped node */
+static bool update_flags_not_stopped(struct ctdb_context *ctdb, void *data)
 {
 	int ret;
 
-	struct ctdb_node_map *nodemap=NULL;
+	ret = ctdb_ctrl_continue_node(ctdb, TIMELIMIT(), options.pnn);
 
-	do {
-		ret = ctdb_ctrl_continue_node(ctdb, TIMELIMIT(), options.pnn);
-		if (ret != 0) {
-			DEBUG(DEBUG_ERR, ("Unable to continue node %u\n", options.pnn));
-			return ret;
-		}
-	
-		sleep(1);
+	return ret == 0;
+}
 
-		/* read the nodemap and verify the change took effect */
-		if (ctdb_ctrl_getnodemap(ctdb, TIMELIMIT(), CTDB_CURRENT_NODE, ctdb, &nodemap) != 0) {
-			DEBUG(DEBUG_ERR, ("Unable to get nodemap from local node\n"));
-			exit(10);
-		}
-
-	} while (nodemap->nodes[options.pnn].flags & NODE_FLAGS_STOPPED);
-	ret = control_ipreallocate(ctdb, argc, argv);
-	if (ret != 0) {
-		DEBUG(DEBUG_ERR, ("IP Reallocate failed on node %u\n", options.pnn));
-		return ret;
-	}
-
-	return 0;
+static int control_continue(struct ctdb_context *ctdb, int argc, const char **argv)
+{
+	return update_flags_and_ipreallocate(ctdb, NULL,
+						  update_flags_not_stopped,
+						  NODE_FLAGS_STOPPED,
+						  "stopped",
+						  false /* set_flag */);
 }
 
 static uint32_t get_generation(struct ctdb_context *ctdb)
 {
+	TALLOC_CTX *tmp_ctx = talloc_new(ctdb);
 	struct ctdb_vnn_map *vnnmap=NULL;
 	int ret;
+	uint32_t generation;
 
 	/* wait until the recmaster is not in recovery mode */
 	while (1) {
@@ -2266,117 +3256,87 @@ static uint32_t get_generation(struct ctdb_context *ctdb)
 		}
 
 		/* get the recmaster */
-		ret = ctdb_ctrl_getrecmaster(ctdb, ctdb, TIMELIMIT(), CTDB_CURRENT_NODE, &recmaster);
+		ret = ctdb_ctrl_getrecmaster(ctdb, tmp_ctx, TIMELIMIT(), CTDB_CURRENT_NODE, &recmaster);
 		if (ret != 0) {
 			DEBUG(DEBUG_ERR, ("Unable to get recmaster from node %u\n", options.pnn));
+			talloc_free(tmp_ctx);
 			exit(10);
 		}
 
 		/* get recovery mode */
-		ret = ctdb_ctrl_getrecmode(ctdb, ctdb, TIMELIMIT(), recmaster, &recmode);
+		ret = ctdb_ctrl_getrecmode(ctdb, tmp_ctx, TIMELIMIT(), recmaster, &recmode);
 		if (ret != 0) {
 			DEBUG(DEBUG_ERR, ("Unable to get recmode from node %u\n", options.pnn));
+			talloc_free(tmp_ctx);
 			exit(10);
 		}
 
 		/* get the current generation number */
-		ret = ctdb_ctrl_getvnnmap(ctdb, TIMELIMIT(), recmaster, ctdb, &vnnmap);
+		ret = ctdb_ctrl_getvnnmap(ctdb, TIMELIMIT(), recmaster, tmp_ctx, &vnnmap);
 		if (ret != 0) {
 			DEBUG(DEBUG_ERR, ("Unable to get vnnmap from recmaster (%u)\n", recmaster));
+			talloc_free(tmp_ctx);
 			exit(10);
 		}
 
-		if ((recmode == CTDB_RECOVERY_NORMAL)
-		&&  (vnnmap->generation != 1)){
-			return vnnmap->generation;
+		if ((recmode == CTDB_RECOVERY_NORMAL) && (vnnmap->generation != 1)) {
+			generation = vnnmap->generation;
+			talloc_free(tmp_ctx);
+			return generation;
 		}
 		sleep(1);
 	}
 }
 
-/*
-  ban a node from the cluster
- */
+/* Ban a node */
+static bool update_state_banned(struct ctdb_context *ctdb, void *data)
+{
+	struct ctdb_ban_time *bantime = (struct ctdb_ban_time *)data;
+	int ret;
+
+	ret = ctdb_ctrl_set_ban(ctdb, TIMELIMIT(), options.pnn, bantime);
+
+	return ret == 0;
+}
+
 static int control_ban(struct ctdb_context *ctdb, int argc, const char **argv)
 {
-	int ret;
-	struct ctdb_node_map *nodemap=NULL;
 	struct ctdb_ban_time bantime;
 
 	if (argc < 1) {
 		usage();
 	}
 	
-	/* verify the node exists */
-	ret = ctdb_ctrl_getnodemap(ctdb, TIMELIMIT(), CTDB_CURRENT_NODE, ctdb, &nodemap);
-	if (ret != 0) {
-		DEBUG(DEBUG_ERR, ("Unable to get nodemap from local node\n"));
-		return ret;
-	}
-
-	if (nodemap->nodes[options.pnn].flags & NODE_FLAGS_BANNED) {
-		DEBUG(DEBUG_ERR,("Node %u is already banned.\n", options.pnn));
-		return -1;
-	}
-
 	bantime.pnn  = options.pnn;
 	bantime.time = strtoul(argv[0], NULL, 0);
 
-	ret = ctdb_ctrl_set_ban(ctdb, TIMELIMIT(), options.pnn, &bantime);
-	if (ret != 0) {
-		DEBUG(DEBUG_ERR,("Banning node %d for %d seconds failed.\n", bantime.pnn, bantime.time));
+	if (bantime.time == 0) {
+		DEBUG(DEBUG_ERR, ("Invalid ban time specified - must be >0\n"));
 		return -1;
-	}	
-
-	ret = control_ipreallocate(ctdb, argc, argv);
-	if (ret != 0) {
-		DEBUG(DEBUG_ERR, ("IP Reallocate failed on node %u\n", options.pnn));
-		return ret;
 	}
 
-	return 0;
+	return update_flags_and_ipreallocate(ctdb, &bantime,
+						  update_state_banned,
+						  NODE_FLAGS_BANNED,
+						  "banned",
+						  true /* set_flag*/);
 }
 
 
-/*
-  unban a node from the cluster
- */
+/* Unban a node */
 static int control_unban(struct ctdb_context *ctdb, int argc, const char **argv)
 {
-	int ret;
-	struct ctdb_node_map *nodemap=NULL;
 	struct ctdb_ban_time bantime;
-
-	/* verify the node exists */
-	ret = ctdb_ctrl_getnodemap(ctdb, TIMELIMIT(), CTDB_CURRENT_NODE, ctdb, &nodemap);
-	if (ret != 0) {
-		DEBUG(DEBUG_ERR, ("Unable to get nodemap from local node\n"));
-		return ret;
-	}
-
-	if (!(nodemap->nodes[options.pnn].flags & NODE_FLAGS_BANNED)) {
-		DEBUG(DEBUG_ERR,("Node %u is not banned.\n", options.pnn));
-		return -1;
-	}
 
 	bantime.pnn  = options.pnn;
 	bantime.time = 0;
 
-	ret = ctdb_ctrl_set_ban(ctdb, TIMELIMIT(), options.pnn, &bantime);
-	if (ret != 0) {
-		DEBUG(DEBUG_ERR,("Unbanning node %d failed.\n", bantime.pnn));
-		return -1;
-	}	
-
-	ret = control_ipreallocate(ctdb, argc, argv);
-	if (ret != 0) {
-		DEBUG(DEBUG_ERR, ("IP Reallocate failed on node %u\n", options.pnn));
-		return ret;
-	}
-
-	return 0;
+	return update_flags_and_ipreallocate(ctdb, &bantime,
+						  update_state_banned,
+						  NODE_FLAGS_BANNED,
+						  "banned",
+						  false /* set_flag*/);
 }
-
 
 /*
   show ban information for a node
@@ -2403,7 +3363,8 @@ static int control_showban(struct ctdb_context *ctdb, int argc, const char **arg
 	if (bantime->time == 0) {
 		printf("Node %u is not banned\n", bantime->pnn);
 	} else {
-		printf("Node %u is banned banned for %d seconds\n", bantime->pnn, bantime->time);
+		printf("Node %u is banned, %d seconds remaining\n",
+		       bantime->pnn, bantime->time);
 	}
 
 	return 0;
@@ -2432,14 +3393,21 @@ static int control_recover(struct ctdb_context *ctdb, int argc, const char **arg
 {
 	int ret;
 	uint32_t generation, next_generation;
+	bool force;
+
+	/* "force" option ignores freeze failure and forces recovery */
+	force = (argc == 1) && (strcasecmp(argv[0], "force") == 0);
 
 	/* record the current generation number */
 	generation = get_generation(ctdb);
 
 	ret = ctdb_ctrl_freeze_priority(ctdb, TIMELIMIT(), options.pnn, 1);
 	if (ret != 0) {
-		DEBUG(DEBUG_ERR, ("Unable to freeze node\n"));
-		return ret;
+		if (!force) {
+			DEBUG(DEBUG_ERR, ("Unable to freeze node\n"));
+			return ret;
+		}
+		DEBUG(DEBUG_WARNING, ("Unable to freeze node but proceeding because \"force\" option given\n"));
 	}
 
 	ret = ctdb_ctrl_setrecmode(ctdb, TIMELIMIT(), options.pnn, CTDB_RECOVERY_ACTIVE);
@@ -2495,7 +3463,7 @@ static int control_getcapabilities(struct ctdb_context *ctdb, int argc, const ch
 	ret = ctdb_ctrl_getcapabilities(ctdb, TIMELIMIT(), options.pnn, &capabilities);
 	if (ret != 0) {
 		DEBUG(DEBUG_ERR, ("Unable to get capabilities from node %u\n", options.pnn));
-		return ret;
+		return -1;
 	}
 	
 	if (!options.machinereadable){
@@ -2519,20 +3487,24 @@ static int control_getcapabilities(struct ctdb_context *ctdb, int argc, const ch
  */
 static int control_lvs(struct ctdb_context *ctdb, int argc, const char **argv)
 {
+	TALLOC_CTX *tmp_ctx = talloc_new(ctdb);
 	uint32_t *capabilities;
 	struct ctdb_node_map *nodemap=NULL;
 	int i, ret;
 	int healthy_count = 0;
 
-	ret = ctdb_ctrl_getnodemap(ctdb, TIMELIMIT(), options.pnn, ctdb, &nodemap);
+	ret = ctdb_ctrl_getnodemap(ctdb, TIMELIMIT(), options.pnn, tmp_ctx, &nodemap);
 	if (ret != 0) {
 		DEBUG(DEBUG_ERR, ("Unable to get nodemap from node %u\n", options.pnn));
-		return ret;
+		talloc_free(tmp_ctx);
+		return -1;
 	}
 
 	capabilities = talloc_array(ctdb, uint32_t, nodemap->num);
 	CTDB_NO_MEMORY(ctdb, capabilities);
 	
+	ret = 0;
+
 	/* collect capabilities for all connected nodes */
 	for (i=0; i<nodemap->num; i++) {
 		if (nodemap->nodes[i].flags & NODE_FLAGS_INACTIVE) {
@@ -2541,11 +3513,12 @@ static int control_lvs(struct ctdb_context *ctdb, int argc, const char **argv)
 		if (nodemap->nodes[i].flags & NODE_FLAGS_PERMANENTLY_DISABLED) {
 			continue;
 		}
-	
+
 		ret = ctdb_ctrl_getcapabilities(ctdb, TIMELIMIT(), i, &capabilities[i]);
 		if (ret != 0) {
 			DEBUG(DEBUG_ERR, ("Unable to get capabilities from node %u\n", i));
-			return ret;
+			ret = -1;
+			goto done;
 		}
 
 		if (!(capabilities[i] & CTDB_CAP_LVS)) {
@@ -2579,7 +3552,9 @@ static int control_lvs(struct ctdb_context *ctdb, int argc, const char **argv)
 			ctdb_addr_to_str(&nodemap->nodes[i].addr));
 	}
 
-	return 0;
+done:
+	talloc_free(tmp_ctx);
+	return ret;
 }
 
 /*
@@ -2587,20 +3562,25 @@ static int control_lvs(struct ctdb_context *ctdb, int argc, const char **argv)
  */
 static int control_lvsmaster(struct ctdb_context *ctdb, int argc, const char **argv)
 {
+	TALLOC_CTX *tmp_ctx = talloc_new(ctdb);
 	uint32_t *capabilities;
 	struct ctdb_node_map *nodemap=NULL;
 	int i, ret;
 	int healthy_count = 0;
 
-	ret = ctdb_ctrl_getnodemap(ctdb, TIMELIMIT(), options.pnn, ctdb, &nodemap);
+	ret = ctdb_ctrl_getnodemap(ctdb, TIMELIMIT(), options.pnn, tmp_ctx, &nodemap);
 	if (ret != 0) {
 		DEBUG(DEBUG_ERR, ("Unable to get nodemap from node %u\n", options.pnn));
-		return ret;
+		talloc_free(tmp_ctx);
+		return -1;
 	}
 
-	capabilities = talloc_array(ctdb, uint32_t, nodemap->num);
-	CTDB_NO_MEMORY(ctdb, capabilities);
-	
+	capabilities = talloc_array(tmp_ctx, uint32_t, nodemap->num);
+	if (capabilities == NULL) {
+		talloc_free(tmp_ctx);
+		CTDB_NO_MEMORY(ctdb, capabilities);
+	}
+
 	/* collect capabilities for all connected nodes */
 	for (i=0; i<nodemap->num; i++) {
 		if (nodemap->nodes[i].flags & NODE_FLAGS_INACTIVE) {
@@ -2613,7 +3593,8 @@ static int control_lvsmaster(struct ctdb_context *ctdb, int argc, const char **a
 		ret = ctdb_ctrl_getcapabilities(ctdb, TIMELIMIT(), i, &capabilities[i]);
 		if (ret != 0) {
 			DEBUG(DEBUG_ERR, ("Unable to get capabilities from node %u\n", i));
-			return ret;
+			ret = -1;
+			goto done;
 		}
 
 		if (!(capabilities[i] & CTDB_CAP_LVS)) {
@@ -2624,6 +3605,8 @@ static int control_lvsmaster(struct ctdb_context *ctdb, int argc, const char **a
 			healthy_count++;
 		}
 	}
+
+	ret = -1;
 
 	/* find and show the lvsmaster */
 	for (i=0; i<nodemap->num; i++) {
@@ -2648,11 +3631,14 @@ static int control_lvsmaster(struct ctdb_context *ctdb, int argc, const char **a
 		} else {
 			printf("Node %d is LVS master\n", i);
 		}
-		return 0;
+		ret = 0;
+		goto done;
 	}
 
 	printf("There is no LVS master\n");
-	return -1;
+done:
+	talloc_free(tmp_ctx);
+	return ret;
 }
 
 /*
@@ -2699,23 +3685,18 @@ static int control_catdb(struct ctdb_context *ctdb, int argc, const char **argv)
 	const char *db_name;
 	struct ctdb_db_context *ctdb_db;
 	int ret;
-	bool persistent;
 	struct ctdb_dump_db_context c;
+	uint8_t flags;
 
 	if (argc < 1) {
 		usage();
 	}
 
-	db_name = argv[0];
-
-
-	if (db_exists(ctdb, db_name, &persistent)) {
-		DEBUG(DEBUG_ERR,("Database '%s' does not exist\n", db_name));
+	if (!db_exists(ctdb, argv[0], NULL, &db_name, &flags)) {
 		return -1;
 	}
 
-	ctdb_db = ctdb_attach(ctdb, db_name, persistent, 0);
-
+	ctdb_db = ctdb_attach(ctdb, TIMELIMIT(), db_name, flags & CTDB_DB_FLAGS_PERSISTENT, 0);
 	if (ctdb_db == NULL) {
 		DEBUG(DEBUG_ERR,("Unable to attach to database '%s'\n", db_name));
 		return -1;
@@ -2754,6 +3735,741 @@ static int control_catdb(struct ctdb_context *ctdb, int argc, const char **argv)
 	return 0;
 }
 
+struct cattdb_data {
+	struct ctdb_context *ctdb;
+	uint32_t count;
+};
+
+static int cattdb_traverse(struct tdb_context *tdb, TDB_DATA key, TDB_DATA data, void *private_data)
+{
+	struct cattdb_data *d = private_data;
+	struct ctdb_dump_db_context c;
+
+	d->count++;
+
+	ZERO_STRUCT(c);
+	c.f = stdout;
+	c.printemptyrecords = (bool)options.printemptyrecords;
+	c.printdatasize = (bool)options.printdatasize;
+	c.printlmaster = false;
+	c.printhash = (bool)options.printhash;
+	c.printrecordflags = true;
+
+	return ctdb_dumpdb_record(d->ctdb, key, data, &c);
+}
+
+/*
+  cat the local tdb database using same format as catdb
+ */
+static int control_cattdb(struct ctdb_context *ctdb, int argc, const char **argv)
+{
+	const char *db_name;
+	struct ctdb_db_context *ctdb_db;
+	struct cattdb_data d;
+	uint8_t flags;
+
+	if (argc < 1) {
+		usage();
+	}
+
+	if (!db_exists(ctdb, argv[0], NULL, &db_name, &flags)) {
+		return -1;
+	}
+
+	ctdb_db = ctdb_attach(ctdb, TIMELIMIT(), db_name, flags & CTDB_DB_FLAGS_PERSISTENT, 0);
+	if (ctdb_db == NULL) {
+		DEBUG(DEBUG_ERR,("Unable to attach to database '%s'\n", db_name));
+		return -1;
+	}
+
+	/* traverse the local tdb */
+	d.count = 0;
+	d.ctdb  = ctdb;
+	if (tdb_traverse_read(ctdb_db->ltdb->tdb, cattdb_traverse, &d) == -1) {
+		printf("Failed to cattdb data\n");
+		exit(10);
+	}
+	talloc_free(ctdb_db);
+
+	printf("Dumped %d records\n", d.count);
+	return 0;
+}
+
+/*
+  display the content of a database key
+ */
+static int control_readkey(struct ctdb_context *ctdb, int argc, const char **argv)
+{
+	const char *db_name;
+	struct ctdb_db_context *ctdb_db;
+	struct ctdb_record_handle *h;
+	TALLOC_CTX *tmp_ctx = talloc_new(ctdb);
+	TDB_DATA key, data;
+	uint8_t flags;
+
+	if (argc < 2) {
+		usage();
+	}
+
+	if (!db_exists(ctdb, argv[0], NULL, &db_name, &flags)) {
+		return -1;
+	}
+
+	ctdb_db = ctdb_attach(ctdb, TIMELIMIT(), db_name, flags & CTDB_DB_FLAGS_PERSISTENT, 0);
+	if (ctdb_db == NULL) {
+		DEBUG(DEBUG_ERR,("Unable to attach to database '%s'\n", db_name));
+		return -1;
+	}
+
+	key.dptr  = discard_const(argv[1]);
+	key.dsize = strlen((char *)key.dptr);
+
+	h = ctdb_fetch_lock(ctdb_db, tmp_ctx, key, &data);
+	if (h == NULL) {
+		printf("Failed to fetch record '%s' on node %d\n", 
+	       		(const char *)key.dptr, ctdb_get_pnn(ctdb));
+		talloc_free(tmp_ctx);
+		exit(10);
+	}
+
+	printf("Data: size:%d ptr:[%.*s]\n", (int)data.dsize, (int)data.dsize, data.dptr);
+
+	talloc_free(ctdb_db);
+	talloc_free(tmp_ctx);
+	return 0;
+}
+
+/*
+  display the content of a database key
+ */
+static int control_writekey(struct ctdb_context *ctdb, int argc, const char **argv)
+{
+	const char *db_name;
+	struct ctdb_db_context *ctdb_db;
+	struct ctdb_record_handle *h;
+	TALLOC_CTX *tmp_ctx = talloc_new(ctdb);
+	TDB_DATA key, data;
+	uint8_t flags;
+
+	if (argc < 3) {
+		usage();
+	}
+
+	if (!db_exists(ctdb, argv[0], NULL, &db_name, &flags)) {
+		return -1;
+	}
+
+	ctdb_db = ctdb_attach(ctdb, TIMELIMIT(), db_name, flags & CTDB_DB_FLAGS_PERSISTENT, 0);
+	if (ctdb_db == NULL) {
+		DEBUG(DEBUG_ERR,("Unable to attach to database '%s'\n", db_name));
+		return -1;
+	}
+
+	key.dptr  = discard_const(argv[1]);
+	key.dsize = strlen((char *)key.dptr);
+
+	h = ctdb_fetch_lock(ctdb_db, tmp_ctx, key, &data);
+	if (h == NULL) {
+		printf("Failed to fetch record '%s' on node %d\n", 
+	       		(const char *)key.dptr, ctdb_get_pnn(ctdb));
+		talloc_free(tmp_ctx);
+		exit(10);
+	}
+
+	data.dptr  = discard_const(argv[2]);
+	data.dsize = strlen((char *)data.dptr);
+
+	if (ctdb_record_store(h, data) != 0) {
+		printf("Failed to store record\n");
+	}
+
+	talloc_free(h);
+	talloc_free(ctdb_db);
+	talloc_free(tmp_ctx);
+	return 0;
+}
+
+/*
+  fetch a record from a persistent database
+ */
+static int control_pfetch(struct ctdb_context *ctdb, int argc, const char **argv)
+{
+	const char *db_name;
+	struct ctdb_db_context *ctdb_db;
+	TALLOC_CTX *tmp_ctx = talloc_new(ctdb);
+	struct ctdb_transaction_handle *h;
+	TDB_DATA key, data;
+	int fd, ret;
+	bool persistent;
+	uint8_t flags;
+
+	if (argc < 2) {
+		talloc_free(tmp_ctx);
+		usage();
+	}
+
+	if (!db_exists(ctdb, argv[0], NULL, &db_name, &flags)) {
+		talloc_free(tmp_ctx);
+		return -1;
+	}
+
+	persistent = flags & CTDB_DB_FLAGS_PERSISTENT;
+	if (!persistent) {
+		DEBUG(DEBUG_ERR,("Database '%s' is not persistent\n", db_name));
+		talloc_free(tmp_ctx);
+		return -1;
+	}
+
+	ctdb_db = ctdb_attach(ctdb, TIMELIMIT(), db_name, persistent, 0);
+	if (ctdb_db == NULL) {
+		DEBUG(DEBUG_ERR,("Unable to attach to database '%s'\n", db_name));
+		talloc_free(tmp_ctx);
+		return -1;
+	}
+
+	h = ctdb_transaction_start(ctdb_db, tmp_ctx);
+	if (h == NULL) {
+		DEBUG(DEBUG_ERR,("Failed to start transaction on database %s\n", db_name));
+		talloc_free(tmp_ctx);
+		return -1;
+	}
+
+	key.dptr  = discard_const(argv[1]);
+	key.dsize = strlen(argv[1]);
+	ret = ctdb_transaction_fetch(h, tmp_ctx, key, &data);
+	if (ret != 0) {
+		DEBUG(DEBUG_ERR,("Failed to fetch record\n"));
+		talloc_free(tmp_ctx);
+		return -1;
+	}
+
+	if (data.dsize == 0 || data.dptr == NULL) {
+		DEBUG(DEBUG_ERR,("Record is empty\n"));
+		talloc_free(tmp_ctx);
+		return -1;
+	}
+
+	if (argc == 3) {
+	  fd = open(argv[2], O_WRONLY|O_CREAT|O_TRUNC, 0600);
+		if (fd == -1) {
+			DEBUG(DEBUG_ERR,("Failed to open output file %s\n", argv[2]));
+			talloc_free(tmp_ctx);
+			return -1;
+		}
+		write(fd, data.dptr, data.dsize);
+		close(fd);
+	} else {
+		write(1, data.dptr, data.dsize);
+	}
+
+	/* abort the transaction */
+	talloc_free(h);
+
+
+	talloc_free(tmp_ctx);
+	return 0;
+}
+
+/*
+  fetch a record from a tdb-file
+ */
+static int control_tfetch(struct ctdb_context *ctdb, int argc, const char **argv)
+{
+	const char *tdb_file;
+	TDB_CONTEXT *tdb;
+	TDB_DATA key, data;
+	TALLOC_CTX *tmp_ctx = talloc_new(NULL);
+	int fd;
+
+	if (argc < 2) {
+		usage();
+	}
+
+	tdb_file = argv[0];
+
+	tdb = tdb_open(tdb_file, 0, 0, O_RDONLY, 0);
+	if (tdb == NULL) {
+		printf("Failed to open TDB file %s\n", tdb_file);
+		return -1;
+	}
+
+	if (!strncmp(argv[1], "0x", 2)) {
+		key = hextodata(tmp_ctx, argv[1] + 2);
+		if (key.dsize == 0) {
+			printf("Failed to convert \"%s\" into a TDB_DATA\n", argv[1]);
+			return -1;
+		}
+	} else {
+		key.dptr  = discard_const(argv[1]);
+		key.dsize = strlen(argv[1]);
+	}
+
+	data = tdb_fetch(tdb, key);
+	if (data.dptr == NULL || data.dsize < sizeof(struct ctdb_ltdb_header)) {
+		printf("Failed to read record %s from tdb %s\n", argv[1], tdb_file);
+		tdb_close(tdb);
+		return -1;
+	}
+
+	tdb_close(tdb);
+
+	if (argc == 3) {
+	  fd = open(argv[2], O_WRONLY|O_CREAT|O_TRUNC, 0600);
+		if (fd == -1) {
+			printf("Failed to open output file %s\n", argv[2]);
+			return -1;
+		}
+		if (options.verbose){
+			write(fd, data.dptr, data.dsize);
+		} else {
+			write(fd, data.dptr+sizeof(struct ctdb_ltdb_header), data.dsize-sizeof(struct ctdb_ltdb_header));
+		}
+		close(fd);
+	} else {
+		if (options.verbose){
+			write(1, data.dptr, data.dsize);
+		} else {
+			write(1, data.dptr+sizeof(struct ctdb_ltdb_header), data.dsize-sizeof(struct ctdb_ltdb_header));
+		}
+	}
+
+	talloc_free(tmp_ctx);
+	return 0;
+}
+
+/*
+  store a record and header to a tdb-file
+ */
+static int control_tstore(struct ctdb_context *ctdb, int argc, const char **argv)
+{
+	const char *tdb_file;
+	TDB_CONTEXT *tdb;
+	TDB_DATA key, value, data;
+	TALLOC_CTX *tmp_ctx = talloc_new(NULL);
+	struct ctdb_ltdb_header header;
+
+	if (argc < 3) {
+		usage();
+	}
+
+	tdb_file = argv[0];
+
+	tdb = tdb_open(tdb_file, 0, 0, O_RDWR, 0);
+	if (tdb == NULL) {
+		printf("Failed to open TDB file %s\n", tdb_file);
+		return -1;
+	}
+
+	if (!strncmp(argv[1], "0x", 2)) {
+		key = hextodata(tmp_ctx, argv[1] + 2);
+		if (key.dsize == 0) {
+			printf("Failed to convert \"%s\" into a TDB_DATA\n", argv[1]);
+			return -1;
+		}
+	} else {
+		key.dptr  = discard_const(argv[1]);
+		key.dsize = strlen(argv[1]);
+	}
+
+	if (!strncmp(argv[2], "0x", 2)) {
+		value = hextodata(tmp_ctx, argv[2] + 2);
+		if (value.dsize == 0) {
+			printf("Failed to convert \"%s\" into a TDB_DATA\n", argv[2]);
+			return -1;
+		}
+	} else {
+		value.dptr  = discard_const(argv[2]);
+		value.dsize = strlen(argv[2]);
+	}
+
+	ZERO_STRUCT(header);
+	if (argc > 3) {
+		header.rsn = atoll(argv[3]);
+	}
+	if (argc > 4) {
+		header.dmaster = atoi(argv[4]);
+	}
+	if (argc > 5) {
+		header.flags = atoi(argv[5]);
+	}
+
+	data.dsize = sizeof(struct ctdb_ltdb_header) + value.dsize;
+	data.dptr = talloc_size(tmp_ctx, data.dsize);
+	if (data.dptr == NULL) {
+		printf("Failed to allocate header+value\n");
+		return -1;
+	}
+
+	*(struct ctdb_ltdb_header *)data.dptr = header;
+	memcpy(data.dptr + sizeof(struct ctdb_ltdb_header), value.dptr, value.dsize);
+
+	if (tdb_store(tdb, key, data, TDB_REPLACE) != 0) {
+		printf("Failed to write record %s to tdb %s\n", argv[1], tdb_file);
+		tdb_close(tdb);
+		return -1;
+	}
+
+	tdb_close(tdb);
+
+	talloc_free(tmp_ctx);
+	return 0;
+}
+
+/*
+  write a record to a persistent database
+ */
+static int control_pstore(struct ctdb_context *ctdb, int argc, const char **argv)
+{
+	const char *db_name;
+	struct ctdb_db_context *ctdb_db;
+	TALLOC_CTX *tmp_ctx = talloc_new(ctdb);
+	struct ctdb_transaction_handle *h;
+	struct stat st;
+	TDB_DATA key, data;
+	int fd, ret;
+
+	if (argc < 3) {
+		talloc_free(tmp_ctx);
+		usage();
+	}
+
+	fd = open(argv[2], O_RDONLY);
+	if (fd == -1) {
+		DEBUG(DEBUG_ERR,("Failed to open file containing record data : %s  %s\n", argv[2], strerror(errno)));
+		talloc_free(tmp_ctx);
+		return -1;
+	}
+	
+	ret = fstat(fd, &st);
+	if (ret == -1) {
+		DEBUG(DEBUG_ERR,("fstat of file %s failed: %s\n", argv[2], strerror(errno)));
+		close(fd);
+		talloc_free(tmp_ctx);
+		return -1;
+	}
+
+	if (!S_ISREG(st.st_mode)) {
+		DEBUG(DEBUG_ERR,("Not a regular file %s\n", argv[2]));
+		close(fd);
+		talloc_free(tmp_ctx);
+		return -1;
+	}
+
+	data.dsize = st.st_size;
+	if (data.dsize == 0) {
+		data.dptr  = NULL;
+	} else {
+		data.dptr = talloc_size(tmp_ctx, data.dsize);
+		if (data.dptr == NULL) {
+			DEBUG(DEBUG_ERR,("Failed to talloc %d of memory to store record data\n", (int)data.dsize));
+			close(fd);
+			talloc_free(tmp_ctx);
+			return -1;
+		}
+		ret = read(fd, data.dptr, data.dsize);
+		if (ret != data.dsize) {
+			DEBUG(DEBUG_ERR,("Failed to read %d bytes of record data\n", (int)data.dsize));
+			close(fd);
+			talloc_free(tmp_ctx);
+			return -1;
+		}
+	}
+	close(fd);
+
+
+	db_name = argv[0];
+
+	ctdb_db = ctdb_attach(ctdb, TIMELIMIT(), db_name, true, 0);
+	if (ctdb_db == NULL) {
+		DEBUG(DEBUG_ERR,("Unable to attach to database '%s'\n", db_name));
+		talloc_free(tmp_ctx);
+		return -1;
+	}
+
+	h = ctdb_transaction_start(ctdb_db, tmp_ctx);
+	if (h == NULL) {
+		DEBUG(DEBUG_ERR,("Failed to start transaction on database %s\n", db_name));
+		talloc_free(tmp_ctx);
+		return -1;
+	}
+
+	key.dptr  = discard_const(argv[1]);
+	key.dsize = strlen(argv[1]);
+	ret = ctdb_transaction_store(h, key, data);
+	if (ret != 0) {
+		DEBUG(DEBUG_ERR,("Failed to store record\n"));
+		talloc_free(tmp_ctx);
+		return -1;
+	}
+
+	ret = ctdb_transaction_commit(h);
+	if (ret != 0) {
+		DEBUG(DEBUG_ERR,("Failed to commit transaction\n"));
+		talloc_free(tmp_ctx);
+		return -1;
+	}
+
+
+	talloc_free(tmp_ctx);
+	return 0;
+}
+
+/*
+ * delete a record from a persistent database
+ */
+static int control_pdelete(struct ctdb_context *ctdb, int argc, const char **argv)
+{
+	const char *db_name;
+	struct ctdb_db_context *ctdb_db;
+	TALLOC_CTX *tmp_ctx = talloc_new(ctdb);
+	struct ctdb_transaction_handle *h;
+	TDB_DATA key;
+	int ret;
+	bool persistent;
+	uint8_t flags;
+
+	if (argc < 2) {
+		talloc_free(tmp_ctx);
+		usage();
+	}
+
+	if (!db_exists(ctdb, argv[0], NULL, &db_name, &flags)) {
+		talloc_free(tmp_ctx);
+		return -1;
+	}
+
+	persistent = flags & CTDB_DB_FLAGS_PERSISTENT;
+	if (!persistent) {
+		DEBUG(DEBUG_ERR, ("Database '%s' is not persistent\n", db_name));
+		talloc_free(tmp_ctx);
+		return -1;
+	}
+
+	ctdb_db = ctdb_attach(ctdb, TIMELIMIT(), db_name, persistent, 0);
+	if (ctdb_db == NULL) {
+		DEBUG(DEBUG_ERR, ("Unable to attach to database '%s'\n", db_name));
+		talloc_free(tmp_ctx);
+		return -1;
+	}
+
+	h = ctdb_transaction_start(ctdb_db, tmp_ctx);
+	if (h == NULL) {
+		DEBUG(DEBUG_ERR, ("Failed to start transaction on database %s\n", db_name));
+		talloc_free(tmp_ctx);
+		return -1;
+	}
+
+	key.dptr = discard_const(argv[1]);
+	key.dsize = strlen(argv[1]);
+	ret = ctdb_transaction_store(h, key, tdb_null);
+	if (ret != 0) {
+		DEBUG(DEBUG_ERR, ("Failed to delete record\n"));
+		talloc_free(tmp_ctx);
+		return -1;
+	}
+
+	ret = ctdb_transaction_commit(h);
+	if (ret != 0) {
+		DEBUG(DEBUG_ERR, ("Failed to commit transaction\n"));
+		talloc_free(tmp_ctx);
+		return -1;
+	}
+
+	talloc_free(tmp_ctx);
+	return 0;
+}
+
+static const char *ptrans_parse_string(TALLOC_CTX *mem_ctx, const char *s,
+				       TDB_DATA *data)
+{
+	const char *t;
+	size_t n;
+	const char *ret; /* Next byte after successfully parsed value */
+
+	/* Error, unless someone says otherwise */
+	ret = NULL;
+	/* Indicates no value to parse */
+	*data = tdb_null;
+
+	/* Skip whitespace */
+	n = strspn(s, " \t");
+	t = s + n;
+
+	if (t[0] == '"') {
+		/* Quoted ASCII string - no wide characters! */
+		t++;
+		n = strcspn(t, "\"");
+		if (t[n] == '"') {
+			if (n > 0) {
+				data->dsize = n;
+				data->dptr = talloc_memdup(mem_ctx, t, n);
+				CTDB_NOMEM_ABORT(data->dptr);
+			}
+			ret = t + n + 1;
+		} else {
+			DEBUG(DEBUG_WARNING,("Unmatched \" in input %s\n", s));
+		}
+	} else {
+		DEBUG(DEBUG_WARNING,("Unsupported input format in %s\n", s));
+	}
+
+	return ret;
+}
+
+static bool ptrans_get_key_value(TALLOC_CTX *mem_ctx, FILE *file,
+				 TDB_DATA *key, TDB_DATA *value)
+{
+	char line [1024]; /* FIXME: make this more flexible? */
+	const char *t;
+	char *ptr;
+
+	ptr = fgets(line, sizeof(line), file);
+
+	if (ptr == NULL) {
+		return false;
+	}
+
+	/* Get key */
+	t = ptrans_parse_string(mem_ctx, line, key);
+	if (t == NULL || key->dptr == NULL) {
+		/* Line Ignored but not EOF */
+		return true;
+	}
+
+	/* Get value */
+	t = ptrans_parse_string(mem_ctx, t, value);
+	if (t == NULL) {
+		/* Line Ignored but not EOF */
+		talloc_free(key->dptr);
+		*key = tdb_null;
+		return true;
+	}
+
+	return true;
+}
+
+/*
+ * Update a persistent database as per file/stdin
+ */
+static int control_ptrans(struct ctdb_context *ctdb,
+			  int argc, const char **argv)
+{
+	const char *db_name;
+	struct ctdb_db_context *ctdb_db;
+	TALLOC_CTX *tmp_ctx = talloc_new(ctdb);
+	struct ctdb_transaction_handle *h;
+	TDB_DATA key, value;
+	FILE *file;
+	int ret;
+
+	if (argc < 1) {
+		talloc_free(tmp_ctx);
+		usage();
+	}
+
+	file = stdin;
+	if (argc == 2) {
+		file = fopen(argv[1], "r");
+		if (file == NULL) {
+			DEBUG(DEBUG_ERR,("Unable to open file for reading '%s'\n", argv[1]));
+			talloc_free(tmp_ctx);
+			return -1;
+		}
+	}
+
+	db_name = argv[0];
+
+	ctdb_db = ctdb_attach(ctdb, TIMELIMIT(), db_name, true, 0);
+	if (ctdb_db == NULL) {
+		DEBUG(DEBUG_ERR,("Unable to attach to database '%s'\n", db_name));
+		goto error;
+	}
+
+	h = ctdb_transaction_start(ctdb_db, tmp_ctx);
+	if (h == NULL) {
+		DEBUG(DEBUG_ERR,("Failed to start transaction on database %s\n", db_name));
+		goto error;
+	}
+
+	while (ptrans_get_key_value(tmp_ctx, file, &key, &value)) {
+		if (key.dsize != 0) {
+			ret = ctdb_transaction_store(h, key, value);
+			/* Minimise memory use */
+			talloc_free(key.dptr);
+			if (value.dptr != NULL) {
+				talloc_free(value.dptr);
+			}
+			if (ret != 0) {
+				DEBUG(DEBUG_ERR,("Failed to store record\n"));
+				ctdb_transaction_cancel(h);
+				goto error;
+			}
+		}
+	}
+
+	ret = ctdb_transaction_commit(h);
+	if (ret != 0) {
+		DEBUG(DEBUG_ERR,("Failed to commit transaction\n"));
+		goto error;
+	}
+
+	if (file != stdin) {
+		fclose(file);
+	}
+	talloc_free(tmp_ctx);
+	return 0;
+
+error:
+	if (file != stdin) {
+		fclose(file);
+	}
+
+	talloc_free(tmp_ctx);
+	return -1;
+}
+
+/*
+  check if a service is bound to a port or not
+ */
+static int control_chktcpport(struct ctdb_context *ctdb, int argc, const char **argv)
+{
+	int s, ret;
+	int v;
+	int port;
+        struct sockaddr_in sin;
+
+	if (argc != 1) {
+		printf("Use: ctdb chktcport <port>\n");
+		return EINVAL;
+	}
+
+	port = atoi(argv[0]);
+
+	s = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP);
+	if (s == -1) {
+		printf("Failed to open local socket\n");
+		return errno;
+	}
+
+	v = fcntl(s, F_GETFL, 0);
+	if (v == -1 || fcntl(s, F_SETFL, v | O_NONBLOCK) != 0) {
+		printf("Unable to set socket non-blocking: %s\n", strerror(errno));
+	}
+
+	bzero(&sin, sizeof(sin));
+	sin.sin_family = PF_INET;
+	sin.sin_port   = htons(port);
+	ret = bind(s, (struct sockaddr *)&sin, sizeof(sin));
+	close(s);
+	if (ret == -1) {
+		printf("Failed to bind to local socket: %d %s\n", errno, strerror(errno));
+		return errno;
+	}
+
+	return 0;
+}
+
+
 
 static void log_handler(struct ctdb_context *ctdb, uint64_t srvid, 
 			     TDB_DATA data, void *private_data)
@@ -2771,57 +4487,71 @@ static void log_handler(struct ctdb_context *ctdb, uint64_t srvid,
  */
 static int control_getlog(struct ctdb_context *ctdb, int argc, const char **argv)
 {
-	int ret;
-	int32_t res;
+	int ret, i;
+	bool main_daemon;
 	struct ctdb_get_log_addr log_addr;
 	TDB_DATA data;
-	TALLOC_CTX *tmp_ctx = talloc_new(ctdb);
-	char *errmsg;
 	struct timeval tv;
 
-	if (argc != 1) {
-		DEBUG(DEBUG_ERR,("Invalid arguments\n"));
-		talloc_free(tmp_ctx);
-		return -1;
+	/* Process options */
+	main_daemon = true;
+	log_addr.pnn = ctdb_get_pnn(ctdb);
+	log_addr.level = DEBUG_NOTICE;
+	for (i = 0; i < argc; i++) {
+		if (strcmp(argv[i], "recoverd") == 0) {
+			main_daemon = false;
+		} else {
+			if (isalpha(argv[i][0]) || argv[i][0] == '-') { 
+				log_addr.level = get_debug_by_desc(argv[i]);
+			} else {
+				log_addr.level = strtol(argv[i], NULL, 0);
+			}
+		}
 	}
 
-	log_addr.pnn = ctdb_ctrl_getpnn(ctdb, TIMELIMIT(), CTDB_CURRENT_NODE);
+	/* Our message port is our PID */
 	log_addr.srvid = getpid();
-	if (isalpha(argv[0][0]) || argv[0][0] == '-') { 
-		log_addr.level = get_debug_by_desc(argv[0]);
-	} else {
-		log_addr.level = strtol(argv[0], NULL, 0);
-	}
-
 
 	data.dptr = (unsigned char *)&log_addr;
 	data.dsize = sizeof(log_addr);
 
 	DEBUG(DEBUG_ERR, ("Pulling logs from node %u\n", options.pnn));
 
-	ctdb_set_message_handler(ctdb, log_addr.srvid, log_handler, NULL);
+	ctdb_client_set_message_handler(ctdb, log_addr.srvid, log_handler, NULL);
 	sleep(1);
 
 	DEBUG(DEBUG_ERR,("Listen for response on %d\n", (int)log_addr.srvid));
 
-	ret = ctdb_control(ctdb, options.pnn, 0, CTDB_CONTROL_GET_LOG,
-			   0, data, tmp_ctx, NULL, &res, NULL, &errmsg);
-	if (ret != 0 || res != 0) {
-		DEBUG(DEBUG_ERR,("Failed to get logs - %s\n", errmsg));
-		talloc_free(tmp_ctx);
-		return -1;
-	}
+	if (main_daemon) {
+		int32_t res;
+		char *errmsg;
+		TALLOC_CTX *tmp_ctx = talloc_new(ctdb);
 
+		ret = ctdb_control(ctdb, options.pnn, 0, CTDB_CONTROL_GET_LOG,
+				   0, data, tmp_ctx, NULL, &res, NULL, &errmsg);
+		if (ret != 0 || res != 0) {
+			DEBUG(DEBUG_ERR,("Failed to get logs - %s\n", errmsg));
+			talloc_free(tmp_ctx);
+			return -1;
+		}
+		talloc_free(tmp_ctx);
+	} else {
+		ret = ctdb_client_send_message(ctdb, options.pnn,
+					       CTDB_SRVID_GETLOG, data);
+		if (ret != 0) {
+			DEBUG(DEBUG_ERR,("Failed to send getlog request message to %u\n", options.pnn));
+			return -1;
+		}
+	}
 
 	tv = timeval_current();
 	/* this loop will terminate when we have received the reply */
-	while (timeval_elapsed(&tv) < 3.0) {	
+	while (timeval_elapsed(&tv) < (double)options.timelimit) {
 		event_loop_once(ctdb->ev);
 	}
 
 	DEBUG(DEBUG_INFO,("Timed out waiting for log data.\n"));
 
-	talloc_free(tmp_ctx);
 	return 0;
 }
 
@@ -2831,23 +4561,99 @@ static int control_getlog(struct ctdb_context *ctdb, int argc, const char **argv
 static int control_clearlog(struct ctdb_context *ctdb, int argc, const char **argv)
 {
 	int ret;
-	int32_t res;
-	char *errmsg;
-	TALLOC_CTX *tmp_ctx = talloc_new(ctdb);
 
-	ret = ctdb_control(ctdb, options.pnn, 0, CTDB_CONTROL_CLEAR_LOG,
-			   0, tdb_null, tmp_ctx, NULL, &res, NULL, &errmsg);
-	if (ret != 0 || res != 0) {
-		DEBUG(DEBUG_ERR,("Failed to clear logs\n"));
+	if (argc == 0 || (argc >= 1 && strcmp(argv[0], "recoverd") != 0)) {
+		/* "recoverd" not given - get logs from main daemon */
+		int32_t res;
+		char *errmsg;
+		TALLOC_CTX *tmp_ctx = talloc_new(ctdb);
+
+		ret = ctdb_control(ctdb, options.pnn, 0, CTDB_CONTROL_CLEAR_LOG,
+				   0, tdb_null, tmp_ctx, NULL, &res, NULL, &errmsg);
+		if (ret != 0 || res != 0) {
+			DEBUG(DEBUG_ERR,("Failed to clear logs\n"));
+			talloc_free(tmp_ctx);
+			return -1;
+		}
+
 		talloc_free(tmp_ctx);
-		return -1;
+	} else {
+		TDB_DATA data; /* unused in recoverd... */
+		data.dsize = 0;
+
+		ret = ctdb_client_send_message(ctdb, options.pnn, CTDB_SRVID_CLEARLOG, data);
+		if (ret != 0) {
+			DEBUG(DEBUG_ERR,("Failed to send clearlog request message to %u\n", options.pnn));
+			return -1;
+		}
 	}
 
-	talloc_free(tmp_ctx);
 	return 0;
 }
 
+/* Reload public IPs on a specified nodes */
+static int control_reloadips(struct ctdb_context *ctdb, int argc, const char **argv)
+{
+	TALLOC_CTX *tmp_ctx = talloc_new(ctdb);
+	uint32_t *nodes;
+	uint32_t pnn_mode;
+	uint32_t timeout;
+	int ret;
 
+	assert_single_node_only();
+
+	if (argc > 1) {
+		usage();
+	}
+
+	/* Determine the nodes where IPs need to be reloaded */
+	if (!parse_nodestring(ctdb, tmp_ctx, argc == 1 ? argv[0] : NULL,
+			      options.pnn, true, &nodes, &pnn_mode)) {
+		ret = -1;
+		goto done;
+	}
+
+again:
+	/* Disable takeover runs on all connected nodes.  A reply
+	 * indicating success is needed from each node so all nodes
+	 * will need to be active.  This will retry until maxruntime
+	 * is exceeded, hence no error handling.
+	 * 
+	 * A check could be added to not allow reloading of IPs when
+	 * there are disconnected nodes.  However, this should
+	 * probably be left up to the administrator.
+	 */
+	timeout = LONGTIMEOUT;
+	srvid_broadcast(ctdb, CTDB_SRVID_DISABLE_TAKEOVER_RUNS, &timeout,
+			"Disable takeover runs", true);
+
+	/* Now tell all the desired nodes to reload their public IPs.
+	 * Keep trying this until it succeeds.  This assumes all
+	 * failures are transient, which might not be true...
+	 */
+	if (ctdb_client_async_control(ctdb, CTDB_CONTROL_RELOAD_PUBLIC_IPS,
+				      nodes, 0, LONGTIMELIMIT(),
+				      false, tdb_null,
+				      NULL, NULL, NULL) != 0) {
+		DEBUG(DEBUG_ERR,
+		      ("Unable to reload IPs on some nodes, try again.\n"));
+		goto again;
+	}
+
+	/* It isn't strictly necessary to wait until takeover runs are
+	 * re-enabled but doing so can't hurt.
+	 */
+	timeout = 0;
+	srvid_broadcast(ctdb, CTDB_SRVID_DISABLE_TAKEOVER_RUNS, &timeout,
+			"Enable takeover runs", true);
+
+	ipreallocate(ctdb);
+
+	ret = 0;
+done:
+	talloc_free(tmp_ctx);
+	return ret;
+}
 
 /*
   display a list of the databases on a remote ctdb
@@ -2864,12 +4670,14 @@ static int control_getdbmap(struct ctdb_context *ctdb, int argc, const char **ar
 	}
 
 	if(options.machinereadable){
-		printf(":ID:Name:Path:Persistent:Unhealthy:\n");
+		printf(":ID:Name:Path:Persistent:Sticky:Unhealthy:ReadOnly:\n");
 		for(i=0;i<dbmap->num;i++){
 			const char *path;
 			const char *name;
 			const char *health;
 			bool persistent;
+			bool readonly;
+			bool sticky;
 
 			ctdb_ctrl_getdbpath(ctdb, TIMELIMIT(), options.pnn,
 					    dbmap->dbs[i].dbid, ctdb, &path);
@@ -2877,10 +4685,13 @@ static int control_getdbmap(struct ctdb_context *ctdb, int argc, const char **ar
 					    dbmap->dbs[i].dbid, ctdb, &name);
 			ctdb_ctrl_getdbhealth(ctdb, TIMELIMIT(), options.pnn,
 					      dbmap->dbs[i].dbid, ctdb, &health);
-			persistent = dbmap->dbs[i].persistent;
-			printf(":0x%08X:%s:%s:%d:%d:\n",
+			persistent = dbmap->dbs[i].flags & CTDB_DB_FLAGS_PERSISTENT;
+			readonly   = dbmap->dbs[i].flags & CTDB_DB_FLAGS_READONLY;
+			sticky     = dbmap->dbs[i].flags & CTDB_DB_FLAGS_STICKY;
+			printf(":0x%08X:%s:%s:%d:%d:%d:%d:\n",
 			       dbmap->dbs[i].dbid, name, path,
-			       !!(persistent), !!(health));
+			       !!(persistent), !!(sticky),
+			       !!(health), !!(readonly));
 		}
 		return 0;
 	}
@@ -2891,14 +4702,20 @@ static int control_getdbmap(struct ctdb_context *ctdb, int argc, const char **ar
 		const char *name;
 		const char *health;
 		bool persistent;
+		bool readonly;
+		bool sticky;
 
 		ctdb_ctrl_getdbpath(ctdb, TIMELIMIT(), options.pnn, dbmap->dbs[i].dbid, ctdb, &path);
 		ctdb_ctrl_getdbname(ctdb, TIMELIMIT(), options.pnn, dbmap->dbs[i].dbid, ctdb, &name);
 		ctdb_ctrl_getdbhealth(ctdb, TIMELIMIT(), options.pnn, dbmap->dbs[i].dbid, ctdb, &health);
-		persistent = dbmap->dbs[i].persistent;
-		printf("dbid:0x%08x name:%s path:%s%s%s\n",
+		persistent = dbmap->dbs[i].flags & CTDB_DB_FLAGS_PERSISTENT;
+		readonly   = dbmap->dbs[i].flags & CTDB_DB_FLAGS_READONLY;
+		sticky     = dbmap->dbs[i].flags & CTDB_DB_FLAGS_STICKY;
+		printf("dbid:0x%08x name:%s path:%s%s%s%s%s\n",
 		       dbmap->dbs[i].dbid, name, path,
 		       persistent?" PERSISTENT":"",
+		       sticky?" STICKY":"",
+		       readonly?" READONLY":"",
 		       health?" UNHEALTHY":"");
 	}
 
@@ -2910,44 +4727,29 @@ static int control_getdbmap(struct ctdb_context *ctdb, int argc, const char **ar
  */
 static int control_getdbstatus(struct ctdb_context *ctdb, int argc, const char **argv)
 {
-	int i, ret;
-	struct ctdb_dbid_map *dbmap=NULL;
 	const char *db_name;
+	uint32_t db_id;
+	uint8_t flags;
+	const char *path;
+	const char *health;
 
 	if (argc < 1) {
 		usage();
 	}
 
-	db_name = argv[0];
-
-	ret = ctdb_ctrl_getdbmap(ctdb, TIMELIMIT(), options.pnn, ctdb, &dbmap);
-	if (ret != 0) {
-		DEBUG(DEBUG_ERR, ("Unable to get dbids from node %u\n", options.pnn));
-		return ret;
+	if (!db_exists(ctdb, argv[0], &db_id, &db_name, &flags)) {
+		return -1;
 	}
 
-	for(i=0;i<dbmap->num;i++){
-		const char *path;
-		const char *name;
-		const char *health;
-		bool persistent;
+	ctdb_ctrl_getdbpath(ctdb, TIMELIMIT(), options.pnn, db_id, ctdb, &path);
+	ctdb_ctrl_getdbhealth(ctdb, TIMELIMIT(), options.pnn, db_id, ctdb, &health);
+	printf("dbid: 0x%08x\nname: %s\npath: %s\nPERSISTENT: %s\nSTICKY: %s\nREADONLY: %s\nHEALTH: %s\n",
+	       db_id, db_name, path,
+	       (flags & CTDB_DB_FLAGS_PERSISTENT ? "yes" : "no"),
+	       (flags & CTDB_DB_FLAGS_STICKY ? "yes" : "no"),
+	       (flags & CTDB_DB_FLAGS_READONLY ? "yes" : "no"),
+	       (health ? health : "OK"));
 
-		ctdb_ctrl_getdbname(ctdb, TIMELIMIT(), options.pnn, dbmap->dbs[i].dbid, ctdb, &name);
-		if (strcmp(name, db_name) != 0) {
-			continue;
-		}
-
-		ctdb_ctrl_getdbpath(ctdb, TIMELIMIT(), options.pnn, dbmap->dbs[i].dbid, ctdb, &path);
-		ctdb_ctrl_getdbhealth(ctdb, TIMELIMIT(), options.pnn, dbmap->dbs[i].dbid, ctdb, &health);
-		persistent = dbmap->dbs[i].persistent;
-		printf("dbid: 0x%08x\nname: %s\npath: %s\nPERSISTENT: %s\nHEALTH: %s\n",
-		       dbmap->dbs[i].dbid, name, path,
-		       persistent?"yes":"no",
-		       health?health:"OK");
-		return 0;
-	}
-
-	DEBUG(DEBUG_ERR, ("db %s doesn't exist on node %u\n", db_name, options.pnn));
 	return 0;
 }
 
@@ -2961,11 +4763,9 @@ static int control_isnotrecmaster(struct ctdb_context *ctdb, int argc, const cha
 	uint32_t mypnn, recmaster;
 	int ret;
 
-	mypnn = ctdb_ctrl_getpnn(ctdb, TIMELIMIT(), options.pnn);
-	if (mypnn == -1) {
-		printf("Failed to get pnn of node\n");
-		return 1;
-	}
+	assert_single_node_only();
+
+	mypnn = getpnn(ctdb);
 
 	ret = ctdb_ctrl_getrecmaster(ctdb, ctdb, TIMELIMIT(), options.pnn, &recmaster);
 	if (ret != 0) {
@@ -3002,6 +4802,49 @@ static int control_ping(struct ctdb_context *ctdb, int argc, const char **argv)
 
 
 /*
+  get a node's runstate
+ */
+static int control_runstate(struct ctdb_context *ctdb, int argc, const char **argv)
+{
+	int ret;
+	enum ctdb_runstate runstate;
+
+	ret = ctdb_ctrl_get_runstate(ctdb, TIMELIMIT(), options.pnn, &runstate);
+	if (ret == -1) {
+		printf("Unable to get runstate response from node %u\n",
+		       options.pnn);
+		return -1;
+	} else {
+		bool found = true;
+		enum ctdb_runstate t;
+		int i;
+		for (i=0; i<argc; i++) {
+			found = false;
+			t = runstate_from_string(argv[i]);
+			if (t == CTDB_RUNSTATE_UNKNOWN) {
+				printf("Invalid run state (%s)\n", argv[i]);
+				return -1;
+			}
+
+			if (t == runstate) {
+				found = true;
+				break;
+			}
+		}
+
+		if (!found) {
+			printf("CTDB not in required run state (got %s)\n", 
+			       runstate_to_string((enum ctdb_runstate)runstate));
+			return -1;
+		}
+	}
+
+	printf("%s\n", runstate_to_string(runstate));
+	return 0;
+}
+
+
+/*
   get a tunable
  */
 static int control_getvar(struct ctdb_context *ctdb, int argc, const char **argv)
@@ -3016,7 +4859,7 @@ static int control_getvar(struct ctdb_context *ctdb, int argc, const char **argv
 
 	name = argv[0];
 	ret = ctdb_ctrl_get_tunable(ctdb, TIMELIMIT(), options.pnn, name, &value);
-	if (ret == -1) {
+	if (ret != 0) {
 		DEBUG(DEBUG_ERR, ("Unable to get tunable variable '%s'\n", name));
 		return -1;
 	}
@@ -3280,28 +5123,6 @@ static int control_setdebug(struct ctdb_context *ctdb, int argc, const char **ar
 
 
 /*
-  freeze a node
- */
-static int control_freeze(struct ctdb_context *ctdb, int argc, const char **argv)
-{
-	int ret;
-	uint32_t priority;
-	
-	if (argc == 1) {
-		priority = strtol(argv[0], NULL, 0);
-	} else {
-		priority = 0;
-	}
-	DEBUG(DEBUG_ERR,("Freeze by priority %u\n", priority));
-
-	ret = ctdb_ctrl_freeze_priority(ctdb, TIMELIMIT(), options.pnn, priority);
-	if (ret != 0) {
-		DEBUG(DEBUG_ERR, ("Unable to freeze node %u\n", options.pnn));
-	}		
-	return 0;
-}
-
-/*
   thaw a node
  */
 static int control_thaw(struct ctdb_context *ctdb, int argc, const char **argv)
@@ -3347,7 +5168,7 @@ static int control_attach(struct ctdb_context *ctdb, int argc, const char **argv
 		persistent = true;
 	}
 
-	ctdb_db = ctdb_attach(ctdb, db_name, persistent, 0);
+	ctdb_db = ctdb_attach(ctdb, TIMELIMIT(), db_name, persistent, 0);
 	if (ctdb_db == NULL) {
 		DEBUG(DEBUG_ERR,("Unable to attach to database '%s'\n", db_name));
 		return -1;
@@ -3392,7 +5213,9 @@ static int control_getdbprio(struct ctdb_context *ctdb, int argc, const char **a
 		usage();
 	}
 
-	db_id = strtoul(argv[0], NULL, 0);
+	if (!db_exists(ctdb, argv[0], &db_id, NULL, NULL)) {
+		return -1;
+	}
 
 	ret = ctdb_ctrl_get_db_priority(ctdb, TIMELIMIT(), options.pnn, db_id, &priority);
 	if (ret != 0) {
@@ -3401,6 +5224,90 @@ static int control_getdbprio(struct ctdb_context *ctdb, int argc, const char **a
 	}
 
 	DEBUG(DEBUG_ERR,("Priority:%u\n", priority));
+
+	return 0;
+}
+
+/*
+  set the sticky records capability for a database
+ */
+static int control_setdbsticky(struct ctdb_context *ctdb, int argc, const char **argv)
+{
+	TALLOC_CTX *tmp_ctx = talloc_new(ctdb);
+	uint32_t db_id;
+	int ret;
+
+	if (argc < 1) {
+		usage();
+	}
+
+	if (!db_exists(ctdb, argv[0], &db_id, NULL, NULL)) {
+		return -1;
+	}
+
+	ret = ctdb_ctrl_set_db_sticky(ctdb, options.pnn, db_id);
+	if (ret != 0) {
+		DEBUG(DEBUG_ERR,("Unable to set db to support sticky records\n"));
+		talloc_free(tmp_ctx);
+		return -1;
+	}
+
+	talloc_free(tmp_ctx);
+	return 0;
+}
+
+/*
+  set the readonly capability for a database
+ */
+static int control_setdbreadonly(struct ctdb_context *ctdb, int argc, const char **argv)
+{
+	TALLOC_CTX *tmp_ctx = talloc_new(ctdb);
+	uint32_t db_id;
+	int ret;
+
+	if (argc < 1) {
+		usage();
+	}
+
+	if (!db_exists(ctdb, argv[0], &db_id, NULL, NULL)) {
+		return -1;
+	}
+
+	ret = ctdb_ctrl_set_db_readonly(ctdb, options.pnn, db_id);
+	if (ret != 0) {
+		DEBUG(DEBUG_ERR,("Unable to set db to support readonly\n"));
+		talloc_free(tmp_ctx);
+		return -1;
+	}
+
+	talloc_free(tmp_ctx);
+	return 0;
+}
+
+/*
+  get db seqnum
+ */
+static int control_getdbseqnum(struct ctdb_context *ctdb, int argc, const char **argv)
+{
+	uint32_t db_id;
+	uint64_t seqnum;
+	int ret;
+
+	if (argc < 1) {
+		usage();
+	}
+
+	if (!db_exists(ctdb, argv[0], &db_id, NULL, NULL)) {
+		return -1;
+	}
+
+	ret = ctdb_ctrl_getdbseqnum(ctdb, TIMELIMIT(), options.pnn, db_id, &seqnum);
+	if (ret != 0) {
+		DEBUG(DEBUG_ERR, ("Unable to get seqnum from node."));
+		return -1;
+	}
+
+	printf("Sequence number:%lld\n", (long long)seqnum);
 
 	return 0;
 }
@@ -3486,8 +5393,8 @@ static int backup_traverse(struct tdb_context *tdb, TDB_DATA key, TDB_DATA data,
  */
 static int control_backupdb(struct ctdb_context *ctdb, int argc, const char **argv)
 {
-	int i, ret;
-	struct ctdb_dbid_map *dbmap=NULL;
+	const char *db_name;
+	int ret;
 	TALLOC_CTX *tmp_ctx = talloc_new(ctdb);
 	struct db_file_header dbhdr;
 	struct ctdb_db_context *ctdb_db;
@@ -3495,36 +5402,22 @@ static int control_backupdb(struct ctdb_context *ctdb, int argc, const char **ar
 	int fh = -1;
 	int status = -1;
 	const char *reason = NULL;
+	uint32_t db_id;
+	uint8_t flags;
+
+	assert_single_node_only();
 
 	if (argc != 2) {
 		DEBUG(DEBUG_ERR,("Invalid arguments\n"));
 		return -1;
 	}
 
-	ret = ctdb_ctrl_getdbmap(ctdb, TIMELIMIT(), options.pnn, tmp_ctx, &dbmap);
-	if (ret != 0) {
-		DEBUG(DEBUG_ERR, ("Unable to get dbids from node %u\n", options.pnn));
-		return ret;
-	}
-
-	for(i=0;i<dbmap->num;i++){
-		const char *name;
-
-		ctdb_ctrl_getdbname(ctdb, TIMELIMIT(), options.pnn, dbmap->dbs[i].dbid, tmp_ctx, &name);
-		if(!strcmp(argv[0], name)){
-			talloc_free(discard_const(name));
-			break;
-		}
-		talloc_free(discard_const(name));
-	}
-	if (i == dbmap->num) {
-		DEBUG(DEBUG_ERR,("No database with name '%s' found\n", argv[0]));
-		talloc_free(tmp_ctx);
+	if (!db_exists(ctdb, argv[0], &db_id, &db_name, &flags)) {
 		return -1;
 	}
 
 	ret = ctdb_ctrl_getdbhealth(ctdb, TIMELIMIT(), options.pnn,
-				    dbmap->dbs[i].dbid, tmp_ctx, &reason);
+				    db_id, tmp_ctx, &reason);
 	if (ret != 0) {
 		DEBUG(DEBUG_ERR,("Unable to get dbhealth for database '%s'\n",
 				 argv[0]));
@@ -3542,7 +5435,7 @@ static int control_backupdb(struct ctdb_context *ctdb, int argc, const char **ar
 			DEBUG(DEBUG_ERR,("database '%s' is unhealthy: %s\n",
 					 argv[0], reason));
 
-			DEBUG(DEBUG_ERR,("disallow backup : tunnable AllowUnhealthyDBRead = %u\n",
+			DEBUG(DEBUG_ERR,("disallow backup : tunable AllowUnhealthyDBRead = %u\n",
 					 allow_unhealthy));
 			talloc_free(tmp_ctx);
 			return -1;
@@ -3555,7 +5448,7 @@ static int control_backupdb(struct ctdb_context *ctdb, int argc, const char **ar
 				     allow_unhealthy));
 	}
 
-	ctdb_db = ctdb_attach(ctdb, argv[0], dbmap->dbs[i].persistent, 0);
+	ctdb_db = ctdb_attach(ctdb, TIMELIMIT(), db_name, flags & CTDB_DB_FLAGS_PERSISTENT, 0);
 	if (ctdb_db == NULL) {
 		DEBUG(DEBUG_ERR,("Unable to attach to database '%s'\n", argv[0]));
 		talloc_free(tmp_ctx);
@@ -3605,15 +5498,16 @@ static int control_backupdb(struct ctdb_context *ctdb, int argc, const char **ar
 		return -1;
 	}
 
+	ZERO_STRUCT(dbhdr);
 	dbhdr.version = DB_VERSION;
 	dbhdr.timestamp = time(NULL);
-	dbhdr.persistent = dbmap->dbs[i].persistent;
+	dbhdr.persistent = flags & CTDB_DB_FLAGS_PERSISTENT;
 	dbhdr.size = bd->len;
 	if (strlen(argv[0]) >= MAX_DB_NAME) {
 		DEBUG(DEBUG_ERR,("Too long dbname\n"));
 		goto done;
 	}
-	strncpy(discard_const(dbhdr.name), argv[0], MAX_DB_NAME);
+	strncpy(discard_const(dbhdr.name), argv[0], MAX_DB_NAME-1);
 	ret = write(fh, &dbhdr, sizeof(dbhdr));
 	if (ret == -1) {
 		DEBUG(DEBUG_ERR,("write failed: %s\n", strerror(errno)));
@@ -3633,6 +5527,9 @@ done:
 			DEBUG(DEBUG_ERR,("close failed: %s\n", strerror(errno)));
 		}
 	}
+
+	DEBUG(DEBUG_ERR,("Database backed up to %s\n", argv[1]));
+
 	talloc_free(tmp_ctx);
 	return status;
 }
@@ -3656,8 +5553,11 @@ static int control_restoredb(struct ctdb_context *ctdb, int argc, const char **a
 	uint32_t generation;
 	struct tm *tm;
 	char tbuf[100];
+	char *dbname;
 
-	if (argc != 1) {
+	assert_single_node_only();
+
+	if (argc < 1 || argc > 2) {
 		DEBUG(DEBUG_ERR,("Invalid arguments\n"));
 		return -1;
 	}
@@ -3672,8 +5572,14 @@ static int control_restoredb(struct ctdb_context *ctdb, int argc, const char **a
 	read(fh, &dbhdr, sizeof(dbhdr));
 	if (dbhdr.version != DB_VERSION) {
 		DEBUG(DEBUG_ERR,("Invalid version of database dump. File is version %lu but expected version was %u\n", dbhdr.version, DB_VERSION));
+		close(fh);
 		talloc_free(tmp_ctx);
 		return -1;
+	}
+
+	dbname = discard_const(dbhdr.name);
+	if (argc == 2) {
+		dbname = discard_const(argv[1]);
 	}
 
 	outdata.dsize = dbhdr.size;
@@ -3690,12 +5596,12 @@ static int control_restoredb(struct ctdb_context *ctdb, int argc, const char **a
 	tm = localtime(&dbhdr.timestamp);
 	strftime(tbuf,sizeof(tbuf)-1,"%Y/%m/%d %H:%M:%S", tm);
 	printf("Restoring database '%s' from backup @ %s\n",
-		dbhdr.name, tbuf);
+		dbname, tbuf);
 
 
-	ctdb_db = ctdb_attach(ctdb, dbhdr.name, dbhdr.persistent, 0);
+	ctdb_db = ctdb_attach(ctdb, TIMELIMIT(), dbname, dbhdr.persistent, 0);
 	if (ctdb_db == NULL) {
-		DEBUG(DEBUG_ERR,("Unable to attach to database '%s'\n", dbhdr.name));
+		DEBUG(DEBUG_ERR,("Unable to attach to database '%s'\n", dbname));
 		talloc_free(tmp_ctx);
 		return -1;
 	}
@@ -3845,6 +5751,8 @@ static int control_dumpdbbackup(struct ctdb_context *ctdb, int argc, const char 
 	struct ctdb_marshall_buffer *m;
 	struct ctdb_dump_db_context c;
 
+	assert_single_node_only();
+
 	if (argc != 1) {
 		DEBUG(DEBUG_ERR,("Invalid arguments\n"));
 		return -1;
@@ -3860,6 +5768,7 @@ static int control_dumpdbbackup(struct ctdb_context *ctdb, int argc, const char 
 	read(fh, &dbhdr, sizeof(dbhdr));
 	if (dbhdr.version != DB_VERSION) {
 		DEBUG(DEBUG_ERR,("Invalid version of database dump. File is version %lu but expected version was %u\n", dbhdr.version, DB_VERSION));
+		close(fh);
 		talloc_free(tmp_ctx);
 		return -1;
 	}
@@ -3911,6 +5820,7 @@ static int control_dumpdbbackup(struct ctdb_context *ctdb, int argc, const char 
 static int control_wipedb(struct ctdb_context *ctdb, int argc,
 			  const char **argv)
 {
+	const char *db_name;
 	int ret;
 	TALLOC_CTX *tmp_ctx = talloc_new(ctdb);
 	TDB_DATA data;
@@ -3921,40 +5831,20 @@ static int control_wipedb(struct ctdb_context *ctdb, int argc,
 	struct ctdb_control_wipe_database w;
 	uint32_t *nodes;
 	uint32_t generation;
-	struct ctdb_dbid_map *dbmap = NULL;
+	uint8_t flags;
+
+	assert_single_node_only();
 
 	if (argc != 1) {
 		DEBUG(DEBUG_ERR,("Invalid arguments\n"));
 		return -1;
 	}
 
-	ret = ctdb_ctrl_getdbmap(ctdb, TIMELIMIT(), options.pnn, tmp_ctx,
-				 &dbmap);
-	if (ret != 0) {
-		DEBUG(DEBUG_ERR, ("Unable to get dbids from node %u\n",
-				  options.pnn));
-		return ret;
-	}
-
-	for(i=0;i<dbmap->num;i++){
-		const char *name;
-
-		ctdb_ctrl_getdbname(ctdb, TIMELIMIT(), options.pnn,
-				    dbmap->dbs[i].dbid, tmp_ctx, &name);
-		if(!strcmp(argv[0], name)){
-			talloc_free(discard_const(name));
-			break;
-		}
-		talloc_free(discard_const(name));
-	}
-	if (i == dbmap->num) {
-		DEBUG(DEBUG_ERR, ("No database with name '%s' found\n",
-				  argv[0]));
-		talloc_free(tmp_ctx);
+	if (!db_exists(ctdb, argv[0], NULL, &db_name, &flags)) {
 		return -1;
 	}
 
-	ctdb_db = ctdb_attach(ctdb, argv[0], dbmap->dbs[i].persistent, 0);
+	ctdb_db = ctdb_attach(ctdb, TIMELIMIT(), db_name, flags & CTDB_DB_FLAGS_PERSISTENT, 0);
 	if (ctdb_db == NULL) {
 		DEBUG(DEBUG_ERR, ("Unable to attach to database '%s'\n",
 				  argv[0]));
@@ -4079,51 +5969,9 @@ static int control_wipedb(struct ctdb_context *ctdb, int argc,
 		return -1;
 	}
 
+	DEBUG(DEBUG_ERR, ("Database wiped.\n"));
+
 	talloc_free(tmp_ctx);
-	return 0;
-}
-
-/*
- * set flags of a node in the nodemap
- */
-static int control_setflags(struct ctdb_context *ctdb, int argc, const char **argv)
-{
-	int ret;
-	int32_t status;
-	int node;
-	int flags;
-	TDB_DATA data;
-	struct ctdb_node_flag_change c;
-
-	if (argc != 2) {
-		usage();
-		return -1;
-	}
-
-	if (sscanf(argv[0], "%d", &node) != 1) {
-		DEBUG(DEBUG_ERR, ("Badly formed node\n"));
-		usage();
-		return -1;
-	}
-	if (sscanf(argv[1], "0x%x", &flags) != 1) {
-		DEBUG(DEBUG_ERR, ("Badly formed flags\n"));
-		usage();
-		return -1;
-	}
-
-	c.pnn       = node;
-	c.old_flags = 0;
-	c.new_flags = flags;
-
-	data.dsize = sizeof(c);
-	data.dptr = (unsigned char *)&c;
-
-	ret = ctdb_control(ctdb, options.pnn, 0, CTDB_CONTROL_MODIFY_FLAGS, 0, 
-			   data, NULL, NULL, &status, NULL, NULL);
-	if (ret != 0 || status != 0) {
-		DEBUG(DEBUG_ERR,("Failed to modify flags\n"));
-		return -1;
-	}
 	return 0;
 }
 
@@ -4166,25 +6014,21 @@ static int control_rddumpmemory(struct ctdb_context *ctdb, int argc, const char 
 {
 	int ret;
 	TDB_DATA data;
-	struct rd_memdump_reply rd;
+	struct srvid_request rd;
 
-	rd.pnn = ctdb_ctrl_getpnn(ctdb, TIMELIMIT(), CTDB_CURRENT_NODE);
-	if (rd.pnn == -1) {
-		DEBUG(DEBUG_ERR, ("Failed to get pnn of local node\n"));
-		return -1;
-	}
+	rd.pnn = ctdb_get_pnn(ctdb);
 	rd.srvid = getpid();
 
 	/* register a message port for receiveing the reply so that we
 	   can receive the reply
 	*/
-	ctdb_set_message_handler(ctdb, rd.srvid, mem_dump_handler, NULL);
+	ctdb_client_set_message_handler(ctdb, rd.srvid, mem_dump_handler, NULL);
 
 
 	data.dptr = (uint8_t *)&rd;
 	data.dsize = sizeof(rd);
 
-	ret = ctdb_send_message(ctdb, options.pnn, CTDB_SRVID_MEM_DUMP, data);
+	ret = ctdb_client_send_message(ctdb, options.pnn, CTDB_SRVID_MEM_DUMP, data);
 	if (ret != 0) {
 		DEBUG(DEBUG_ERR,("Failed to send memdump request message to %u\n", options.pnn));
 		return -1;
@@ -4216,7 +6060,7 @@ static int control_msgsend(struct ctdb_context *ctdb, int argc, const char **arg
 	data.dptr = (uint8_t *)discard_const(argv[1]);
 	data.dsize= strlen(argv[1]);
 
-	ret = ctdb_send_message(ctdb, CTDB_BROADCAST_CONNECTED, srvid, data);
+	ret = ctdb_client_send_message(ctdb, CTDB_BROADCAST_CONNECTED, srvid, data);
 	if (ret != 0) {
 		DEBUG(DEBUG_ERR,("Failed to send memdump request message to %u\n", options.pnn));
 		return -1;
@@ -4251,7 +6095,7 @@ static int control_msglisten(struct ctdb_context *ctdb, int argc, const char **a
 
 	/* register a message port and listen for messages
 	*/
-	ctdb_set_message_handler(ctdb, srvid, msglisten_handler, NULL);
+	ctdb_client_set_message_handler(ctdb, srvid, msglisten_handler, NULL);
 	printf("Listening for messages on srvid:%d\n", (int)srvid);
 
 	while (1) {	
@@ -4263,60 +6107,37 @@ static int control_msglisten(struct ctdb_context *ctdb, int argc, const char **a
 
 /*
   list all nodes in the cluster
-  if the daemon is running, we read the data from the daemon.
-  if the daemon is not running we parse the nodes file directly
+  we parse the nodes file directly
  */
 static int control_listnodes(struct ctdb_context *ctdb, int argc, const char **argv)
 {
-	int i, ret;
-	struct ctdb_node_map *nodemap=NULL;
+	TALLOC_CTX *mem_ctx = talloc_new(NULL);
+	struct pnn_node *pnn_nodes;
+	struct pnn_node *pnn_node;
 
-	if (ctdb != NULL) {
-		ret = ctdb_ctrl_getnodemap(ctdb, TIMELIMIT(), options.pnn, ctdb, &nodemap);
-		if (ret != 0) {
-			DEBUG(DEBUG_ERR, ("Unable to get nodemap from node %u\n", options.pnn));
-			return ret;
-		}
+	assert_single_node_only();
 
-		for(i=0;i<nodemap->num;i++){
-			if (nodemap->nodes[i].flags & NODE_FLAGS_DELETED) {
-				continue;
-			}
-			if (options.machinereadable){
-				printf(":%d:%s:\n", nodemap->nodes[i].pnn, ctdb_addr_to_str(&nodemap->nodes[i].addr));
-			} else {
-				printf("%s\n", ctdb_addr_to_str(&nodemap->nodes[i].addr));
-			}
-		}
-	} else {
-		TALLOC_CTX *mem_ctx = talloc_new(NULL);
-		struct pnn_node *pnn_nodes;
-		struct pnn_node *pnn_node;
-	
-		pnn_nodes = read_nodes_file(mem_ctx);
-		if (pnn_nodes == NULL) {
-			DEBUG(DEBUG_ERR,("Failed to read nodes file\n"));
+	pnn_nodes = read_nodes_file(mem_ctx);
+	if (pnn_nodes == NULL) {
+		DEBUG(DEBUG_ERR,("Failed to read nodes file\n"));
+		talloc_free(mem_ctx);
+		return -1;
+	}
+
+	for(pnn_node=pnn_nodes;pnn_node;pnn_node=pnn_node->next) {
+		ctdb_sock_addr addr;
+		if (parse_ip(pnn_node->addr, NULL, 63999, &addr) == 0) {
+			DEBUG(DEBUG_ERR,("Wrongly formed ip address '%s' in nodes file\n", pnn_node->addr));
 			talloc_free(mem_ctx);
 			return -1;
 		}
-
-		for(pnn_node=pnn_nodes;pnn_node;pnn_node=pnn_node->next) {
-			ctdb_sock_addr addr;
-
-			if (parse_ip(pnn_node->addr, NULL, 63999, &addr) == 0) {
-				DEBUG(DEBUG_ERR,("Wrongly formed ip address '%s' in nodes file\n", pnn_node->addr));
-				talloc_free(mem_ctx);
-				return -1;
-			}
-
-			if (options.machinereadable){
-				printf(":%d:%s:\n", pnn_node->pnn, pnn_node->addr);
-			} else {
-				printf("%s\n", pnn_node->addr);
-			}
+		if (options.machinereadable){
+			printf(":%d:%s:\n", pnn_node->pnn, pnn_node->addr);
+		} else {
+			printf("%s\n", pnn_node->addr);
 		}
-		talloc_free(mem_ctx);
 	}
+	talloc_free(mem_ctx);
 
 	return 0;
 }
@@ -4330,11 +6151,9 @@ static int control_reload_nodes_file(struct ctdb_context *ctdb, int argc, const 
 	int mypnn;
 	struct ctdb_node_map *nodemap=NULL;
 
-	mypnn = ctdb_ctrl_getpnn(ctdb, TIMELIMIT(), CTDB_CURRENT_NODE);
-	if (mypnn == -1) {
-		DEBUG(DEBUG_ERR, ("Failed to read pnn of local node\n"));
-		return -1;
-	}
+	assert_single_node_only();
+
+	mypnn = ctdb_get_pnn(ctdb);
 
 	ret = ctdb_ctrl_getnodemap(ctdb, TIMELIMIT(), CTDB_CURRENT_NODE, ctdb, &nodemap);
 	if (ret != 0) {
@@ -4377,25 +6196,26 @@ static const struct {
 	const char *msg;
 	const char *args;
 } ctdb_commands[] = {
-#ifdef CTDB_VERS
-	{ "version",         control_version,           true,	false,  "show version of ctdb" },
-#endif
+	{ "version",         control_version,           true,	true,   "show version of ctdb" },
 	{ "status",          control_status,            true,	false,  "show node status" },
 	{ "uptime",          control_uptime,            true,	false,  "show node uptime" },
 	{ "ping",            control_ping,              true,	false,  "ping all nodes" },
+	{ "runstate",        control_runstate,          true,	false,  "get/check runstate of a node", "[setup|first_recovery|startup|running]" },
 	{ "getvar",          control_getvar,            true,	false,  "get a tunable variable",               "<name>"},
 	{ "setvar",          control_setvar,            true,	false,  "set a tunable variable",               "<name> <value>"},
 	{ "listvars",        control_listvars,          true,	false,  "list tunable variables"},
 	{ "statistics",      control_statistics,        false,	false, "show statistics" },
 	{ "statisticsreset", control_statistics_reset,  true,	false,  "reset statistics"},
+	{ "stats",           control_stats,             false,	false,  "show rolling statistics", "[number of history records]" },
 	{ "ip",              control_ip,                false,	false,  "show which public ip's that ctdb manages" },
 	{ "ipinfo",          control_ipinfo,            true,	false,  "show details about a public ip that ctdb manages", "<ip>" },
 	{ "ifaces",          control_ifaces,            true,	false,  "show which interfaces that ctdb manages" },
 	{ "setifacelink",    control_setifacelink,      true,	false,  "set interface link status", "<iface> <status>" },
 	{ "process-exists",  control_process_exists,    true,	false,  "check if a process exists on a node",  "<pid>"},
 	{ "getdbmap",        control_getdbmap,          true,	false,  "show the database map" },
-	{ "getdbstatus",     control_getdbstatus,       true,	false,  "show the status of a database", "<dbname>" },
-	{ "catdb",           control_catdb,             true,	false,  "dump a database" ,                     "<dbname>"},
+	{ "getdbstatus",     control_getdbstatus,       true,	false,  "show the status of a database", "<dbname|dbid>" },
+	{ "catdb",           control_catdb,             true,	false,  "dump a ctdb database" ,                     "<dbname|dbid>"},
+	{ "cattdb",          control_cattdb,            true,	false,  "dump a local tdb database" ,                     "<dbname|dbid>"},
 	{ "getmonmode",      control_getmonmode,        true,	false,  "show monitoring mode" },
 	{ "getcapabilities", control_getcapabilities,   true,	false,  "show node capabilities" },
 	{ "pnn",             control_pnn,               true,	false,  "show the pnn of the currnet node" },
@@ -4405,8 +6225,8 @@ static const struct {
 	{ "enablemonitor",      control_enable_monmode, true,	false,  "set monitoring mode to ACTIVE" },
 	{ "setdebug",        control_setdebug,          true,	false,  "set debug level",                      "<EMERG|ALERT|CRIT|ERR|WARNING|NOTICE|INFO|DEBUG>" },
 	{ "getdebug",        control_getdebug,          true,	false,  "get debug level" },
-	{ "getlog",          control_getlog,            true,	false,  "get the log data from the in memory ringbuffer", "<level>" },
-	{ "clearlog",          control_clearlog,        true,	false,  "clear the log data from the in memory ringbuffer" },
+	{ "getlog",          control_getlog,            true,	false,  "get the log data from the in memory ringbuffer", "[<level>] [recoverd]" },
+	{ "clearlog",          control_clearlog,        true,	false,  "clear the log data from the in memory ringbuffer", "[recoverd]" },
 	{ "attach",          control_attach,            true,	false,  "attach to a database",                 "<dbname> [persistent]" },
 	{ "dumpmemory",      control_dumpmemory,        true,	false,  "dump memory map to stdout" },
 	{ "rddumpmemory",    control_rddumpmemory,      true,	false,  "dump memory map from the recovery daemon to stdout" },
@@ -4415,52 +6235,72 @@ static const struct {
 	{ "enable",          control_enable,            true,	false,  "enable a nodes public IP" },
 	{ "stop",            control_stop,              true,	false,  "stop a node" },
 	{ "continue",        control_continue,          true,	false,  "re-start a stopped node" },
-	{ "ban",             control_ban,               true,	false,  "ban a node from the cluster",          "<bantime|0>"},
+	{ "ban",             control_ban,               true,	false,  "ban a node from the cluster",          "<bantime>"},
 	{ "unban",           control_unban,             true,	false,  "unban a node" },
 	{ "showban",         control_showban,           true,	false,  "show ban information"},
 	{ "shutdown",        control_shutdown,          true,	false,  "shutdown ctdbd" },
 	{ "recover",         control_recover,           true,	false,  "force recovery" },
-	{ "ipreallocate",    control_ipreallocate,      true,	false,  "force the recovery daemon to perform a ip reallocation procedure" },
-	{ "freeze",          control_freeze,            true,	false,  "freeze databases", "[priority:1-3]" },
+	{ "sync", 	     control_ipreallocate,      false,	false,  "wait until ctdbd has synced all state changes" },
+	{ "ipreallocate",    control_ipreallocate,      false,	false,  "force the recovery daemon to perform a ip reallocation procedure" },
 	{ "thaw",            control_thaw,              true,	false,  "thaw databases", "[priority:1-3]" },
 	{ "isnotrecmaster",  control_isnotrecmaster,    false,	false,  "check if the local node is recmaster or not" },
-	{ "killtcp",         kill_tcp,                  false,	false, "kill a tcp connection.", "<srcip:port> <dstip:port>" },
+	{ "killtcp",         kill_tcp,                  false,	false, "kill a tcp connection.", "[<srcip:port> <dstip:port>]" },
 	{ "gratiousarp",     control_gratious_arp,      false,	false, "send a gratious arp", "<ip> <interface>" },
 	{ "tickle",          tickle_tcp,                false,	false, "send a tcp tickle ack", "<srcip:port> <dstip:port>" },
-	{ "gettickles",      control_get_tickles,       false,	false, "get the list of tickles registered for this ip", "<ip>" },
+	{ "gettickles",      control_get_tickles,       false,	false, "get the list of tickles registered for this ip", "<ip> [<port>]" },
+	{ "addtickle",       control_add_tickle,        false,	false, "add a tickle for this ip", "<ip>:<port> <ip>:<port>" },
+
+	{ "deltickle",       control_del_tickle,        false,	false, "delete a tickle from this ip", "<ip>:<port> <ip>:<port>" },
 
 	{ "regsrvid",        regsrvid,			false,	false, "register a server id", "<pnn> <type> <id>" },
 	{ "unregsrvid",      unregsrvid,		false,	false, "unregister a server id", "<pnn> <type> <id>" },
 	{ "chksrvid",        chksrvid,			false,	false, "check if a server id exists", "<pnn> <type> <id>" },
 	{ "getsrvids",       getsrvids,			false,	false, "get a list of all server ids"},
-	{ "vacuum",          ctdb_vacuum,		false,	true, "vacuum the databases of empty records", "[max_records]"},
+	{ "check_srvids",    check_srvids,		false,	false, "check if a srvid exists", "<id>+" },
 	{ "repack",          ctdb_repack,		false,	false, "repack all databases", "[max_freelist]"},
 	{ "listnodes",       control_listnodes,		false,	true, "list all nodes in the cluster"},
 	{ "reloadnodes",     control_reload_nodes_file,	false,	false, "reload the nodes file and restart the transport on all nodes"},
 	{ "moveip",          control_moveip,		false,	false, "move/failover an ip address to another node", "<ip> <node>"},
+	{ "rebalanceip",     control_rebalanceip,	false,	false, "release an ip from the node and let recd rebalance it", "<ip>"},
 	{ "addip",           control_addip,		true,	false, "add a ip address to a node", "<ip/mask> <iface>"},
 	{ "delip",           control_delip,		false,	false, "delete an ip address from a node", "<ip>"},
 	{ "eventscript",     control_eventscript,	true,	false, "run the eventscript with the given parameters on a node", "<arguments>"},
-	{ "backupdb",        control_backupdb,          false,	false, "backup the database into a file.", "<database> <file>"},
-	{ "restoredb",        control_restoredb,        false,	false, "restore the database from a file.", "<file>"},
+	{ "backupdb",        control_backupdb,          false,	false, "backup the database into a file.", "<dbname|dbid> <file>"},
+	{ "restoredb",        control_restoredb,        false,	false, "restore the database from a file.", "<file> [dbname]"},
 	{ "dumpdbbackup",    control_dumpdbbackup,      false,	true,  "dump database backup from a file.", "<file>"},
-	{ "wipedb",           control_wipedb,        false,	false, "wipe the contents of a database.", "<dbname>"},
-	{ "recmaster",        control_recmaster,        false,	false, "show the pnn for the recovery master."},
-	{ "setflags",        control_setflags,          false,	false, "set flags for a node in the nodemap.", "<node> <flags>"},
-	{ "scriptstatus",    control_scriptstatus,  false,	false, "show the status of the monitoring scripts (or all scripts)", "[all]"},
-	{ "enablescript",     control_enablescript,  false,	false, "enable an eventscript", "<script>"},
-	{ "disablescript",    control_disablescript,  false,	false, "disable an eventscript", "<script>"},
-	{ "natgwlist",        control_natgwlist,        false,	false, "show the nodes belonging to this natgw configuration"},
-	{ "xpnn",             control_xpnn,             true,	true,  "find the pnn of the local node without talking to the daemon (unreliable)" },
-	{ "getreclock",       control_getreclock,	false,	false, "Show the reclock file of a node"},
-	{ "setreclock",       control_setreclock,	false,	false, "Set/clear the reclock file of a node", "[filename]"},
+	{ "wipedb",           control_wipedb,        false,	false, "wipe the contents of a database.", "<dbname|dbid>"},
+	{ "recmaster",        control_recmaster,        true,	false, "show the pnn for the recovery master."},
+	{ "scriptstatus",     control_scriptstatus,     true,	false, "show the status of the monitoring scripts (or all scripts)", "[all]"},
+	{ "enablescript",     control_enablescript,  true,	false, "enable an eventscript", "<script>"},
+	{ "disablescript",    control_disablescript,  true,	false, "disable an eventscript", "<script>"},
+	{ "natgwlist",        control_natgwlist,        true,	false, "show the nodes belonging to this natgw configuration"},
+	{ "xpnn",             control_xpnn,             false,	true,  "find the pnn of the local node without talking to the daemon (unreliable)" },
+	{ "getreclock",       control_getreclock,	true,	false, "Show the reclock file of a node"},
+	{ "setreclock",       control_setreclock,	true,	false, "Set/clear the reclock file of a node", "[filename]"},
 	{ "setnatgwstate",    control_setnatgwstate,	false,	false, "Set NATGW state to on/off", "{on|off}"},
 	{ "setlmasterrole",   control_setlmasterrole,	false,	false, "Set LMASTER role to on/off", "{on|off}"},
 	{ "setrecmasterrole", control_setrecmasterrole,	false,	false, "Set RECMASTER role to on/off", "{on|off}"},
-	{ "setdbprio",        control_setdbprio,	false,	false, "Set DB priority", "<dbid> <prio:1-3>"},
-	{ "getdbprio",        control_getdbprio,	false,	false, "Get DB priority", "<dbid>"},
+	{ "setdbprio",        control_setdbprio,	false,	false, "Set DB priority", "<dbname|dbid> <prio:1-3>"},
+	{ "getdbprio",        control_getdbprio,	false,	false, "Get DB priority", "<dbname|dbid>"},
+	{ "setdbreadonly",    control_setdbreadonly,	false,	false, "Set DB readonly capable", "<dbname|dbid>"},
+	{ "setdbsticky",      control_setdbsticky,	false,	false, "Set DB sticky-records capable", "<dbname|dbid>"},
 	{ "msglisten",        control_msglisten,	false,	false, "Listen on a srvid port for messages", "<msg srvid>"},
 	{ "msgsend",          control_msgsend,	false,	false, "Send a message to srvid", "<srvid> <message>"},
+	{ "pfetch", 	     control_pfetch,      	false,	false,  "fetch a record from a persistent database", "<dbname|dbid> <key> [<file>]" },
+	{ "pstore", 	     control_pstore,      	false,	false,  "write a record to a persistent database", "<dbname|dbid> <key> <file containing record>" },
+	{ "pdelete", 	     control_pdelete,      	false,	false,  "delete a record from a persistent database", "<dbname|dbid> <key>" },
+	{ "ptrans", 	     control_ptrans,      	false,	false,  "update a persistent database (from stdin)", "<dbname|dbid>" },
+	{ "tfetch", 	     control_tfetch,      	false,	true,  "fetch a record from a [c]tdb-file [-v]", "<tdb-file> <key> [<file>]" },
+	{ "tstore", 	     control_tstore,      	false,	true,  "store a record (including ltdb header)", "<tdb-file> <key> <data> [<rsn> <dmaster> <flags>]" },
+	{ "readkey", 	     control_readkey,      	true,	false,  "read the content off a database key", "<tdb-file> <key>" },
+	{ "writekey", 	     control_writekey,      	true,	false,  "write to a database key", "<tdb-file> <key> <value>" },
+	{ "checktcpport",    control_chktcpport,      	false,	true,  "check if a service is bound to a specific tcp port or not", "<port>" },
+	{ "rebalancenode",     control_rebalancenode,	false,	false, "mark nodes as forced IP rebalancing targets", "[<pnn-list>]"},
+	{ "getdbseqnum",     control_getdbseqnum,       false,	false, "get the sequence number off a database", "<dbname|dbid>" },
+	{ "nodestatus",      control_nodestatus,        true,   false,  "show and return node status", "[<pnn-list>]" },
+	{ "dbstatistics",    control_dbstatistics,      false,	false, "show db statistics", "<dbname|dbid>" },
+	{ "reloadips",       control_reloadips,         false,	false, "reload the public addresses file on specified nodes" , "[<pnn-list>]" },
+	{ "ipiface",         control_ipiface,           false,	true,  "Find which interface an ip address is hosted on", "<ip>" },
 };
 
 /*
@@ -4527,7 +6367,7 @@ int main(int argc, const char *argv[])
 	
 	/* set some defaults */
 	options.maxruntime = 0;
-	options.timelimit = 3;
+	options.timelimit = 10;
 	options.pnn = CTDB_CURRENT_NODE;
 
 	pc = poptGetContext(argv[0], argc, argv, popt_options, POPT_CONTEXT_KEEP_FIRST);
@@ -4566,66 +6406,19 @@ int main(int argc, const char *argv[])
 	signal(SIGALRM, ctdb_alarm);
 	alarm(options.maxruntime);
 
-	/* setup the node number to contact */
-	if (nodestring != NULL) {
-		if (strcmp(nodestring, "all") == 0) {
-			options.pnn = CTDB_BROADCAST_ALL;
-		} else {
-			options.pnn = strtoul(nodestring, NULL, 0);
-		}
-	}
-
 	control = extra_argv[0];
 
+	/* Default value for CTDB_BASE - don't override */
+	setenv("CTDB_BASE", ETCDIR "/ctdb", 0);
+
 	ev = event_context_init(NULL);
+	if (!ev) {
+		DEBUG(DEBUG_ERR, ("Failed to initialize event system\n"));
+		exit(1);
+	}
 
 	for (i=0;i<ARRAY_SIZE(ctdb_commands);i++) {
 		if (strcmp(control, ctdb_commands[i].name) == 0) {
-			int j;
-
-			if (ctdb_commands[i].without_daemon == true) {
-				close(2);
-			}
-
-			/* initialise ctdb */
-			ctdb = ctdb_cmdline_client(ev);
-
-			if (ctdb_commands[i].without_daemon == false) {
-				if (ctdb == NULL) {
-					DEBUG(DEBUG_ERR, ("Failed to init ctdb\n"));
-					exit(1);
-				}
-
-				/* verify the node exists */
-				verify_node(ctdb);
-
-				if (options.pnn == CTDB_CURRENT_NODE) {
-					int pnn;
-					pnn = ctdb_ctrl_getpnn(ctdb, TIMELIMIT(), options.pnn);		
-					if (pnn == -1) {
-						return -1;
-					}
-					options.pnn = pnn;
-				}
-			}
-
-			if (ctdb_commands[i].auto_all && 
-			    options.pnn == CTDB_BROADCAST_ALL) {
-				uint32_t *nodes;
-				uint32_t num_nodes;
-				ret = 0;
-
-				nodes = ctdb_get_connected_nodes(ctdb, TIMELIMIT(), ctdb, &num_nodes);
-				CTDB_NO_MEMORY(ctdb, nodes);
-	
-				for (j=0;j<num_nodes;j++) {
-					options.pnn = nodes[j];
-					ret |= ctdb_commands[i].fn(ctdb, extra_argc-1, extra_argv+1);
-				}
-				talloc_free(nodes);
-			} else {
-				ret = ctdb_commands[i].fn(ctdb, extra_argc-1, extra_argv+1);
-			}
 			break;
 		}
 	}
@@ -4635,5 +6428,51 @@ int main(int argc, const char *argv[])
 		exit(1);
 	}
 
+	if (ctdb_commands[i].without_daemon == true) {
+		if (nodestring != NULL) {
+			DEBUG(DEBUG_ERR, ("Can't specify node(s) with \"ctdb %s\"\n", control));
+			exit(1);
+		}
+		close(2);
+		return ctdb_commands[i].fn(NULL, extra_argc-1, extra_argv+1);
+	}
+
+	/* initialise ctdb */
+	ctdb = ctdb_cmdline_client(ev, TIMELIMIT());
+
+	if (ctdb == NULL) {
+		DEBUG(DEBUG_ERR, ("Failed to init ctdb\n"));
+		exit(1);
+	}
+
+	/* setup the node number(s) to contact */
+	if (!parse_nodestring(ctdb, ctdb, nodestring, CTDB_CURRENT_NODE, false,
+			      &options.nodes, &options.pnn)) {
+		usage();
+	}
+
+	if (options.pnn == CTDB_CURRENT_NODE) {
+		options.pnn = options.nodes[0];
+	}
+
+	if (ctdb_commands[i].auto_all && 
+	    ((options.pnn == CTDB_BROADCAST_ALL) ||
+	     (options.pnn == CTDB_MULTICAST))) {
+		int j;
+
+		ret = 0;
+		for (j = 0; j < talloc_array_length(options.nodes); j++) {
+			options.pnn = options.nodes[j];
+			ret |= ctdb_commands[i].fn(ctdb, extra_argc-1, extra_argv+1);
+		}
+	} else {
+		ret = ctdb_commands[i].fn(ctdb, extra_argc-1, extra_argv+1);
+	}
+
+	talloc_free(ctdb);
+	talloc_free(ev);
+	(void)poptFreeContext(pc);
+
 	return ret;
+
 }

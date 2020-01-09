@@ -43,12 +43,13 @@ case $cmd in
 	ip=$2
 	maskbits=$3
 
-	[ `id -u` = 0 ] && {
+	[ -n "$TEST_LOCAL_DAEMONS" ] || {
 	    /sbin/ip addr add $ip/$maskbits dev $iface || {
 		echo "Failed to add $ip/$maskbits on dev $iface"
 		exit 1
 	    }
 	}
+	echo "ctdb takeip event for $1 $2 $3"
 	exit 0;
 	;;
 
@@ -63,13 +64,18 @@ case $cmd in
 	iface=$1
 	ip=$2
 	maskbits=$3
-	[ `id -u` = 0 ] && {
+	[ -n "$TEST_LOCAL_DAEMONS" ] || {
 	    /sbin/ip addr del $ip/$maskbits dev $iface || {
 		echo "Failed to del $ip on dev $iface"
 		exit 1
 	    }
 	}
-	echo "ctdb takeip event for $1 $2 $3"
+	echo "ctdb releaseip event for $1 $2 $3"
+	exit 0
+	;;
+
+     updateip)
+	echo "ctdb updateip event for $1"
 	exit 0
 	;;
 
@@ -77,6 +83,12 @@ case $cmd in
 	echo "ctdb recovered event"
 	exit 0
 	;;
+
+     ipreallocated)
+	echo "ctdb ipreallocated event"
+	exit 0
+	;;
+
 
      shutdown)
 	echo "ctdb shutdown event"

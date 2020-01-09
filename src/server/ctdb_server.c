@@ -18,8 +18,7 @@
 */
 
 #include "includes.h"
-#include "lib/tdb/include/tdb.h"
-#include "lib/events/events.h"
+#include "tdb.h"
 #include "lib/util/dlinklist.h"
 #include "system/network.h"
 #include "system/filesys.h"
@@ -79,42 +78,6 @@ int ctdb_set_recovery_lock_file(struct ctdb_context *ctdb, const char *file)
 }
 
 /*
-  set the directory for the local databases
-*/
-int ctdb_set_tdb_dir(struct ctdb_context *ctdb, const char *dir)
-{
-	ctdb->db_directory = talloc_strdup(ctdb, dir);
-	if (ctdb->db_directory == NULL) {
-		return -1;
-	}
-	return 0;
-}
-
-/*
-  set the directory for the persistent databases
-*/
-int ctdb_set_tdb_dir_persistent(struct ctdb_context *ctdb, const char *dir)
-{
-	ctdb->db_directory_persistent = talloc_strdup(ctdb, dir);
-	if (ctdb->db_directory_persistent == NULL) {
-		return -1;
-	}
-	return 0;
-}
-
-/*
-  set the directory for internal state databases
-*/
-int ctdb_set_tdb_dir_state(struct ctdb_context *ctdb, const char *dir)
-{
-	ctdb->db_directory_state = talloc_strdup(ctdb, dir);
-	if (ctdb->db_directory_state == NULL) {
-		return -1;
-	}
-	return 0;
-}
-
-/*
   add a node to the list of nodes
 */
 static int ctdb_add_node(struct ctdb_context *ctdb, char *nstr)
@@ -147,18 +110,6 @@ static int ctdb_add_node(struct ctdb_context *ctdb, char *nstr)
 	    ctdb_same_address(&ctdb->address, &node->address)) {
 		/* for automatic binding to interfaces, see tcp_connect.c */
 		ctdb->pnn = node->pnn;
-		node->flags &= ~NODE_FLAGS_DISCONNECTED;
-
-		/* do we start out in DISABLED mode? */
-		if (ctdb->start_as_disabled != 0) {
-			DEBUG(DEBUG_INFO, ("This node is configured to start in DISABLED state\n"));
-			node->flags |= NODE_FLAGS_DISABLED;
-		}
-		/* do we start out in STOPPED mode? */
-		if (ctdb->start_as_stopped != 0) {
-			DEBUG(DEBUG_INFO, ("This node is configured to start in STOPPED state\n"));
-			node->flags |= NODE_FLAGS_STOPPED;
-		}
 	}
 
 	ctdb->num_nodes++;
@@ -210,7 +161,7 @@ static int ctdb_add_deleted_node(struct ctdb_context *ctdb)
 /*
   setup the node list from a file
 */
-int ctdb_set_nlist(struct ctdb_context *ctdb, const char *nlist)
+static int ctdb_set_nlist(struct ctdb_context *ctdb, const char *nlist)
 {
 	char **lines;
 	int nlines;
@@ -278,6 +229,16 @@ int ctdb_set_nlist(struct ctdb_context *ctdb, const char *nlist)
 	return 0;
 }
 
+void ctdb_load_nodes_file(struct ctdb_context *ctdb)
+{
+	int ret;
+
+	ret = ctdb_set_nlist(ctdb, ctdb->nodes_file);
+	if (ret == -1) {
+		DEBUG(DEBUG_ALERT,("ctdb_set_nlist failed - %s\n", ctdb_errstr(ctdb)));
+		exit(1);
+	}
+}
 
 /*
   setup the local node address
@@ -367,47 +328,47 @@ void ctdb_input_pkt(struct ctdb_context *ctdb, struct ctdb_req_header *hdr)
 
 	switch (hdr->operation) {
 	case CTDB_REQ_CALL:
-		ctdb->statistics.node.req_call++;
+		CTDB_INCREMENT_STAT(ctdb, node.req_call);
 		ctdb_request_call(ctdb, hdr);
 		break;
 
 	case CTDB_REPLY_CALL:
-		ctdb->statistics.node.reply_call++;
+		CTDB_INCREMENT_STAT(ctdb, node.reply_call);
 		ctdb_reply_call(ctdb, hdr);
 		break;
 
 	case CTDB_REPLY_ERROR:
-		ctdb->statistics.node.reply_error++;
+		CTDB_INCREMENT_STAT(ctdb, node.reply_error);
 		ctdb_reply_error(ctdb, hdr);
 		break;
 
 	case CTDB_REQ_DMASTER:
-		ctdb->statistics.node.req_dmaster++;
+		CTDB_INCREMENT_STAT(ctdb, node.req_dmaster);
 		ctdb_request_dmaster(ctdb, hdr);
 		break;
 
 	case CTDB_REPLY_DMASTER:
-		ctdb->statistics.node.reply_dmaster++;
+		CTDB_INCREMENT_STAT(ctdb, node.reply_dmaster);
 		ctdb_reply_dmaster(ctdb, hdr);
 		break;
 
 	case CTDB_REQ_MESSAGE:
-		ctdb->statistics.node.req_message++;
+		CTDB_INCREMENT_STAT(ctdb, node.req_message);
 		ctdb_request_message(ctdb, hdr);
 		break;
 
 	case CTDB_REQ_CONTROL:
-		ctdb->statistics.node.req_control++;
+		CTDB_INCREMENT_STAT(ctdb, node.req_control);
 		ctdb_request_control(ctdb, hdr);
 		break;
 
 	case CTDB_REPLY_CONTROL:
-		ctdb->statistics.node.reply_control++;
+		CTDB_INCREMENT_STAT(ctdb, node.reply_control);
 		ctdb_reply_control(ctdb, hdr);
 		break;
 
 	case CTDB_REQ_KEEPALIVE:
-		ctdb->statistics.keepalive_packets_recv++;
+		CTDB_INCREMENT_STAT(ctdb, keepalive_packets_recv);
 		break;
 
 	default:
@@ -464,8 +425,9 @@ void ctdb_node_connected(struct ctdb_node *node)
 	node->dead_count = 0;
 	node->flags &= ~NODE_FLAGS_DISCONNECTED;
 	node->flags |= NODE_FLAGS_UNHEALTHY;
-	DEBUG(DEBUG_INFO,("%s: connected to %s - %u connected\n", 
-		 node->ctdb->name, node->name, node->ctdb->num_connected));
+	DEBUG(DEBUG_NOTICE,
+	      ("%s: connected to %s - %u connected\n", 
+	       node->ctdb->name, node->name, node->ctdb->num_connected));
 }
 
 struct queue_next {
@@ -578,7 +540,7 @@ void ctdb_queue_packet(struct ctdb_context *ctdb, struct ctdb_req_header *hdr)
 		return;
 	}
 
-	ctdb->statistics.node_packets_sent++;
+	CTDB_INCREMENT_STAT(ctdb, node_packets_sent);
 
 	if (!ctdb_validate_pnn(ctdb, hdr->destnode)) {
 	  	DEBUG(DEBUG_CRIT,(__location__ " cant send to node %u that does not exist\n", 

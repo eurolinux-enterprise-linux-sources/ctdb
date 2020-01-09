@@ -25,7 +25,7 @@ Expected results:
 EOF
 }
 
-. ctdb_test_functions.bash
+. "${TEST_SCRIPTS_DIR}/integration.bash"
 
 ctdb_test_init "$@"
 
@@ -38,6 +38,10 @@ if ! try_command_on_node -v 0 "rpm -q ctdb" ; then
     exit 0
 fi
 rpm_ver="${out#ctdb-}"
+# Some version of RPM append the architecture to the version.
+# And also remove the release suffix.
+arch=$(uname -m)
+rpm_ver="${rpm_ver%-*.${arch}}"
 
 try_command_on_node -v 0 "$CTDB version"
 ctdb_ver="${out#CTDB version: }"

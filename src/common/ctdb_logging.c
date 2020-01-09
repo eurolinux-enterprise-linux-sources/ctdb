@@ -18,18 +18,17 @@
 */
 
 #include "includes.h"
-#include "lib/events/events.h"
-#include "lib/tdb/include/tdb.h"
+#include "tdb.h"
 #include "system/time.h"
 #include "../include/ctdb_private.h"
-#include "../include/ctdb.h"
+#include "../include/ctdb_client.h"
 
 int log_ringbuf_size;
 
 #define MAX_LOG_SIZE 128
 
-static int first_entry;
-static int last_entry;
+static int first_entry = 0;
+static int ringbuf_count = 0;
 
 struct ctdb_log_entry {
 	int32_t level;
@@ -46,6 +45,7 @@ static struct ctdb_log_entry *log_entries;
 static void log_ringbuffer_v(const char *format, va_list ap)
 {
 	int ret;
+	int next_entry;
 
 	if (log_entries == NULL && log_ringbuf_size != 0) {
 		/* Hope this works. We cant log anything if it doesnt anyway */
@@ -55,25 +55,30 @@ static void log_ringbuffer_v(const char *format, va_list ap)
 		return;
 	}
 
-	log_entries[last_entry].message[0] = '\0';
+	next_entry = (first_entry + ringbuf_count) % log_ringbuf_size;
 
-	ret = vsnprintf(&log_entries[last_entry].message[0], MAX_LOG_SIZE, format, ap);
+	if (ringbuf_count > 0 && first_entry == next_entry) {
+		first_entry = (first_entry + 1) % log_ringbuf_size;
+	}
+
+	log_entries[next_entry].message[0] = '\0';
+
+	ret = vsnprintf(&log_entries[next_entry].message[0], MAX_LOG_SIZE, format, ap);
 	if (ret == -1) {
 		return;
 	}
-
-	log_entries[last_entry].level = this_log_level;
-	log_entries[last_entry].t = timeval_current();
-
-	last_entry++;
-	if (last_entry >= log_ringbuf_size) {
-		last_entry = 0;
+	/* Log messages longer than MAX_LOG_SIZE are truncated to MAX_LOG_SIZE-1
+	 * bytes.  In that case, add a newline.
+	 */
+	if (ret >= MAX_LOG_SIZE) {
+		log_entries[next_entry].message[MAX_LOG_SIZE-2] = '\n';
 	}
-	if (first_entry == last_entry) {
-		first_entry++;
-	}
-	if (first_entry >= log_ringbuf_size) {
-		first_entry = 0;
+
+	log_entries[next_entry].level = this_log_level;
+	log_entries[next_entry].t = timeval_current();
+
+	if (ringbuf_count < log_ringbuf_size) {
+		ringbuf_count++;
 	}
 }
 
@@ -86,16 +91,26 @@ void log_ringbuffer(const char *format, ...)
 	va_end(ap);
 }
 
+void ctdb_log_ringbuffer_free(void)
+{
+	if (log_entries != NULL) {
+		free(log_entries);
+		log_entries = NULL;
+	}
+	log_ringbuf_size = 0;
+}
 
-
-static void ctdb_collect_log(struct ctdb_context *ctdb, struct ctdb_get_log_addr *log_addr)
+void ctdb_collect_log(struct ctdb_context *ctdb, struct ctdb_get_log_addr *log_addr)
 {
 	TDB_DATA data;
 	FILE *f;
 	long fsize;
 	int tmp_entry;
-	int count = 0;
-	DEBUG(DEBUG_ERR,("Marshalling log entries  first:%d last:%d\n", first_entry, last_entry));
+	struct tm *tm;
+	char tbuf[100];
+	int i;
+
+	DEBUG(DEBUG_ERR,("Marshalling %d log entries\n", ringbuf_count));
 
 	/* dump to a file, then send the file as a blob */
 	f = tmpfile();
@@ -104,47 +119,42 @@ static void ctdb_collect_log(struct ctdb_context *ctdb, struct ctdb_get_log_addr
 		return;
 	}
 
-	tmp_entry = first_entry;
-	while (tmp_entry != last_entry) {
-		struct tm *tm;
-		char tbuf[100];
-
-		if (log_entries == NULL) {
-			break;
-		}
+	for (i=0; i<ringbuf_count; i++) {
+		tmp_entry = (first_entry + i) % log_ringbuf_size;
 
 		if (log_entries[tmp_entry].level > log_addr->level) {
-			tmp_entry++;
-			if (tmp_entry >= log_ringbuf_size) {
-				tmp_entry = 0;
-			}
 		 	continue;
 		}
 
 		tm = localtime(&log_entries[tmp_entry].t.tv_sec);
 		strftime(tbuf, sizeof(tbuf)-1,"%Y/%m/%d %H:%M:%S", tm);
 
-		if (log_entries[tmp_entry].message) {
-			count += fprintf(f, "%s:%s %s", tbuf, get_debug_by_level(log_entries[tmp_entry].level), log_entries[tmp_entry].message);
-		}
-
-		tmp_entry++;
-		if (tmp_entry >= log_ringbuf_size) {
-			tmp_entry = 0;
+		if (log_entries[tmp_entry].message[0] != '\0') {
+			fprintf(f, "%s:%s %s", tbuf,
+				get_debug_by_level(log_entries[tmp_entry].level),
+				log_entries[tmp_entry].message);
 		}
 	}
 
 	fsize = ftell(f);
+	if (fsize < 0) {
+		fclose(f);
+		DEBUG(DEBUG_ERR, ("Cannot get file size for log entries\n"));
+		return;
+	}
 	rewind(f);
 	data.dptr = talloc_size(NULL, fsize);
-	CTDB_NO_MEMORY_VOID(ctdb, data.dptr);
+	if (data.dptr == NULL) {
+		fclose(f);
+		CTDB_NO_MEMORY_VOID(ctdb, data.dptr);
+	}
 	data.dsize = fread(data.dptr, 1, fsize, f);
 	fclose(f);
 
 	DEBUG(DEBUG_ERR,("Marshalling log entries into a blob of %d bytes\n", (int)data.dsize));
 
 	DEBUG(DEBUG_ERR,("Send log to %d:%d\n", (int)log_addr->pnn, (int)log_addr->srvid));
-	ctdb_send_message(ctdb, log_addr->pnn, log_addr->srvid, data);
+	ctdb_client_send_message(ctdb, log_addr->pnn, log_addr->srvid, data);
 
 	talloc_free(data.dptr);
 }
@@ -157,14 +167,15 @@ int32_t ctdb_control_get_log(struct ctdb_context *ctdb, TDB_DATA addr)
 	/* spawn a child process to marshall the huge log blob and send it back
 	   to the ctdb tool using a MESSAGE
 	*/
-	child = fork();
+	child = ctdb_fork_no_free_ringbuffer(ctdb);
 	if (child == (pid_t)-1) {
 		DEBUG(DEBUG_ERR,("Failed to fork a log collector child\n"));
 		return -1;
 	}
 
 	if (child == 0) {
-		if (switch_from_server_to_client(ctdb) != 0) {
+		ctdb_set_process_name("ctdb_log_collector");
+		if (switch_from_server_to_client(ctdb, "log-collector") != 0) {
 			DEBUG(DEBUG_CRIT, (__location__ "ERROR: failed to switch log collector child into client mode.\n"));
 			_exit(1);
 		}
@@ -175,12 +186,15 @@ int32_t ctdb_control_get_log(struct ctdb_context *ctdb, TDB_DATA addr)
 	return 0;
 }
 
+void ctdb_clear_log(struct ctdb_context *ctdb)
+{
+	first_entry = 0;
+	ringbuf_count  = 0;
+}
 
 int32_t ctdb_control_clear_log(struct ctdb_context *ctdb)
 {
-	first_entry = 0;
-	last_entry  = 0;
+	ctdb_clear_log(ctdb);
 
 	return 0;
 }
-

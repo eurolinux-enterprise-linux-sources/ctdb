@@ -2,6 +2,7 @@
    ctdb ltdb code
 
    Copyright (C) Andrew Tridgell  2006
+   Copyright (C) Ronnie sahlberg  2011
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -18,8 +19,7 @@
 */
 
 #include "includes.h"
-#include "lib/events/events.h"
-#include "lib/tdb/include/tdb.h"
+#include "tdb.h"
 #include "system/network.h"
 #include "system/filesys.h"
 #include "../include/ctdb_private.h"
@@ -97,7 +97,12 @@ int ctdb_ltdb_fetch(struct ctdb_db_context *ctdb_db,
 		if (data) {
 			*data = d2;
 		}
-		ctdb_ltdb_store(ctdb_db, key, header, d2);
+		if (ctdb_db->persistent || header->dmaster == ctdb_db->ctdb->pnn) {
+			if (ctdb_ltdb_store(ctdb_db, key, header, d2) != 0) {
+				DEBUG(DEBUG_NOTICE,
+				      (__location__ "failed to store initial header\n"));
+			}
+		}
 		return 0;
 	}
 
@@ -114,6 +119,40 @@ int ctdb_ltdb_fetch(struct ctdb_db_context *ctdb_db,
 	if (data) {
 		CTDB_NO_MEMORY(ctdb, data->dptr);
 	}
+
+	return 0;
+}
+
+/*
+  fetch a record from the ltdb, separating out the header information
+  and returning the body of the record.
+  if the record does not exist, *header will be NULL
+  and data = {0, NULL}
+*/
+int ctdb_ltdb_fetch_with_header(struct ctdb_db_context *ctdb_db, 
+		    TDB_DATA key, struct ctdb_ltdb_header *header, 
+		    TALLOC_CTX *mem_ctx, TDB_DATA *data)
+{
+	TDB_DATA rec;
+
+	rec = tdb_fetch(ctdb_db->ltdb->tdb, key);
+	if (rec.dsize < sizeof(*header)) {
+		free(rec.dptr);
+
+		data->dsize = 0;
+		data->dptr = NULL;
+		return -1;
+	}
+
+	*header = *(struct ctdb_ltdb_header *)rec.dptr;
+	if (data) {
+		data->dsize = rec.dsize - sizeof(struct ctdb_ltdb_header);
+		data->dptr = talloc_memdup(mem_ctx, 
+					   sizeof(struct ctdb_ltdb_header)+rec.dptr,
+					   data->dsize);
+	}
+
+	free(rec.dptr);
 
 	return 0;
 }
@@ -195,7 +234,106 @@ int ctdb_ltdb_unlock(struct ctdb_db_context *ctdb_db, TDB_DATA key)
 {
 	int ret = tdb_chainunlock(ctdb_db->ltdb->tdb, key);
 	if (ret != 0) {
-		DEBUG(DEBUG_ERR,("tdb_chainunlock failed\n"));
+ 		DEBUG(DEBUG_ERR,("tdb_chainunlock failed on db %s [%s]\n", ctdb_db->db_name, tdb_errorstr(ctdb_db->ltdb->tdb)));
 	}
 	return ret;
 }
+
+
+/*
+  delete a record from a normal database
+*/
+int ctdb_ltdb_delete(struct ctdb_db_context *ctdb_db, TDB_DATA key)
+{
+	if (ctdb_db->persistent != 0) {
+		DEBUG(DEBUG_ERR,("Trying to delete emty record in persistent database\n"));
+		return 0;
+	}
+	if (tdb_delete(ctdb_db->ltdb->tdb, key) != 0) {
+		DEBUG(DEBUG_ERR,("Failed to delete empty record."));
+		return -1;
+	}
+	return 0;
+}
+
+int ctdb_trackingdb_add_pnn(struct ctdb_context *ctdb, TDB_DATA *data, uint32_t pnn)
+{
+	int byte_pos = pnn / 8;
+	int bit_mask   = 1 << (pnn % 8);
+
+	if (byte_pos + 1 > data->dsize) {
+		char *buf;
+
+		buf = malloc(byte_pos + 1);
+		memset(buf, 0, byte_pos + 1);
+		if (buf == NULL) {
+			DEBUG(DEBUG_ERR, ("Out of memory when allocating buffer of %d bytes for trackingdb\n", byte_pos + 1));
+			return -1;
+		}
+		if (data->dptr != NULL) {
+			memcpy(buf, data->dptr, data->dsize);
+			free(data->dptr);
+		}
+		data->dptr  = (uint8_t *)buf;
+		data->dsize = byte_pos + 1;
+	}
+
+	data->dptr[byte_pos] |= bit_mask;
+	return 0;
+}
+
+void ctdb_trackingdb_traverse(struct ctdb_context *ctdb, TDB_DATA data, ctdb_trackingdb_cb cb, void *private_data)
+{
+	int i;
+
+	for(i = 0; i < data.dsize; i++) {
+		int j;
+
+		for (j=0; j<8; j++) {
+			int mask = 1<<j;
+
+			if (data.dptr[i] & mask) {
+				cb(ctdb, i * 8 + j, private_data);
+			}
+		}
+	}
+}
+
+/*
+  this is the dummy null procedure that all databases support
+*/
+int ctdb_null_func(struct ctdb_call_info *call)
+{
+	return 0;
+}
+
+/*
+  this is a plain fetch procedure that all databases support
+*/
+int ctdb_fetch_func(struct ctdb_call_info *call)
+{
+	call->reply_data = &call->record_data;
+	return 0;
+}
+
+/*
+  this is a plain fetch procedure that all databases support
+  this returns the full record including the ltdb header
+*/
+int ctdb_fetch_with_header_func(struct ctdb_call_info *call)
+{
+	call->reply_data = talloc(call, TDB_DATA);
+	if (call->reply_data == NULL) {
+		return -1;
+	}
+	call->reply_data->dsize = sizeof(struct ctdb_ltdb_header) + call->record_data.dsize;
+	call->reply_data->dptr  = talloc_size(call->reply_data, call->reply_data->dsize);
+	if (call->reply_data->dptr == NULL) {
+		return -1;
+	}
+	memcpy(call->reply_data->dptr, call->header, sizeof(struct ctdb_ltdb_header));
+	memcpy(&call->reply_data->dptr[sizeof(struct ctdb_ltdb_header)], call->record_data.dptr, call->record_data.dsize);
+
+	return 0;
+}
+

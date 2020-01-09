@@ -2,6 +2,8 @@
    Unix SMB/CIFS implementation.
    replacement routines for broken systems
    Copyright (C) Andrew Tridgell 1992-1998
+   Copyright (C) Jelmer Vernooij 2005-2008
+   Copyright (C) Matthieu Patou  2010
 
      ** NOTE! The following LGPL license applies to the replace
      ** library. This does NOT imply that all of Samba is released
@@ -25,11 +27,15 @@
 
 #include "system/filesys.h"
 #include "system/time.h"
+#include "system/network.h"
 #include "system/passwd.h"
 #include "system/syslog.h"
-#include "system/network.h"
 #include "system/locale.h"
 #include "system/wait.h"
+
+#ifdef _WIN32
+#define mkdir(d,m) _mkdir(d)
+#endif
 
 void replace_dummy(void);
 void replace_dummy(void) {}
@@ -83,6 +89,9 @@ size_t rep_strlcat(char *d, const char *s, size_t bufsize)
 	size_t ret = len1 + len2;
 
 	if (len1+len2 >= bufsize) {
+		if (bufsize < (len1+1)) {
+			return ret;
+		}
 		len2 = bufsize - (len1+1);
 	}
 	if (len2 > 0) {
@@ -168,7 +177,7 @@ int rep_initgroups(char *name, gid_t id)
 #include <grp.h>
 
 	gid_t *grouplst = NULL;
-	int max_gr = 32;
+	int max_gr = NGROUPS_MAX;
 	int ret;
 	int    i,j;
 	struct group *g;
@@ -205,20 +214,10 @@ int rep_initgroups(char *name, gid_t id)
 #endif /* HAVE_INITGROUPS */
 
 
-#if (defined(SecureWare) && defined(SCO))
-/* This is needed due to needing the nap() function but we don't want
-   to include the Xenix libraries since that will break other things...
-   BTW: system call # 0x0c28 is the same as calling nap() */
-long nap(long milliseconds) {
-	 return syscall(0x0c28, milliseconds);
- }
-#endif
-
-
 #ifndef HAVE_MEMMOVE
 /*******************************************************************
 safely copies memory, ensuring no overlap problems.
-this is only used if the machine does not have it's own memmove().
+this is only used if the machine does not have its own memmove().
 this is not the fastest algorithm in town, but it will do for our
 needs.
 ********************************************************************/
@@ -295,20 +294,6 @@ char *rep_strdup(const char *s)
 }
 #endif /* HAVE_STRDUP */
 
-#ifndef WITH_PTHREADS
-/* REWRITE: not thread safe */
-#ifdef REPLACE_INET_NTOA
-char *rep_inet_ntoa(struct in_addr ip)
-{
-	uint8_t *p = (uint8_t *)&ip.s_addr;
-	static char buf[18];
-	slprintf(buf, 17, "%d.%d.%d.%d", 
-		 (int)p[0], (int)p[1], (int)p[2], (int)p[3]);
-	return buf;
-}
-#endif /* REPLACE_INET_NTOA */
-#endif
-
 #ifndef HAVE_SETLINEBUF
 void rep_setlinebuf(FILE *stream)
 {
@@ -366,7 +351,7 @@ char *rep_strndup(const char *s, size_t n)
 }
 #endif
 
-#ifndef HAVE_WAITPID
+#if !defined(HAVE_WAITPID) && defined(HAVE_WAIT4)
 int rep_waitpid(pid_t pid,int *status,int options)
 {
   return wait4(pid, status, options, NULL);
@@ -379,7 +364,8 @@ int rep_seteuid(uid_t euid)
 #ifdef HAVE_SETRESUID
 	return setresuid(-1, euid, -1);
 #else
-#  error "You need a seteuid function"
+	errno = ENOSYS;
+	return -1;
 #endif
 }
 #endif
@@ -390,7 +376,8 @@ int rep_setegid(gid_t egid)
 #ifdef HAVE_SETRESGID
 	return setresgid(-1, egid, -1);
 #else
-#  error "You need a setegid function"
+	errno = ENOSYS;
+	return -1;
 #endif
 }
 #endif
@@ -414,11 +401,11 @@ int rep_chroot(const char *dname)
 int rep_mkstemp(char *template)
 {
 	/* have a reasonable go at emulating it. Hope that
-	   the system mktemp() isn't completly hopeless */
-	char *p = mktemp(template);
-	if (!p)
+	   the system mktemp() isn't completely hopeless */
+	mktemp(template);
+	if (template[0] == 0)
 		return -1;
-	return open(p, O_CREAT|O_EXCL|O_RDWR, 0600);
+	return open(template, O_CREAT|O_EXCL|O_RDWR, 0600);
 }
 #endif
 
@@ -473,7 +460,7 @@ char *rep_strcasestr(const char *haystack, const char *needle)
 	for (s=haystack;*s;s++) {
 		if (toupper(*needle) == toupper(*s) &&
 		    strncasecmp(s, needle, nlen) == 0) {
-			return (char *)((intptr_t)s);
+			return (char *)((uintptr_t)s);
 		}
 	}
 	return NULL;
@@ -507,6 +494,7 @@ char *rep_strtok_r(char *s, const char *delim, char **save_ptr)
 }
 #endif
 
+
 #ifndef HAVE_STRTOLL
 long long int rep_strtoll(const char *str, char **endptr, int base)
 {
@@ -520,7 +508,29 @@ long long int rep_strtoll(const char *str, char **endptr, int base)
 # error "You need a strtoll function"
 #endif
 }
-#endif
+#else
+#ifdef HAVE_BSD_STRTOLL
+#ifdef HAVE_STRTOQ
+long long int rep_strtoll(const char *str, char **endptr, int base)
+{
+	long long int nb = strtoq(str, endptr, base);
+	/* In linux EINVAL is only returned if base is not ok */
+	if (errno == EINVAL) {
+		if (base == 0 || (base >1 && base <37)) {
+			/* Base was ok so it's because we were not
+			 * able to make the convertion.
+			 * Let's reset errno.
+			 */
+			errno = 0;
+		}
+	}
+	return nb;
+}
+#else
+#error "You need the strtoq function"
+#endif /* HAVE_STRTOQ */
+#endif /* HAVE_BSD_STRTOLL */
+#endif /* HAVE_STRTOLL */
 
 
 #ifndef HAVE_STRTOULL
@@ -536,7 +546,29 @@ unsigned long long int rep_strtoull(const char *str, char **endptr, int base)
 # error "You need a strtoull function"
 #endif
 }
-#endif
+#else
+#ifdef HAVE_BSD_STRTOLL
+#ifdef HAVE_STRTOUQ
+unsigned long long int rep_strtoull(const char *str, char **endptr, int base)
+{
+	unsigned long long int nb = strtouq(str, endptr, base);
+	/* In linux EINVAL is only returned if base is not ok */
+	if (errno == EINVAL) {
+		if (base == 0 || (base >1 && base <37)) {
+			/* Base was ok so it's because we were not
+			 * able to make the convertion.
+			 * Let's reset errno.
+			 */
+			errno = 0;
+		}
+	}
+	return nb;
+}
+#else
+#error "You need the strtouq function"
+#endif /* HAVE_STRTOUQ */
+#endif /* HAVE_BSD_STRTOLL */
+#endif /* HAVE_STRTOULL */
 
 #ifndef HAVE_SETENV
 int rep_setenv(const char *name, const char *value, int overwrite) 
@@ -600,24 +632,271 @@ int rep_unsetenv(const char *name)
 }
 #endif
 
-#ifndef HAVE_SOCKETPAIR
-int rep_socketpair(int d, int type, int protocol, int sv[2])
+#ifndef HAVE_UTIME
+int rep_utime(const char *filename, const struct utimbuf *buf)
 {
-	if (d != AF_UNIX) {
-		errno = EAFNOSUPPORT;
+	errno = ENOSYS;
+	return -1;
+}
+#endif
+
+#ifndef HAVE_UTIMES
+int rep_utimes(const char *filename, const struct timeval tv[2])
+{
+	struct utimbuf u;
+
+	u.actime = tv[0].tv_sec;
+	if (tv[0].tv_usec > 500000) {
+		u.actime += 1;
+	}
+
+	u.modtime = tv[1].tv_sec;
+	if (tv[1].tv_usec > 500000) {
+		u.modtime += 1;
+	}
+
+	return utime(filename, &u);
+}
+#endif
+
+#ifndef HAVE_DUP2
+int rep_dup2(int oldfd, int newfd) 
+{
+	errno = ENOSYS;
+	return -1;
+}
+#endif
+
+#ifndef HAVE_CHOWN
+/**
+chown isn't used much but OS/2 doesn't have it
+**/
+int rep_chown(const char *fname, uid_t uid, gid_t gid)
+{
+	errno = ENOSYS;
+	return -1;
+}
+#endif
+
+#ifndef HAVE_LINK
+int rep_link(const char *oldpath, const char *newpath)
+{
+	errno = ENOSYS;
+	return -1;
+}
+#endif
+
+#ifndef HAVE_READLINK
+int rep_readlink(const char *path, char *buf, size_t bufsiz)
+{
+	errno = ENOSYS;
+	return -1;
+}
+#endif
+
+#ifndef HAVE_SYMLINK
+int rep_symlink(const char *oldpath, const char *newpath)
+{
+	errno = ENOSYS;
+	return -1;
+}
+#endif
+
+#ifndef HAVE_LCHOWN
+int rep_lchown(const char *fname,uid_t uid,gid_t gid)
+{
+	errno = ENOSYS;
+	return -1;
+}
+#endif
+
+#ifndef HAVE_REALPATH
+char *rep_realpath(const char *path, char *resolved_path)
+{
+	/* As realpath is not a system call we can't return ENOSYS. */
+	errno = EINVAL;
+	return NULL;
+}
+#endif
+
+
+#ifndef HAVE_MEMMEM
+void *rep_memmem(const void *haystack, size_t haystacklen,
+		 const void *needle, size_t needlelen)
+{
+	if (needlelen == 0) {
+		return discard_const(haystack);
+	}
+	while (haystacklen >= needlelen) {
+		char *p = (char *)memchr(haystack, *(const char *)needle,
+					 haystacklen-(needlelen-1));
+		if (!p) return NULL;
+		if (memcmp(p, needle, needlelen) == 0) {
+			return p;
+		}
+		haystack = p+1;
+		haystacklen -= (p - (const char *)haystack) + 1;
+	}
+	return NULL;
+}
+#endif
+
+#if !defined(HAVE_VDPRINTF) || !defined(HAVE_C99_VSNPRINTF)
+int rep_vdprintf(int fd, const char *format, va_list ap)
+{
+	char *s = NULL;
+	int ret;
+
+	vasprintf(&s, format, ap);
+	if (s == NULL) {
+		errno = ENOMEM;
+		return -1;
+	}
+	ret = write(fd, s, strlen(s));
+	free(s);
+	return ret;
+}
+#endif
+
+#if !defined(HAVE_DPRINTF) || !defined(HAVE_C99_VSNPRINTF)
+int rep_dprintf(int fd, const char *format, ...)
+{
+	int ret;
+	va_list ap;
+
+	va_start(ap, format);
+	ret = vdprintf(fd, format, ap);
+	va_end(ap);
+
+	return ret;
+}
+#endif
+
+#ifndef HAVE_GET_CURRENT_DIR_NAME
+char *rep_get_current_dir_name(void)
+{
+	char buf[PATH_MAX+1];
+	char *p;
+	p = getcwd(buf, sizeof(buf));
+	if (p == NULL) {
+		return NULL;
+	}
+	return strdup(p);
+}
+#endif
+
+#ifndef HAVE_STRERROR_R
+int rep_strerror_r(int errnum, char *buf, size_t buflen)
+{
+	char *s = strerror(errnum);
+	if (strlen(s)+1 > buflen) {
+		errno = ERANGE;
+		return -1;
+	}
+	strncpy(buf, s, buflen);
+	return 0;
+}
+#endif
+
+#ifndef HAVE_CLOCK_GETTIME
+int rep_clock_gettime(clockid_t clk_id, struct timespec *tp)
+{
+	struct timeval tval;
+	switch (clk_id) {
+		case 0: /* CLOCK_REALTIME :*/
+#ifdef HAVE_GETTIMEOFDAY_TZ
+			gettimeofday(&tval,NULL);
+#else
+			gettimeofday(&tval);
+#endif
+			tp->tv_sec = tval.tv_sec;
+			tp->tv_nsec = tval.tv_usec * 1000;
+			break;
+		default:
+			errno = EINVAL;
+			return -1;
+	}
+	return 0;
+}
+#endif
+
+#ifndef HAVE_MEMALIGN
+void *rep_memalign( size_t align, size_t size )
+{
+#if defined(HAVE_POSIX_MEMALIGN)
+	void *p = NULL;
+	int ret = posix_memalign( &p, align, size );
+	if ( ret == 0 )
+		return p;
+
+	return NULL;
+#else
+	/* On *BSD systems memaligns doesn't exist, but memory will
+	 * be aligned on allocations of > pagesize. */
+#if defined(SYSCONF_SC_PAGESIZE)
+	size_t pagesize = (size_t)sysconf(_SC_PAGESIZE);
+#elif defined(HAVE_GETPAGESIZE)
+	size_t pagesize = (size_t)getpagesize();
+#else
+	size_t pagesize = (size_t)-1;
+#endif
+	if (pagesize == (size_t)-1) {
+		errno = ENOSYS;
+		return NULL;
+	}
+	if (size < pagesize) {
+		size = pagesize;
+	}
+	return malloc(size);
+#endif
+}
+#endif
+
+#ifndef HAVE_GETPEEREID
+int rep_getpeereid(int s, uid_t *uid, gid_t *gid)
+{
+#if defined(HAVE_PEERCRED)
+	struct ucred cred;
+	socklen_t cred_len = sizeof(struct ucred);
+	int ret;
+
+#undef getsockopt
+	ret = getsockopt(s, SOL_SOCKET, SO_PEERCRED, (void *)&cred, &cred_len);
+	if (ret != 0) {
 		return -1;
 	}
 
-	if (protocol != 0) {
-		errno = EPROTONOSUPPORT;
+	if (cred_len != sizeof(struct ucred)) {
+		errno = EINVAL;
 		return -1;
 	}
 
-	if (type != SOCK_STREAM) {
-		errno = EOPNOTSUPP;
-		return -1;
-	}
+	*uid = cred.uid;
+	*gid = cred.gid;
+	return 0;
+#else
+	errno = ENOSYS;
+	return -1;
+#endif
+}
+#endif
 
-	return pipe(sv);
+#ifndef HAVE_USLEEP
+int rep_usleep(useconds_t sec)
+{
+	struct timeval tval;
+	/*
+	 * Fake it with select...
+	 */
+	tval.tv_sec = 0;
+	tval.tv_usec = usecs/1000;
+	select(0,NULL,NULL,NULL,&tval);
+	return 0;
+}
+#endif /* HAVE_USLEEP */
+
+#ifndef HAVE_SETPROCTITLE
+void rep_setproctitle(const char *fmt, ...)
+{
 }
 #endif

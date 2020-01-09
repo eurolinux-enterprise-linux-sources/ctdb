@@ -20,29 +20,25 @@
 
 #
 # Create CTDB source tarball of the current git branch HEAD.
-# The version is extracted from the spec file...
-# The first extra argument will be added as an additional version.
+# The version is calculated from git tag in mkversion.sh.
+# Optional argument is the directory to which tarball is copied.
 #
 
-DIRNAME=$(dirname $0)
-TOPDIR=${DIRNAME}/..
+TARGETDIR="${1:-${PWD}}"  # Default target directory is .
+
+DIRNAME=$(dirname "$0")
+cd -P "${DIRNAME}/.."
+TOPDIR="$PWD"
+
+tmpd=$(mktemp -d) || {
+    echo "Failed to create temporary directory"
+    exit 1
+}
 
 TAR_PREFIX_TMP="ctdb-tmp"
-SPECFILE=/tmp/${TAR_PREFIX_TMP}/packaging/RPM/ctdb.spec
-SPECFILE_IN=${SPECFILE}.in
-
-EXTRA_SUFFIX="$1"
-
-# if no githash was specified on the commandline,
-# then use the current head
-if test x"$GITHASH" = "x" ; then
-	GITHASH="$(git log --pretty=format:%h -1)"
-fi
-
-GITHASH_SUFFIX=".${GITHASH}"
-if test "x$USE_GITHASH" = "xno" ; then
-	GITHASH_SUFFIX=""
-fi
+SPECFILE="${tmpd}/${TAR_PREFIX_TMP}/packaging/RPM/ctdb.spec"
+SPECFILE_IN="${SPECFILE}.in"
+VERSION_H="${tmpd}/${TAR_PREFIX_TMP}/include/ctdb_version.h"
 
 if echo | gzip -c --rsyncable - > /dev/null 2>&1 ; then
 	GZIP="gzip -9 --rsyncable"
@@ -50,71 +46,66 @@ else
 	GZIP="gzip -9"
 fi
 
-pushd ${TOPDIR}
 echo "Creating tarball ... "
-git archive --prefix=${TAR_PREFIX_TMP}/ ${GITHASH} | ( cd /tmp ; tar xf - )
-RC=$?
-popd
-if [ $RC -ne 0 ]; then
+git archive --prefix="${TAR_PREFIX_TMP}/" HEAD | ( cd "$tmpd" ; tar xf - )
+if [ $? -ne 0 ]; then
 	echo "Error calling git archive."
 	exit 1
 fi
 
-sed -e s/GITHASH/${GITHASH_SUFFIX}/g \
+set -- $("${TOPDIR}/packaging/mkversion.sh" "$VERSION_H")
+VERSION=$1
+RELEASE=$2
+if [ -z "$VERSION" -o -z "$RELEASE" ]; then
+    exit 1
+fi
+
+sed -e "s/@VERSION@/${VERSION}/g" \
+    -e "s/@RELEASE@/$RELEASE/g" \
 	< ${SPECFILE_IN} \
 	> ${SPECFILE}
-
-VERSION=$(grep ^Version ${SPECFILE} | sed -e 's/^Version:\ \+//')${GITHASH_SUFFIX}
-
-if [ "x${EXTRA_SUFFIX}" != "x" ]; then
-	VERSION="${VERSION}-${EXTRA_SUFFIX}"
-fi
 
 TAR_PREFIX="ctdb-${VERSION}"
 TAR_BASE="ctdb-${VERSION}"
 
-pushd /tmp/${TAR_PREFIX_TMP}
-./autogen.sh
-RC=$?
-popd
-if [ $RC -ne 0 ]; then
+cd "${tmpd}/${TAR_PREFIX_TMP}"
+./autogen.sh || {
 	echo "Error calling autogen.sh."
 	exit 1
-fi
+}
 
-if test "x${DEBIAN_MODE}" = "xyes" ; then
+make -C doc || {
+    echo "Error building docs."
+    exit 1
+}
+
+if [ "$DEBIAN_MODE" = "yes" ] ; then
 	TAR_PREFIX="ctdb-${VERSION}.orig"
 	TAR_BASE="ctdb_${VERSION}.orig"
-	rm -rf /tmp/${TAR_PREFIX_TMP}/lib/popt
+	rm -rf "${tmpd}/${TAR_PREFIX_TMP}/lib/popt"
 fi
 
-TAR_BALL=${TAR_BASE}.tar
-TAR_GZ_BALL=${TAR_BALL}.gz
+TAR_BALL="${TAR_BASE}.tar"
+TAR_GZ_BALL="${TAR_BALL}.gz"
 
-mv /tmp/${TAR_PREFIX_TMP} /tmp/${TAR_PREFIX}
+mv "${tmpd}/${TAR_PREFIX_TMP}" "${tmpd}/${TAR_PREFIX}"
 
-pushd /tmp
-tar cf ${TAR_BALL} ${TAR_PREFIX}
-RC=$?
-if [ $RC -ne 0 ]; then
-	popd
+cd "$tmpd"
+tar cf "$TAR_BALL" "$TAR_PREFIX" || {
         echo "Creation of tarball failed."
         exit 1
-fi
+}
 
-${GZIP} ${TAR_BALL}
-RC=$?
-if [ $RC -ne 0 ]; then
-	popd
+$GZIP "$TAR_BALL" || {
         echo "Zipping tarball failed."
         exit 1
-fi
+}
 
-rm -rf ${TAR_PREFIX}
+rm -rf "$TAR_PREFIX"
 
-popd
+mv "${tmpd}/${TAR_GZ_BALL}" "${TARGETDIR}/"
 
-mv /tmp/${TAR_GZ_BALL} .
+rmdir "$tmpd"
 
 echo "Done."
 exit 0

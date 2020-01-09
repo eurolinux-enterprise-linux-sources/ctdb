@@ -26,6 +26,26 @@ case `uname` in
   AIX*)
     CTDB_SYSTEM_OBJ=common/system_aix.o
     CTDB_SCSI_IO=
+    CPPFLAGS="$CPPFLAGS -D_AIX_=1"
+    CTDB_PCAP_LDFLAGS=-lpcap
+    ;;
+  GNU/kFreeBSD)
+    CTDB_SYSTEM_OBJ=common/system_kfreebsd.o
+    CTDB_SCSI_IO=
+    CTDB_PCAP_LDFLAGS=-lpcap
+    ;;
+  FreeBSD)
+    CTDB_SYSTEM_OBJ=common/system_freebsd.o
+    CTDB_SCSI_IO=
+    CTDB_PCAP_LDFLAGS=-lpcap
+    LDFLAGS="$LDFLAGS -L/usr/local/lib -lexecinfo"
+    AC_SUBST(LDFLAGS)
+    CPPFLAGS="$CPPFLAGS -I/usr/local/include -D_FREEBSD_=1"
+    AC_SUBST(CPPFLAGS)
+    ;;
+  GNU)
+    CTDB_SYSTEM_OBJ=common/system_gnu.o
+    CTDB_SCSI_IO=
     CTDB_PCAP_LDFLAGS=-lpcap
     ;;
   *)
@@ -35,6 +55,7 @@ case `uname` in
 esac
 
 AC_LIBREPLACE_ALL_CHECKS
+AC_LIBREPLACE_NETWORK_CHECKS
 
 if test "$ac_cv_prog_gcc" = yes; then
    CFLAGS="$CFLAGS -Wall -Wshadow -Wstrict-prototypes -Wpointer-arith -Wcast-qual -Wcast-align -Wwrite-strings"
@@ -51,6 +72,17 @@ if test ! -z "$LOGDIR"; then
 fi
 AC_SUBST(LOGDIR)
 
+SOCKPATH='${localstatedir}/run/ctdb/ctdbd.socket'
+AC_ARG_WITH([socketpath],
+	[  --with-socketpath=FILE       path to CTDB daemon socket [[LOCALSTATEDIR/run/ctdb/ctdbd.socket]]],
+	SOCKPATH=$withval)
+if test ! -z "$SOCKPATH"; then
+  if test "$SOCKPATH" = "yes" -o "$SOCKPATH" = "no"; then
+	  AC_MSG_ERROR([--with-socketpath must specify a file path])
+  fi
+fi
+AC_SUBST(SOCKPATH)
+
 AC_CONFIG_HEADER(config.h)
 
 EXTRA_OBJ=""
@@ -58,13 +90,22 @@ EXTRA_OBJ=""
 m4_include(libpopt.m4)
 m4_include(libtalloc.m4)
 m4_include(libtdb.m4)
-m4_include(libevents.m4)
+m4_include(libtevent.m4)
 m4_include(ib/config.m4)
 m4_include(lib/util/signal.m4)
 m4_include(lib/util/fault.m4)
+m4_include(lib/socket_wrapper/config.m4)
+m4_include(utils/pmda/config.m4)
 
 AC_CHECK_HEADERS(sched.h)
+AC_CHECK_HEADERS(procinfo.h)
+
+AC_CHECK_DECL([ETIME], [],[AC_DEFINE([ETIME], ETIMEDOUT, [ETIME on non-supporting platforms])], [
+#include <errno.h>
+])
+
 AC_CHECK_FUNCS(sched_setscheduler)
+AC_CHECK_FUNCS(thread_setsched)
 AC_CHECK_FUNCS(mlockall)
 
 AC_CACHE_CHECK([for sin_len in sock],ctdb_cv_HAVE_SOCK_SIN_LEN,[

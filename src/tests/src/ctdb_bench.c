@@ -18,11 +18,10 @@
 */
 
 #include "includes.h"
-#include "lib/events/events.h"
 #include "system/filesys.h"
 #include "popt.h"
 #include "cmdline.h"
-#include "ctdb.h"
+#include "ctdb_client.h"
 #include "ctdb_private.h"
 
 #include <sys/time.h>
@@ -94,7 +93,7 @@ static void ring_message_handler(struct ctdb_context *ctdb, uint64_t srvid,
 
 	(*count)++;
 	dest = (ctdb_get_pnn(ctdb) + num_nodes + incr) % num_nodes;
-	ctdb_send_message(ctdb, dest, srvid, data);
+	ctdb_client_send_message(ctdb, dest, srvid, data);
 	if (incr == 1) {
 		msg_plus++;
 	} else {
@@ -103,7 +102,7 @@ static void ring_message_handler(struct ctdb_context *ctdb, uint64_t srvid,
 }
 
 
-void send_start_messages(struct ctdb_context *ctdb, int incr)
+static void send_start_messages(struct ctdb_context *ctdb, int incr)
 {
 	/* two messages are injected into the ring, moving
 	   in opposite directions */
@@ -114,7 +113,7 @@ void send_start_messages(struct ctdb_context *ctdb, int incr)
 	data.dsize = sizeof(incr);
 
 	dest = (ctdb_get_pnn(ctdb) + num_nodes + incr) % num_nodes;
-	ctdb_send_message(ctdb, dest, 0, data);
+	ctdb_client_send_message(ctdb, dest, 0, data);
 }
 
 static void each_second(struct event_context *ev, struct timed_event *te, 
@@ -214,13 +213,22 @@ int main(int argc, const char *argv[])
 		while (extra_argv[extra_argc]) extra_argc++;
 	}
 
+	if (num_nodes == 0) {
+		printf("You must specify the number of nodes\n");
+		exit(1);
+	}
+
 	ev = event_context_init(NULL);
 
 	/* initialise ctdb */
-	ctdb = ctdb_cmdline_client(ev);
+	ctdb = ctdb_cmdline_client(ev, timeval_current_ofs(3, 0));
+	if (ctdb == NULL) {
+		exit(1);
+	}
 
 	/* attach to a specific database */
-	ctdb_db = ctdb_attach(ctdb, "test.tdb", false, 0);
+	ctdb_db = ctdb_attach(ctdb, timeval_current_ofs(2, 0), "test.tdb",
+			      false, 0);
 	if (!ctdb_db) {
 		printf("ctdb_attach failed - %s\n", ctdb_errstr(ctdb));
 		exit(1);
@@ -228,9 +236,15 @@ int main(int argc, const char *argv[])
 
 	/* setup a ctdb call function */
 	ret = ctdb_set_call(ctdb_db, incr_func,  FUNC_INCR);
+	if (ret != 0) {
+		DEBUG(DEBUG_DEBUG,("ctdb_set_call() failed, ignoring return code %d\n", ret));
+	}
 	ret = ctdb_set_call(ctdb_db, fetch_func, FUNC_FETCH);
+	if (ret != 0) {
+		DEBUG(DEBUG_DEBUG,("ctdb_set_call() failed, ignoring return code %d\n", ret));
+	}
 
-	if (ctdb_set_message_handler(ctdb, 0, ring_message_handler,&msg_count))
+	if (ctdb_client_set_message_handler(ctdb, 0, ring_message_handler,&msg_count))
 		goto error;
 
 	printf("Waiting for cluster\n");

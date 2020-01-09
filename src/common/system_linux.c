@@ -23,12 +23,12 @@
 #include "system/filesys.h"
 #include "system/wait.h"
 #include "../include/ctdb_private.h"
-#include "lib/events/events.h"
 #include <netinet/if_ether.h>
 #include <netinet/ip6.h>
 #include <netinet/icmp6.h>
 #include <net/if_arp.h>
 #include <netpacket/packet.h>
+#include <sys/prctl.h>
 
 #ifndef ETHERTYPE_IP6
 #define ETHERTYPE_IP6 0x86dd
@@ -75,7 +75,7 @@ int ctdb_sys_send_arp(const ctdb_sock_addr *addr, const char *iface)
 	struct ether_header *eh;
 	struct arphdr *ah;
 	struct ip6_hdr *ip6;
-	struct icmp6_hdr *icmp6;
+	struct nd_neighbor_solicit *nd_ns;
 	struct ifreq if_hwaddr;
 	unsigned char buffer[78]; /* ipv6 neigh solicitation size */
 	char *ptr;
@@ -83,6 +83,8 @@ int ctdb_sys_send_arp(const ctdb_sock_addr *addr, const char *iface)
 	struct ifreq ifr;
 
 	ZERO_STRUCT(sall);
+	ZERO_STRUCT(ifr);
+	ZERO_STRUCT(if_hwaddr);
 
 	switch (addr->ip.sin_family) {
 	case AF_INET:
@@ -93,7 +95,7 @@ int ctdb_sys_send_arp(const ctdb_sock_addr *addr, const char *iface)
 		}
 
 		DEBUG(DEBUG_DEBUG, (__location__ " Created SOCKET FD:%d for sending arp\n", s));
-		strncpy(ifr.ifr_name, iface, sizeof(ifr.ifr_name));
+		strncpy(ifr.ifr_name, iface, sizeof(ifr.ifr_name)-1);
 		if (ioctl(s, SIOCGIFINDEX, &ifr) < 0) {
 			DEBUG(DEBUG_CRIT,(__location__ " interface '%s' not found\n", iface));
 			close(s);
@@ -101,7 +103,7 @@ int ctdb_sys_send_arp(const ctdb_sock_addr *addr, const char *iface)
 		}
 
 		/* get the mac address */
-		strcpy(if_hwaddr.ifr_name, iface);
+		strncpy(if_hwaddr.ifr_name, iface, sizeof(if_hwaddr.ifr_name)-1);
 		ret = ioctl(s, SIOCGIFHWADDR, &if_hwaddr);
 		if ( ret < 0 ) {
 			close(s);
@@ -195,7 +197,7 @@ int ctdb_sys_send_arp(const ctdb_sock_addr *addr, const char *iface)
 		}
 
 		/* get the mac address */
-		strcpy(if_hwaddr.ifr_name, iface);
+		strncpy(if_hwaddr.ifr_name, iface, sizeof(if_hwaddr.ifr_name)-1);
 		ret = ioctl(s, SIOCGIFHWADDR, &if_hwaddr);
 		if ( ret < 0 ) {
 			close(s);
@@ -223,17 +225,18 @@ int ctdb_sys_send_arp(const ctdb_sock_addr *addr, const char *iface)
 
 		ip6 = (struct ip6_hdr *)(eh+1);
 		ip6->ip6_vfc  = 0x60;
-		ip6->ip6_plen = htons(24);
+		ip6->ip6_plen = htons(sizeof(*nd_ns));
 		ip6->ip6_nxt  = IPPROTO_ICMPV6;
 		ip6->ip6_hlim = 255;
 		ip6->ip6_dst  = addr->ip6.sin6_addr;
 
-		icmp6 = (struct icmp6_hdr *)(ip6+1);
-		icmp6->icmp6_type = ND_NEIGHBOR_SOLICIT;
-		icmp6->icmp6_code = 0;
-		memcpy(&icmp6->icmp6_data32[1], &addr->ip6.sin6_addr, 16);
+		nd_ns = (struct nd_neighbor_solicit *)(ip6+1);
+		nd_ns->nd_ns_type = ND_NEIGHBOR_SOLICIT;
+		nd_ns->nd_ns_code = 0;
+		nd_ns->nd_ns_reserved = 0;
+		nd_ns->nd_ns_target = addr->ip6.sin6_addr;
 
-		icmp6->icmp6_cksum = tcp_checksum6((uint16_t *)icmp6, ntohs(ip6->ip6_plen), ip6);
+		nd_ns->nd_ns_cksum = tcp_checksum6((uint16_t *)nd_ns, ntohs(ip6->ip6_plen), ip6);
 
 		sall.sll_family = AF_PACKET;
 		sall.sll_halen = 6;
@@ -353,7 +356,9 @@ int ctdb_sys_send_tcp(const ctdb_sock_addr *dest,
 		set_nonblocking(s);
 		set_close_on_exec(s);
 
-		ret = sendto(s, &ip4pkt, sizeof(ip4pkt), 0, &dest->ip, sizeof(dest->ip));
+		ret = sendto(s, &ip4pkt, sizeof(ip4pkt), 0,
+			     (const struct sockaddr *)&dest->ip,
+			     sizeof(dest->ip));
 		close(s);
 		if (ret != sizeof(ip4pkt)) {
 			DEBUG(DEBUG_CRIT,(__location__ " failed sendto (%s)\n", strerror(errno)));
@@ -395,7 +400,9 @@ int ctdb_sys_send_tcp(const ctdb_sock_addr *dest,
 		tmpport = tmpdest->ip6.sin6_port;
 
 		tmpdest->ip6.sin6_port = 0;
-		ret = sendto(s, &ip6pkt, sizeof(ip6pkt), 0, &dest->ip6, sizeof(dest->ip6));
+		ret = sendto(s, &ip6pkt, sizeof(ip6pkt), 0,
+			     (const struct sockaddr *)&dest->ip6,
+			     sizeof(dest->ip6));
 		tmpdest->ip6.sin6_port = tmpport;
 		close(s);
 
@@ -537,3 +544,225 @@ int ctdb_sys_read_tcp_packet(int s, void *private_data,
 }
 
 
+bool ctdb_sys_check_iface_exists(const char *iface)
+{
+	int s;
+	struct ifreq ifr;
+
+	s = socket(PF_PACKET, SOCK_RAW, 0);
+	if (s == -1){
+		/* We dont know if the interface exists, so assume yes */
+		DEBUG(DEBUG_CRIT,(__location__ " failed to open raw socket\n"));
+		return true;
+	}
+
+	strncpy(ifr.ifr_name, iface, sizeof(ifr.ifr_name)-1);
+	if (ioctl(s, SIOCGIFINDEX, &ifr) < 0 && errno == ENODEV) {
+		DEBUG(DEBUG_CRIT,(__location__ " interface '%s' not found\n", iface));
+		close(s);
+		return false;
+	}
+	close(s);
+	
+	return true;
+}
+
+int ctdb_get_peer_pid(const int fd, pid_t *peer_pid)
+{
+	struct ucred cr;
+	socklen_t crl = sizeof(struct ucred);
+	int ret;
+	if ((ret = getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cr, &crl) == 0)) {
+		*peer_pid = cr.pid;
+	}
+	return ret;
+}
+
+/*
+ * Find the process name from process ID
+ */
+char *ctdb_get_process_name(pid_t pid)
+{
+	char path[32];
+	char buf[PATH_MAX];
+	char *ptr;
+	int n;
+
+	snprintf(path, sizeof(path), "/proc/%d/exe", pid);
+	n = readlink(path, buf, sizeof(buf)-1);
+	if (n < 0) {
+		return NULL;
+	}
+
+	/* Remove any extra fields */
+	buf[n] = '\0';
+	ptr = strtok(buf, " ");
+	return (ptr == NULL ? ptr : strdup(ptr));
+}
+
+/*
+ * Set process name
+ */
+int ctdb_set_process_name(const char *name)
+{
+	char procname[16];
+
+	strncpy(procname, name, 15);
+	procname[15] = '\0';
+	return prctl(PR_SET_NAME, (unsigned long)procname, 0, 0, 0);
+}
+
+/*
+ * Parsing a line from /proc/locks,
+ */
+static bool parse_proc_locks_line(char *line, pid_t *pid,
+				  struct ctdb_lock_info *curlock)
+{
+	char *ptr, *saveptr;
+
+	/* output of /proc/locks
+	 *
+	 * lock assigned
+	 * 1: POSIX  ADVISORY  WRITE 25945 fd:00:6424820 212 212
+	 *
+	 * lock waiting
+	 * 1: -> POSIX  ADVISORY  WRITE 25946 fd:00:6424820 212 212
+	 */
+
+	/* Id: */
+	ptr = strtok_r(line, " ", &saveptr);
+	if (ptr == NULL) return false;
+
+	/* -> */
+	ptr = strtok_r(NULL, " ", &saveptr);
+	if (ptr == NULL) return false;
+	if (strcmp(ptr, "->") == 0) {
+		curlock->waiting = true;
+		ptr = strtok_r(NULL, " ", &saveptr);
+	} else {
+		curlock->waiting = false;
+	}
+
+	/* POSIX */
+	if (ptr == NULL || strcmp(ptr, "POSIX") != 0) {
+		return false;
+	}
+
+	/* ADVISORY */
+	ptr = strtok_r(NULL, " ", &saveptr);
+	if (ptr == NULL) return false;
+
+	/* WRITE */
+	ptr = strtok_r(NULL, " ", &saveptr);
+	if (ptr == NULL) return false;
+	if (strcmp(ptr, "READ") == 0) {
+		curlock->read_only = true;
+	} else if (strcmp(ptr, "WRITE") == 0) {
+		curlock->read_only = false;
+	} else {
+		return false;
+	}
+
+	/* PID */
+	ptr = strtok_r(NULL, " ", &saveptr);
+	if (ptr == NULL) return false;
+	*pid = atoi(ptr);
+
+	/* MAJOR:MINOR:INODE */
+	ptr = strtok_r(NULL, " :", &saveptr);
+	if (ptr == NULL) return false;
+	ptr = strtok_r(NULL, " :", &saveptr);
+	if (ptr == NULL) return false;
+	ptr = strtok_r(NULL, " :", &saveptr);
+	if (ptr == NULL) return false;
+	curlock->inode = atol(ptr);
+
+	/* START OFFSET */
+	ptr = strtok_r(NULL, " ", &saveptr);
+	if (ptr == NULL) return false;
+	curlock->start = atol(ptr);
+
+	/* END OFFSET */
+	ptr = strtok_r(NULL, " ", &saveptr);
+	if (ptr == NULL) return false;
+	if (strncmp(ptr, "EOF", 3) == 0) {
+		curlock->end = (off_t)-1;
+	} else {
+		curlock->end = atol(ptr);
+	}
+
+	return true;
+}
+
+/*
+ * Find information of lock being waited on for given process ID
+ */
+bool ctdb_get_lock_info(pid_t req_pid, struct ctdb_lock_info *lock_info)
+{
+	FILE *fp;
+	struct ctdb_lock_info curlock;
+	pid_t pid;
+	char buf[1024];
+	bool status = false;
+
+	if ((fp = fopen("/proc/locks", "r")) == NULL) {
+		DEBUG(DEBUG_ERR, ("Failed to read locks information"));
+		return false;
+	}
+	while (fgets(buf, sizeof(buf), fp) != NULL) {
+		if (! parse_proc_locks_line(buf, &pid, &curlock)) {
+			continue;
+		}
+		if (pid == req_pid && curlock.waiting) {
+			*lock_info = curlock;
+			status = true;
+			break;
+		}
+	}
+	fclose(fp);
+
+	return status;
+}
+
+/*
+ * Find process ID which holds an overlapping byte lock for required
+ * inode and byte range.
+ */
+bool ctdb_get_blocker_pid(struct ctdb_lock_info *reqlock, pid_t *blocker_pid)
+{
+	FILE *fp;
+	struct ctdb_lock_info curlock;
+	pid_t pid;
+	char buf[1024];
+	bool status = false;
+
+	if ((fp = fopen("/proc/locks", "r")) == NULL) {
+		DEBUG(DEBUG_ERR, ("Failed to read locks information"));
+		return false;
+	}
+	while (fgets(buf, sizeof(buf), fp) != NULL) {
+		if (! parse_proc_locks_line(buf, &pid, &curlock)) {
+			continue;
+		}
+
+		if (curlock.waiting) {
+			continue;
+		}
+
+		if (curlock.inode != reqlock->inode) {
+			continue;
+		}
+
+		if (curlock.start > reqlock->end ||
+		    curlock.end < reqlock->start) {
+			/* Outside the required range */
+			continue;
+		}
+		*blocker_pid = pid;
+		status = true;
+		break;
+	}
+	fclose(fp);
+
+	return status;
+}

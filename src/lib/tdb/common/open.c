@@ -129,7 +129,7 @@ static int tdb_already_open(dev_t device,
    try to call tdb_error or tdb_errname, just do strerror(errno).
 
    @param name may be NULL for internal databases. */
-struct tdb_context *tdb_open(const char *name, int hash_size, int tdb_flags,
+_PUBLIC_ struct tdb_context *tdb_open(const char *name, int hash_size, int tdb_flags,
 		      int open_flags, mode_t mode)
 {
 	return tdb_open_ex(name, hash_size, tdb_flags, open_flags, mode, NULL, NULL);
@@ -162,7 +162,7 @@ static bool check_header_hash(struct tdb_context *tdb,
 	return check_header_hash(tdb, false, m1, m2);
 }
 
-struct tdb_context *tdb_open_ex(const char *name, int hash_size, int tdb_flags,
+_PUBLIC_ struct tdb_context *tdb_open_ex(const char *name, int hash_size, int tdb_flags,
 				int open_flags, mode_t mode,
 				const struct tdb_logging_context *log_ctx,
 				tdb_hash_func hash_fn)
@@ -195,6 +195,32 @@ struct tdb_context *tdb_open_ex(const char *name, int hash_size, int tdb_flags,
 	} else {
 		tdb->log.log_fn = null_log_fn;
 		tdb->log.log_private = NULL;
+	}
+
+	if (name == NULL && (tdb_flags & TDB_INTERNAL)) {
+		name = "__TDB_INTERNAL__";
+	}
+
+	if (name == NULL) {
+		tdb->name = discard_const_p(char, "__NULL__");
+		TDB_LOG((tdb, TDB_DEBUG_FATAL, "tdb_open_ex: called with name == NULL\n"));
+		tdb->name = NULL;
+		errno = EINVAL;
+		goto fail;
+	}
+
+	/* now make a copy of the name, as the caller memory might went away */
+	if (!(tdb->name = (char *)strdup(name))) {
+		/*
+		 * set the name as the given string, so that tdb_name() will
+		 * work in case of an error.
+		 */
+		tdb->name = discard_const_p(char, name);
+		TDB_LOG((tdb, TDB_DEBUG_ERROR, "tdb_open_ex: can't strdup(%s)\n",
+			 name));
+		tdb->name = NULL;
+		errno = ENOMEM;
+		goto fail;
 	}
 
 	if (hash_fn) {
@@ -287,12 +313,36 @@ struct tdb_context *tdb_open_ex(const char *name, int hash_size, int tdb_flags,
 	if ((tdb_flags & TDB_CLEAR_IF_FIRST) &&
 	    (!tdb->read_only) &&
 	    (locked = (tdb_nest_lock(tdb, ACTIVE_LOCK, F_WRLCK, TDB_LOCK_NOWAIT|TDB_LOCK_PROBE) == 0))) {
-		open_flags |= O_CREAT;
-		if (ftruncate(tdb->fd, 0) == -1) {
+		int ret;
+		ret = tdb_brlock(tdb, F_WRLCK, FREELIST_TOP, 0,
+				 TDB_LOCK_WAIT);
+		if (ret == -1) {
 			TDB_LOG((tdb, TDB_DEBUG_FATAL, "tdb_open_ex: "
-				 "failed to truncate %s: %s\n",
+				 "tdb_brlock failed for %s: %s\n",
 				 name, strerror(errno)));
-			goto fail; /* errno set by ftruncate */
+			goto fail;
+		}
+		ret = tdb_new_database(tdb, hash_size);
+		if (ret == -1) {
+			TDB_LOG((tdb, TDB_DEBUG_FATAL, "tdb_open_ex: "
+				 "tdb_new_database failed for %s: %s\n",
+				 name, strerror(errno)));
+			tdb_unlockall(tdb);
+			goto fail;
+		}
+		ret = tdb_brunlock(tdb, F_WRLCK, FREELIST_TOP, 0);
+		if (ret == -1) {
+			TDB_LOG((tdb, TDB_DEBUG_FATAL, "tdb_open_ex: "
+				 "tdb_unlockall failed for %s: %s\n",
+				 name, strerror(errno)));
+			goto fail;
+		}
+		ret = lseek(tdb->fd, 0, SEEK_SET);
+		if (ret == -1) {
+			TDB_LOG((tdb, TDB_DEBUG_FATAL, "tdb_open_ex: "
+				 "lseek failed for %s: %s\n",
+				 name, strerror(errno)));
+			goto fail;
 		}
 	}
 
@@ -359,12 +409,17 @@ struct tdb_context *tdb_open_ex(const char *name, int hash_size, int tdb_flags,
 		goto fail;
 	}
 
-	if (!(tdb->name = (char *)strdup(name))) {
-		errno = ENOMEM;
+	/* Beware truncation! */
+	tdb->map_size = st.st_size;
+	if (tdb->map_size != st.st_size) {
+		/* Ensure ecode is set for log fn. */
+		tdb->ecode = TDB_ERR_IO;
+		TDB_LOG((tdb, TDB_DEBUG_FATAL, "tdb_open_ex: "
+			 "len %llu too large!\n", (long long)st.st_size));
+		errno = EIO;
 		goto fail;
 	}
 
-	tdb->map_size = st.st_size;
 	tdb->device = st.st_dev;
 	tdb->inode = st.st_ino;
 	tdb_mmap(tdb);
@@ -436,11 +491,11 @@ struct tdb_context *tdb_open_ex(const char *name, int hash_size, int tdb_flags,
 		else
 			tdb_munmap(tdb);
 	}
-	SAFE_FREE(tdb->name);
 	if (tdb->fd != -1)
 		if (close(tdb->fd) != 0)
 			TDB_LOG((tdb, TDB_DEBUG_ERROR, "tdb_open_ex: failed to close tdb->fd on error!\n"));
 	SAFE_FREE(tdb->lockrecs);
+	SAFE_FREE(tdb->name);
 	SAFE_FREE(tdb);
 	errno = save_errno;
 	return NULL;
@@ -451,7 +506,7 @@ struct tdb_context *tdb_open_ex(const char *name, int hash_size, int tdb_flags,
  * Set the maximum number of dead records per hash chain
  */
 
-void tdb_set_max_dead(struct tdb_context *tdb, int max_dead)
+_PUBLIC_ void tdb_set_max_dead(struct tdb_context *tdb, int max_dead)
 {
 	tdb->max_dead_records = max_dead;
 }
@@ -461,7 +516,7 @@ void tdb_set_max_dead(struct tdb_context *tdb, int max_dead)
  *
  * @returns -1 for error; 0 for success.
  **/
-int tdb_close(struct tdb_context *tdb)
+_PUBLIC_ int tdb_close(struct tdb_context *tdb)
 {
 	struct tdb_context **i;
 	int ret = 0;
@@ -502,13 +557,13 @@ int tdb_close(struct tdb_context *tdb)
 }
 
 /* register a loging function */
-void tdb_set_logging_function(struct tdb_context *tdb,
-                              const struct tdb_logging_context *log_ctx)
+_PUBLIC_ void tdb_set_logging_function(struct tdb_context *tdb,
+                                       const struct tdb_logging_context *log_ctx)
 {
         tdb->log = *log_ctx;
 }
 
-void *tdb_get_logging_private(struct tdb_context *tdb)
+_PUBLIC_ void *tdb_get_logging_private(struct tdb_context *tdb)
 {
 	return tdb->log.log_private;
 }
@@ -556,7 +611,9 @@ static int tdb_reopen_internal(struct tdb_context *tdb, bool active_lock)
 		TDB_LOG((tdb, TDB_DEBUG_FATAL, "tdb_reopen: file dev/inode has changed!\n"));
 		goto fail;
 	}
-	tdb_mmap(tdb);
+	if (tdb_mmap(tdb) != 0) {
+		goto fail;
+	}
 #endif /* fake pread or pwrite */
 
 	/* We may still think we hold the active lock. */
@@ -577,13 +634,13 @@ fail:
 
 /* reopen a tdb - this can be used after a fork to ensure that we have an independent
    seek pointer from our parent and to re-establish locks */
-int tdb_reopen(struct tdb_context *tdb)
+_PUBLIC_ int tdb_reopen(struct tdb_context *tdb)
 {
 	return tdb_reopen_internal(tdb, tdb->flags & TDB_CLEAR_IF_FIRST);
 }
 
 /* reopen all tdb's */
-int tdb_reopen_all(int parent_longlived)
+_PUBLIC_ int tdb_reopen_all(int parent_longlived)
 {
 	struct tdb_context *tdb;
 

@@ -18,7 +18,6 @@
 */
 
 #include "includes.h"
-#include "lib/events/events.h"
 #include "../include/ctdb_private.h"
 #include "system/syslog.h"
 #include "system/time.h"

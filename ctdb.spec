@@ -1,37 +1,57 @@
+%global _hardened_build 1
+
 %define initdir %{_sysconfdir}/rc.d/init.d
+%define with_systemd 0
 
 Summary: A Clustered Database based on Samba's Trivial Database (TDB)
 Name: ctdb
-Version: 1.0.114.5
-Release: 3%{?dist}
+Version: 2.5.1
+Release: 1%{?dist}
 License: GPLv3+
 Group: System Environment/Daemons
 URL: http://ctdb.samba.org/
 
-# Tarfile created using git
-# git clone git://git.samba.org/sahlberg/ctdb.git ctdb
-# cd ctdb
-# git-archive --format=tar --prefix=%{name}-%{version}/ %{name}-%{version} | bzip2 > %{name}-%{version}.tar.bz2
-Source0: %{name}-%{version}.tar.bz2
-
-# Fedora specific patch, ctdb should not be enabled by default in the runlevels
-Patch1: ctdb-no_default_runlevel.patch
-Patch2: 0001-Set-FD_CLOEXEC-for-epoll-file-descriptors.patch
-Patch3: 0001-Fixes-for-various-issues-found-by-Coverity.patch
-Patch4: 0001-IPv6-neighbor-solicit-cleanup.patch
-Patch5: 0001-Print-deleted-nodes-as-well.patch
-Patch6: 0001-Fix-memory-leak-in-ctdb_send_message.patch
-Patch7: 0001-Check-return-value-of-tdb_delete.patch
+Source0: https://ftp.samba.org/pub/ctdb/%{name}-%{version}.tar.gz
 
 Requires: chkconfig coreutils psmisc
 Requires: fileutils sed
 Requires: tdb-tools
+%if %{with_systemd}
+Requires(post): systemd-units
+Requires(preun): systemd-units
+Requires(postun): systemd-units
+%else
 Requires(preun): chkconfig initscripts
-Requires(post): chkconfig policycoreutils
+Requires(post): chkconfig
 Requires(postun): initscripts
+%endif
 
 BuildRoot: %(mktemp -ud %{_tmppath}/%{name}-%{version}-%{release}-XXXXXX)
 BuildRequires: autoconf net-tools popt-devel
+# For make check
+BuildRequires: procps iproute
+
+# Always use the bundled versions of these libraries.
+%define with_included_talloc 0
+%define with_included_tdb 0
+%define with_included_tevent 0
+
+# If the above options are changed then mandate minimum system
+# versions.
+%define libtalloc_version 2.0.7
+%define libtdb_version 1.2.10
+%define libtevent_version 0.9.18
+
+%if ! %with_included_talloc
+BuildRequires: libtalloc-devel >= %{libtalloc_version}
+%endif
+%if ! %with_included_tdb
+BuildRequires: libtdb-devel >= %{libtdb_version}
+%endif
+%if ! %with_included_tevent
+BuildRequires: libtevent-devel >= %{libtevent_version}
+%endif
+
 
 %description
 CTDB is a cluster implementation of the TDB database used by Samba and other
@@ -43,6 +63,7 @@ and use CTDB instead.
 Group: Development/Libraries
 Summary: CTDB clustered database development package
 Requires: ctdb = %{version}-%{release}
+Provides: ctdb-static = %{version}-%{release}
 %description devel
 Libraries, include files, etc you can use to develop CTDB applications.
 CTDB is a cluster implementation of the TDB database used by Samba and other
@@ -50,6 +71,18 @@ projects to store temporary data. If an application is already using TDB for
 temporary data it is very easy to convert that application to be cluster aware
 and use CTDB instead.
 
+%package tests
+Summary: CTDB clustered database test suite
+Group: Development/Tools
+Requires: ctdb = %{version}
+Requires: nc
+
+%description tests
+Test suite for CTDB.
+CTDB is a cluster implementation of the TDB database used by Samba and other
+projects to store temporary data. If an application is already using TDB for
+temporary data it is very easy to convert that application to be cluster aware
+and use CTDB instead.
 
 #######################################################################
 
@@ -57,13 +90,6 @@ and use CTDB instead.
 %setup -q
 # setup the init script and sysconfig file
 %setup -T -D -n ctdb-%{version} -q
-%patch1 -p1
-%patch2 -p1
-%patch3 -p1
-%patch4 -p1
-%patch5 -p1
-%patch6 -p1
-%patch7 -p1
 
 %build
 
@@ -72,10 +98,23 @@ CC="gcc"
 ## always run autogen.sh
 ./autogen.sh
 
-CFLAGS="$(echo '%{optflags}') $EXTRA -D_GNU_SOURCE -DCTDB_VERS=\"%{version}-%{release}\"" %configure
+CFLAGS="$(echo '%{optflags}') $EXTRA -D_GNU_SOURCE -DCTDB_VERS=\"%{version}-%{release}\"" %configure \
+%if %with_included_talloc
+        --with-included-talloc \
+%endif
+%if %with_included_tdb
+        --with-included-tdb \
+%endif
+%if %with_included_tevent
+        --with-included-tevent
+%endif
 
 make showflags
 make %{_smp_mflags}
+
+# make test does not work in koji
+#%check
+#make test
 
 %install
 # Clean up in case there is trash left from a previous build
@@ -83,31 +122,58 @@ rm -rf %{buildroot}
 
 # Create the target build directory hierarchy
 mkdir -p %{buildroot}%{_sysconfdir}/sysconfig
+mkdir -p %{buildroot}%{_sysconfdir}/sudoers.d
 mkdir -p %{buildroot}%{initdir}
 
 make DESTDIR=%{buildroot} install
 
+make DESTDIR=%{buildroot} docdir=%{_docdir} install install_tests
+
 install -m644 config/ctdb.sysconfig %{buildroot}%{_sysconfdir}/sysconfig/ctdb
+
+%if %{with_systemd}
+mkdir -p %{buildroot}%{_unitdir}
+install -m 755 config/ctdb.service %{buildroot}%{_unitdir}
+%else
+mkdir -p %{buildroot}%{initdir}
 install -m755 config/ctdb.init %{buildroot}%{initdir}/ctdb
+%endif
+
+%if %{with_systemd}
+# create /run/ctdbd
+mkdir -p %{buildroot}%{_tmpfilesdir}
+echo "d /run/ctdb  755 root root" >> %{buildroot}%{_tmpfilesdir}/%{name}.conf
+
+mkdir -p %{buildroot}/run
+install -d -m 0755 %{buildroot}/run/ctdb/
+%endif
+
+install -d -m 0755 %{buildroot}%{_localstatedir}/lib/ctdb/
+
+mkdir -p %{buildroot}%{_docdir}/ctdb/tests/bin
+install -m755 tests/bin/ctdb_transaction %{buildroot}%{_docdir}/ctdb/tests/bin
+
 
 # Remove "*.old" files
 find %{buildroot} -name "*.old" -exec rm -f {} \;
 
-# fix doc path
-mv %{buildroot}%{_docdir}/ctdb %{buildroot}%{_docdir}/ctdb-%{version}
-cp -r COPYING web %{buildroot}%{_docdir}/ctdb-%{version}
-
-# fix permissions
-chmod 755 %{buildroot}%{_sysconfdir}/ctdb/events.d/20.multipathd
-chmod 755 %{buildroot}%{_sysconfdir}/ctdb/events.d/31.clamd
+cp -r COPYING web %{buildroot}%{_docdir}/ctdb
 
 %clean
 rm -rf %{buildroot}
 
+%if %{with_systemd}
+%post
+%systemd_post ctdb.service
+
+%preun
+%systemd_preun ctdb.service
+
+%postun
+%systemd_postun_with_restart ctdb.service
+%else
 %post
 /sbin/chkconfig --add ctdb
-/bin/mkdir -p /var/ctdb
-/sbin/restorecon -R /var/ctdb
 
 %preun
 if [ "$1" -eq "0" ] ; then
@@ -119,41 +185,86 @@ fi
 if [ "$1" -ge "1" ]; then
  /sbin/service ctdb condrestart >/dev/null 2>&1 || true
 fi
-
+%endif
 
 # Files section
 
 %files
 %defattr(-,root,root,-)
+
 %config(noreplace) %{_sysconfdir}/sysconfig/ctdb
 %config(noreplace) %{_sysconfdir}/ctdb/notify.sh
+%config(noreplace) %{_sysconfdir}/ctdb/debug-hung-script.sh
+%config(noreplace) %{_sysconfdir}/ctdb/ctdb-crash-cleanup.sh
+%config(noreplace) %{_sysconfdir}/ctdb/gcore_trace.sh
 %config(noreplace) %{_sysconfdir}/ctdb/functions
-%attr(755,root,root) %{initdir}/ctdb
+%config(noreplace) %{_sysconfdir}/ctdb/debug_locks.sh
+%dir %{_localstatedir}/lib/ctdb/
+%if %{with_systemd}
+%dir /run/ctdb/
+%{_tmpfilesdir}/%{name}.conf
+%endif
 
-%{_docdir}/ctdb-%{version}
+%if %{with_systemd}
+%{_unitdir}/ctdb.service
+%else
+%attr(755,root,root) %{initdir}/ctdb
+%endif
+
+%{_docdir}/ctdb
 %dir %{_sysconfdir}/ctdb
 %{_sysconfdir}/ctdb/statd-callout
+%dir %{_sysconfdir}/ctdb/nfs-rpc-checks.d
+%{_sysconfdir}/ctdb/nfs-rpc-checks.d/10.statd.check
+%{_sysconfdir}/ctdb/nfs-rpc-checks.d/20.nfsd.check
+%{_sysconfdir}/ctdb/nfs-rpc-checks.d/30.lockd.check
+%{_sysconfdir}/ctdb/nfs-rpc-checks.d/40.mountd.check
+%{_sysconfdir}/ctdb/nfs-rpc-checks.d/50.rquotad.check
+%{_sysconfdir}/sudoers.d/ctdb
 %{_sysconfdir}/ctdb/events.d/
-%{_sysconfdir}/ctdb/interface_modify.sh
 %{_sbindir}/ctdbd
+%{_sbindir}/ctdbd_wrapper
 %{_bindir}/ctdb
 %{_bindir}/smnotify
 %{_bindir}/ping_pong
 %{_bindir}/ltdbtool
 %{_bindir}/ctdb_diagnostics
 %{_bindir}/onnode
+%{_bindir}/ctdb_lock_helper
+
 %{_mandir}/man1/ctdb.1.gz
 %{_mandir}/man1/ctdbd.1.gz
 %{_mandir}/man1/onnode.1.gz
 %{_mandir}/man1/ltdbtool.1.gz
+%{_mandir}/man1/ping_pong.1.gz
 
 %files devel
 %defattr(-,root,root,-)
 %{_includedir}/ctdb.h
+%{_includedir}/ctdb_client.h
+%{_includedir}/ctdb_protocol.h
 %{_includedir}/ctdb_private.h
+%{_includedir}/ctdb_typesafe_cb.h
 %{_libdir}/pkgconfig/ctdb.pc
 
+%files tests
+%defattr(-,root,root,-)
+%dir %{_datadir}/%{name}-tests
+%{_datadir}/%{name}-tests/*
+%dir %{_libdir}/%{name}-tests
+%{_libdir}/%{name}-tests/*
+%{_bindir}/ctdb_run_tests
+%{_bindir}/ctdb_run_cluster_tests
+%doc tests/README
+
 %changelog
+* Fri May 23 2014 Sumit Bose <sbose@redhat.com> - 2.5.1-1
+ - Update to ctdb version 2.5.1
+ - Resolves: rhbz#1061630
+ - Resolves: rhbz#1085447
+ - Resolves: rhbz#987099
+ - Resolves: rhbz#1085413
+
 * Mon Nov 19 2012 Sumit Bose <sbose@redhat.com> - 1.0.114.5-3
  - Improve output of ctdb status by adding the number of deleted nodes
  - Fix a memory and an unchecked return value found by coverity

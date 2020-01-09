@@ -12,6 +12,9 @@
 # Example
 # bond1 10.3.3.0/24 10.0.0.1
 
+[ -n "$CTDB_BASE" ] || \
+    export CTDB_BASE=$(cd -P $(dirname "$0") ; dirname "$PWD")
+
 . $CTDB_BASE/functions
 loadconfig
 
@@ -19,23 +22,21 @@ loadconfig
     exit 0
 }
 
-case "$1" in 
-    takeip|releaseip)
-	iface=$2
-	cat $CTDB_BASE/static-routes | egrep "^$iface " | while read IFACE DEST GW; do
-	    ip route add $DEST via $GW dev $IFACE >/dev/null 2>/dev/null
-	done
-	;;
+case "$1" in
+    ipreallocated)
+        while read iface dest gw; do
+            ip route add "$dest" via "$gw" dev "$iface" >/dev/null 2>&1
+        done <"${CTDB_BASE}/static-routes"
+        ;;
 
     updateip)
 	oiface=$2
 	niface=$3
-	cat $CTDB_BASE/static-routes | egrep "^$niface " | while read IFACE DEST GW; do
-	    ip route add $DEST via $GW dev $IFACE >/dev/null 2>/dev/null
-	done
-	cat $CTDB_BASE/static-routes | egrep "^$oiface " | while read IFACE DEST GW; do
-	    ip route add $DEST via $GW dev $IFACE >/dev/null 2>/dev/null
-	done
+	while read iface dest gw; do
+	    if [ "$niface" = "$iface" -o "$oiface" = "$iface" ] ; then
+		ip route add "$dest" via "$gw" dev "$iface" >/dev/null 2>&1
+	    fi
+	done <"${CTDB_BASE}/static-routes"
 	;;
 
     *)

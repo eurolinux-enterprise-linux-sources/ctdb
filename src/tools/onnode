@@ -31,11 +31,13 @@ usage ()
 Usage: onnode [OPTION] ... <NODES> <COMMAND> ...
   options:
     -c          Run in current working directory on specified nodes.
+    -f          Specify nodes file, overrides CTDB_NODES_FILE.
+    -i          Keep standard input open - the default is to close it.
+    -n          Allow nodes to be specified by name.
     -o <prefix> Save standard output from each node to file <prefix>.<ip>
     -p          Run command in parallel on specified nodes.
+    -P          Push given files to nodes instead of running commands.
     -q          Do not print node addresses (overrides -v).
-    -n          Allow nodes to be specified by name.
-    -f          Specify nodes file, overrides CTDB_NODES_FILE.
     -v          Print node address even for a single node.
   <NODES>       "all", "any", "ok" (or "healthy"), "con" (or "connected"),
                 "rm" (or "recmaster"), "lvs" (or "lvsmaster"),
@@ -62,6 +64,8 @@ verbose=false
 quiet=false
 prefix=""
 names_ok=false
+push=false
+stdin=false
 
 ctdb_base="${CTDB_BASE:-/etc/ctdb}"
 
@@ -70,7 +74,9 @@ parse_options ()
     # $POSIXLY_CORRECT means that the command passed to onnode can
     # take options and getopt won't reorder things to make them
     # options ot onnode.
-    local temp=$(POSIXLY_CORRECT=1 getopt -n "$prog" -o "cf:hno:pqv" -l help -- "$@")
+    local temp
+    # Not on the previous line - local returns 0!
+    temp=$(POSIXLY_CORRECT=1 getopt -n "$prog" -o "cf:hno:pqvPi" -l help -- "$@")
 
     [ $? != 0 ] && usage
 
@@ -85,6 +91,8 @@ parse_options ()
 	    -p) parallel=true ; shift ;;
 	    -q) quiet=true ; shift ;;
 	    -v) verbose=true ; shift ;;
+	    -P) push=true ; shift ;;
+	    -i) stdin=true ; shift ;;
 	    --) shift ; break ;;
 	    -h|--help|*) usage ;; # Shouldn't happen, so this is reasonable.
 	esac
@@ -136,44 +144,47 @@ get_nodes_with_status ()
     local all_nodes="$1"
     local status="$2"
 
-    local bits
-    case "$status" in
-	healthy)
-	    bits="0:0:0:0:0"
-	    ;;
-	connected)
-	    bits="0:[0-1]:[0-1]:[0-1]:[0-1]"
-	    ;;
-	*)
-	    invalid_nodespec
-    esac
-
     if [ -z "$ctdb_status_output" ] ; then
-	# FIXME: need to do something if $CTDB_NODES_SOCKETS is set.
-	ctdb_status_output=$(ctdb -Y status 2>/dev/null)
+	ctdb_status_output=$(ctdb -Y status 2>&1)
 	if [ $? -ne 0 ] ; then
 	    echo "${prog}: unable to get status of CTDB nodes" >&2
+	    echo "$ctdb_status_output" >&2
 	    exit 1
 	fi
-	ctdb_status_output="${ctdb_status_output#* }"
+	local nl="
+"
+	ctdb_status_output="${ctdb_status_output#*${nl}}"
     fi
 
-    local nodes=""
-    local i
-    for i in $ctdb_status_output ; do
-	# Try removing bits from end.
-	local t="${i%:${bits}:}"
-	if [ "$t" != "$i" ] ; then
-	    # Succeeded.  Get address.  NOTE: this is an optimisation.
-	    # It might be better to get the node number and then get
-	    # the nth node to get the address.  This would make things
-	    # more consistent if $ctdb_base/nodes actually contained
-	    # hostnames.
-	    nodes="${nodes} ${t##*:}"
-	fi
-    done
+    (
+	local i
+	IFS="${IFS}:"
+	while IFS="" read i ; do
 
-    echo $nodes
+	    set -- $i # split line on colons
+	    shift     # line starts with : so 1st field is empty
+	    local pnn="$1" ; shift
+	    local ip="$1" ; shift
+
+	    case "$status" in
+		healthy)
+		    # If any bit is 1, don't match this address.
+		    local s
+		    for s ; do
+			[ "$s" != "1" ] || continue 2
+		    done
+		    ;;
+		connected)
+		    # If disconnected bit is not 0, don't match this address.
+		    [ "$1" = "0" ] || continue
+		    ;;
+		*)
+		    invalid_nodespec
+	    esac
+
+	    echo_nth "$pnn" $all_nodes
+	done <<<"$ctdb_status_output"
+    )
 }
 
 ctdb_props="" # cache
@@ -184,20 +195,36 @@ get_node_with_property ()
 
     local prop_node=""
     if [ "${ctdb_props##:${prop}:}" = "$ctdb_props" ] ; then
+	# Not in cache.
 	prop_node=$(ctdb "$prop" -Y 2>/dev/null)
-	# We only want the first line.
-	local nl="
-"
-	prop_node="${prop_node%%${nl}*}"
 	if [ $? -eq 0 ] ; then
-	    ctdb_props="${ctdb_props}${ctdb_props:+ }:${prop}:${prop_node}"
+	    if [ "$prop" = "natgwlist" ] ; then
+		prop_node="${prop_node%% *}" # 1st word
+		if [ "$prop_node" = "-1" ] ; then
+		    # This works around natgwlist returning 0 even
+		    # when there's no natgw.
+		    prop_node=""
+		fi
+	    else
+		# We only want the first line.
+		local nl="
+"
+		prop_node="${prop_node%%${nl}*}"
+	    fi
 	else
 	    prop_node=""
 	fi
+
+	if [ -n "$prop_node" ] ; then
+	    # Add to cache.
+	    ctdb_props="${ctdb_props}${ctdb_props:+ }:${prop}:${prop_node}"
+	fi
     else
+	# Get from cache.
 	prop_node="${ctdb_props##:${prop}:}"
 	prop_node="${prop_node%% *}"
     fi
+
     if [ -n "$prop_node" ] ; then
 	echo_nth "$prop_node" $all_nodes
     else
@@ -284,6 +311,21 @@ get_nodes ()
     done
 }
 
+push()
+{
+    local host="$1"
+    local files="$2"
+
+    local f
+    for f in $files ; do
+        $verbose && echo "Pushing $f"
+        case "$f" in
+	    /*) rsync "$f" "${host}:${f}" ;;
+	    *)  rsync "${PWD}/${f}" "${host}:${PWD}/${f}" ;;
+	esac
+    done
+}
+
 fakessh ()
 {
     CTDB_SOCKET="$1" sh -c "$2" 3>/dev/null
@@ -313,19 +355,27 @@ stderr_filter ()
 
 parse_options "$@"
 
-$current && command="cd $PWD && $command"
-
 ssh_opts=
-if [ -n "$CTDB_NODES_SOCKETS" ] ; then
-    SSH=fakessh
-else 
-    # Could "2>/dev/null || true" but want to see errors from typos in file.
-    [ -r "${ctdb_base}/onnode.conf" ] && . "${ctdb_base}/onnode.conf"
-    [ -n "$SSH" ] || SSH=ssh
-    if [ "$SSH" = "ssh" ] ; then
-	ssh_opts="-n"
-    else
-	: # rsh? All bets are off!
+if $push ; then
+    SSH=push
+    EXTRA_SSH_OPTS=""
+else
+    $current && command="cd $PWD && $command"
+
+    if [ -n "$CTDB_NODES_SOCKETS" ] ; then
+	SSH=fakessh
+	EXTRA_SSH_OPTS=""
+    else 
+	# Could "2>/dev/null || true" but want to see errors from typos in file.
+	[ -r "${ctdb_base}/onnode.conf" ] && . "${ctdb_base}/onnode.conf"
+	[ -n "$SSH" ] || SSH=ssh
+	if [ "$SSH" = "ssh" ] ; then
+	    if $parallel || ! $stdin ; then
+		ssh_opts="-n"
+	    fi
+	else
+	    : # rsh? All bets are off!
+	fi
     fi
 fi
 

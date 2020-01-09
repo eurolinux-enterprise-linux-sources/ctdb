@@ -25,7 +25,7 @@ Expected results:
 EOF
 }
 
-. ctdb_test_functions.bash
+. "${TEST_SCRIPTS_DIR}/integration.bash"
 
 ctdb_test_init "$@"
 
@@ -37,5 +37,5 @@ try_command_on_node -v 0 "$CTDB listvars"
 
 sanity_check_output \
     5 \
-    '^[[:alpha:]]+[[:space:]]*=[[:space:]]*[[:digit:]]+$' \
+    '^[[:alpha:]][[:alnum:]]+[[:space:]]*=[[:space:]]*[[:digit:]]+$' \
     "$out"

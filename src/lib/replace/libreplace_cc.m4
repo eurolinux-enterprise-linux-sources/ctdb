@@ -50,11 +50,21 @@ AC_PROG_INSTALL
 AC_ISC_POSIX
 AC_N_DEFINE(_XOPEN_SOURCE_EXTENDED)
 
+AC_MSG_CHECKING(checking getconf LFS_CFLAGS for large file support flags)
+LFS_CFLAGS=`(getconf LFS_CFLAGS) 2>/dev/null` || LFS_CFLAGS=""
+
+AC_MSG_RESULT(${LFS_CFLAGS})
+if test "x$LFS_CFLAGS" != 'x-1' || test "x$LFS_CFLAGS" != "xundefined"; then
+   CFLAGS="$CFLAGS $LFS_CFLAGS"
+fi
+
 AC_SYS_LARGEFILE
 
 dnl Add #include for broken IRIX header files
 case "$host_os" in
 	*irix6*) AC_ADD_INCLUDE(<standards.h>)
+		AC_N_DEFINE(_XOPEN_SOURCE,600)
+		AC_N_DEFINE(_BSD_TYPES)
 		;;
 	*hpux*)
 		# mmap on HPUX is completely broken...
@@ -102,25 +112,20 @@ case "$host_os" in
 		;;
 esac
 
+# Do not check for standards.h on darwin, we get nasty warnings on
+# OS/X Lion. Probably a positive-list of OS'es like IRIX and AIX
+# would be the better choice, but this seems to work fine
 
-
-AC_CHECK_HEADERS([standards.h])
+case "$host_os" in
+     *darwin*)
+	;;
+     *)
+        AC_CHECK_HEADERS([standards.h])
+	;;
+esac
 
 # Solaris needs HAVE_LONG_LONG defined
 AC_CHECK_TYPES(long long)
-
-AC_CHECK_TYPE(uint_t, unsigned int)
-AC_CHECK_TYPE(int8_t, char)
-AC_CHECK_TYPE(uint8_t, unsigned char)
-AC_CHECK_TYPE(int16_t, short)
-AC_CHECK_TYPE(uint16_t, unsigned short)
-AC_CHECK_TYPE(int32_t, long)
-AC_CHECK_TYPE(uint32_t, unsigned long)
-AC_CHECK_TYPE(int64_t, long long)
-AC_CHECK_TYPE(uint64_t, unsigned long long)
-
-AC_CHECK_TYPE(size_t, unsigned int)
-AC_CHECK_TYPE(ssize_t, int)
 
 AC_CHECK_SIZEOF(int)
 AC_CHECK_SIZEOF(char)
@@ -128,12 +133,32 @@ AC_CHECK_SIZEOF(short)
 AC_CHECK_SIZEOF(long)
 AC_CHECK_SIZEOF(long long)
 
+AC_CHECK_TYPE(int8_t, char)
+AC_CHECK_TYPE(uint8_t, unsigned char)
+AC_CHECK_TYPE(int16_t, short)
+AC_CHECK_TYPE(uint16_t, unsigned short)
+
+if test $ac_cv_sizeof_int -eq 4 ; then
+AC_CHECK_TYPE(int32_t, int)
+AC_CHECK_TYPE(uint32_t, unsigned int)
+elif test $ac_cv_size_long -eq 4 ; then
+AC_CHECK_TYPE(int32_t, long)
+AC_CHECK_TYPE(uint32_t, unsigned long)
+else
+AC_MSG_ERROR([LIBREPLACE no 32-bit type found])
+fi
+
+AC_CHECK_TYPE(int64_t, long long)
+AC_CHECK_TYPE(uint64_t, unsigned long long)
+
+AC_CHECK_TYPE(size_t, unsigned int)
+AC_CHECK_TYPE(ssize_t, int)
+
 AC_CHECK_SIZEOF(off_t)
 AC_CHECK_SIZEOF(size_t)
 AC_CHECK_SIZEOF(ssize_t)
 
-AC_CHECK_TYPE(intptr_t, unsigned long long)
-AC_CHECK_TYPE(ptrdiff_t, unsigned long long)
+AC_CHECK_TYPES([intptr_t, uintptr_t, ptrdiff_t])
 
 if test x"$ac_cv_type_long_long" != x"yes";then
 	AC_MSG_ERROR([LIBREPLACE needs type 'long long'])
@@ -157,7 +182,8 @@ AC_CACHE_CHECK([for immediate structures],libreplace_cv_immediate_structures,[
 			FOOBAR y; 
 		} f2[] = {
 			{FOO_ONE}
-		};   
+		};
+		static const FOOBAR f3[] = {FOO_ONE};
 	],
 	libreplace_cv_immediate_structures=yes,
 	libreplace_cv_immediate_structures=no,

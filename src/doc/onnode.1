@@ -1,13 +1,22 @@
 '\" t
 .\"     Title: onnode
-.\"    Author: [FIXME: author] [see http://docbook.sf.net/el/author]
-.\" Generator: DocBook XSL Stylesheets v1.75.2 <http://docbook.sf.net/>
-.\"      Date: 02/05/2010
-.\"    Manual:  
-.\"    Source:  
+.\"    Author: 
+.\" Generator: DocBook XSL Stylesheets v1.78.1 <http://docbook.sf.net/>
+.\"      Date: 11/27/2013
+.\"    Manual: CTDB - clustered TDB database
+.\"    Source: ctdb
 .\"  Language: English
 .\"
-.TH "ONNODE" "1" "02/05/2010" "" ""
+.TH "ONNODE" "1" "11/27/2013" "ctdb" "CTDB \- clustered TDB database"
+.\" -----------------------------------------------------------------
+.\" * Define some portability stuff
+.\" -----------------------------------------------------------------
+.\" ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+.\" http://bugs.debian.org/507673
+.\" http://lists.gnu.org/archive/html/groff/2009-02/msg00013.html
+.\" ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+.ie \n(.g .ds Aq \(aq
+.el       .ds Aq '
 .\" -----------------------------------------------------------------
 .\" * set default formatting
 .\" -----------------------------------------------------------------
@@ -19,20 +28,84 @@
 .\" * MAIN CONTENT STARTS HERE *
 .\" -----------------------------------------------------------------
 .SH "NAME"
-onnode \- run commands on ctdb nodes
+onnode \- run commands on CTDB cluster nodes
 .SH "SYNOPSIS"
-.HP \w'\fBonnode\ [OPTION]\ \&.\&.\&.\ NODES\ COMMAND\ \&.\&.\&.\fR\ 'u
-\fBonnode [OPTION] \&.\&.\&. NODES COMMAND \&.\&.\&.\fR
+.HP \w'\fBonnode\fR\ 'u
+\fBonnode\fR [\fIOPTION\fR...] {\fINODES\fR} {\fICOMMAND\fR}
 .SH "DESCRIPTION"
 .PP
 onnode is a utility to run commands on a specific node of a CTDB cluster, or on all nodes\&.
 .PP
-The NODES option specifies which node to run a command on\&. You can specify a numeric node number (from 0 to N\-1) or a descriptive node specification (see DESCRIPTIVE NODE SPECIFICATIONS below)\&. You can also specify lists of nodes, separated by commas, and ranges of numeric node numbers, separated by dashes\&. If nodes are specified multiple times then the command will be executed multiple times on those nodes\&. The order of nodes is significant\&.
+\fINODES\fR
+specifies which node(s) to run a command on\&. See section
+NODES SPECIFICATION
+for details\&.
 .PP
-The COMMAND can be any shell command\&. The onnode utility uses ssh or rsh to connect to the remote nodes and run the command\&.
-.SH "DESCRIPTIVE NODE SPECIFICATIONS"
+\fICOMMAND\fR
+can be any shell command\&. The onnode utility uses ssh or rsh to connect to the remote nodes and run the command\&.
+.SH "OPTIONS"
 .PP
-The following descriptive node specification can be used in place of numeric node numbers:
+\-c
+.RS 4
+Execute COMMAND in the current working directory on the specified nodes\&.
+.RE
+.PP
+\-f \fIFILENAME\fR
+.RS 4
+Specify an alternative nodes FILENAME to use instead of the default\&. This option overrides the CTDB_NODES_FILE environment variable\&. See the discussion of
+/etc/ctdb/nodes
+in the FILES section for more details\&.
+.RE
+.PP
+\-i
+.RS 4
+Keep standard input open, allowing data to be piped to onnode\&. Normally onnode closes stdin to avoid surprises when scripting\&. Note that this option is ignored when using
+\fB\-p\fR
+or if
+\fBSSH\fR
+is set to anything other than "ssh"\&.
+.RE
+.PP
+\-n
+.RS 4
+Allow nodes to be specified by name rather than node numbers\&. These nodes don\*(Aqt need to be listed in the nodes file\&. You can avoid the nodes file entirely by combining this with
+\-f /dev/null\&.
+.RE
+.PP
+\-o \fIPREFIX\fR
+.RS 4
+Causes standard output from each node to be saved into a file with name PREFIX\&.\fIIP\fR\&.
+.RE
+.PP
+\-p
+.RS 4
+Run COMMAND in parallel on the specified nodes\&. The default is to run COMMAND sequentially on each node\&.
+.RE
+.PP
+\-P
+.RS 4
+Push files to nodes\&. Names of files to push are specified rather than the usual command\&. Quoting is fragile/broken \- filenames with whitespace in them are not supported\&.
+.RE
+.PP
+\-q
+.RS 4
+Do not print node addresses\&. Normally, onnode prints informational node addresses if more than one node is specified\&. This overrides \-v\&.
+.RE
+.PP
+\-v
+.RS 4
+Print node addresses even if only one node is specified\&. Normally, onnode prints informational node addresses when more than one node is specified\&.
+.RE
+.PP
+\-h, \-\-help
+.RS 4
+Show a short usage guide\&.
+.RE
+.SH "NODES SPECIFICATION"
+.PP
+Nodes can be specified via numeric node numbers (from 0 to N\-1) or mnemonics\&. Multiple nodes are specified using lists of nodes, separated by commas, and ranges of numeric node numbers, separated by dashes\&. If nodes are specified multiple times then the command will be executed multiple times on those nodes\&. The order of nodes is significant\&.
+.PP
+The following mnemonics are available:
 .PP
 all
 .RS 4
@@ -68,66 +141,22 @@ rm | recmaster
 .RS 4
 The current recovery master\&.
 .RE
-.SH "OPTIONS"
-.PP
-\-c
-.RS 4
-Execute COMMAND in the current working directory on the specified nodes\&.
-.RE
-.PP
-\-o <prefix>
-.RS 4
-Causes standard output from each node to be saved into a file with name <prefix>\&.<ip>\&.
-.RE
-.PP
-\-p
-.RS 4
-Run COMMAND in parallel on the specified nodes\&. The default is to run COMMAND sequentially on each node\&.
-.RE
-.PP
-\-q
-.RS 4
-Do not print node addresses\&. Normally, onnode prints informational node addresses if more than one node is specified\&. This overrides \-v\&.
-.RE
-.PP
-\-n
-.RS 4
-Allow nodes to be specified by name rather than node numbers\&. These nodes don\'t need to be listed in the nodes file\&. You can avoid the nodes file entirely by combining this with
-\-f /dev/null\&.
-.RE
-.PP
-\-f <file>
-.RS 4
-Specify an alternative nodes file to use instead of the default\&. This option overrides the CTDB_NODES_FILE environment variable\&. See the discussion of
-/etc/ctdb/nodes
-in the FILES section for more details\&.
-.RE
-.PP
-\-v
-.RS 4
-Print a node addresses even if only one node is specified\&. Normally, onnode prints informational node addresses when more than one node is specified\&.
-.RE
-.PP
-\-h, \-\-help
-.RS 4
-Show a short usage guide\&.
-.RE
 .SH "EXAMPLES"
 .PP
-The following command would show the process ID of ctdb on all nodes
+The following command would show the process ID of ctdbd on all nodes
 .sp
 .if n \{\
 .RS 4
 .\}
 .nf
-      onnode all pidof ctdbd
+      onnode all ctdb getpid
     
 .fi
 .if n \{\
 .RE
 .\}
 .PP
-The following command would show the last 5 lines of log on each node, preceded by the node\'s hostname
+The following command would show the last 5 lines of log on each node, preceded by the node\*(Aqs hostname
 .sp
 .if n \{\
 .RS 4
@@ -140,13 +169,13 @@ The following command would show the last 5 lines of log on each node, preceded 
 .RE
 .\}
 .PP
-The following command would restart the ctdb service on all nodes\&.
+The following command would restart the ctdb service on all nodes, in parallel\&.
 .sp
 .if n \{\
 .RS 4
 .\}
 .nf
-      onnode all service ctdb restart
+      onnode \-p all service ctdb restart
     
 .fi
 .if n \{\
@@ -167,59 +196,59 @@ The following command would run \&./foo in the current working directory, in par
 .\}
 .SH "ENVIRONMENT"
 .PP
+\fBCTDB_BASE\fR
+.RS 4
+Directory containing CTDB configuration files\&. The default is
+/etc/ctdb\&.
+.RE
+.PP
 \fBCTDB_NODES_FILE\fR
 .RS 4
-Name of alternative nodes file to use instead of the default\&. See the discussion of
-/etc/ctdb/nodes
-in the FILES section for more details\&.
+Name of alternative nodes file to use instead of the default\&. See the
+FILES
+section for more details\&.
 .RE
 .SH "FILES"
 .PP
 /etc/ctdb/nodes
 .RS 4
-Default file containing a list of each node\'s IP address or hostname\&.
+Default file containing a list of each node\*(Aqs IP address or hostname\&.
 .sp
 Actually, the default is
-$\fBCTDB_BASE\fR/nodes, where
-\fB$CTDB_BASE\fR
+$CTDB_BASE/nodes, where
+\fBCTDB_BASE\fR
 defaults to
 /etc/ctdb\&. If a relative path is given (via the \-f option or
-\fB$CTDB_BASE\fR) and no corresponding file exists relative to the current directory then the file is also searched for in the
-$\fBCTDB_BASE\fR
+\fBCTDB_BASE\fR) and no corresponding file exists relative to the current directory then the file is also searched for in the
+$CTDB_BASE
 directory\&.
 .RE
 .PP
 /etc/ctdb/onnode\&.conf
 .RS 4
-If this file exists it is sourced by onnode\&. The main purpose is to allow the administrator to set $SSH to something other than "ssh"\&. In this case the \-t option is ignored\&. For example, the administrator may choose to use use rsh instead of ssh\&.
+If this file exists it is sourced by onnode\&. The main purpose is to allow the administrator to set
+\fBSSH\fR
+to something other than "ssh"\&. In this case the \-t option is ignored\&. For example, the administrator may choose to use use rsh instead of ssh\&.
 .RE
 .SH "SEE ALSO"
 .PP
-ctdbd(1), ctdb(1),
+\fBctdb\fR(7),
 \m[blue]\fB\%http://ctdb.samba.org/\fR\m[]
-.SH "COPYRIGHT/LICENSE"
+.SH "AUTHOR"
+.br
+.PP
+This documentation was written by Andrew Tridgell, Martin Schwenke
+.SH "COPYRIGHT"
+.br
+Copyright \(co 2007 Andrew Tridgell, Ronnie Sahlberg
+.br
+Copyright \(co 2008 Martin Schwenke
+.br
+.PP
+This program is free software; you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation; either version 3 of the License, or (at your option) any later version\&.
+.PP
+This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE\&. See the GNU General Public License for more details\&.
+.PP
+You should have received a copy of the GNU General Public License along with this program; if not, see
+\m[blue]\fB\%http://www.gnu.org/licenses\fR\m[]\&.
 .sp
-.if n \{\
-.RS 4
-.\}
-.nf
-Copyright (C) Andrew Tridgell 2007
-Copyright (C) Ronnie sahlberg 2007
-Copyright (C) Martin Schwenke 2008
-
-This program is free software; you can redistribute it and/or modify
-it under the terms of the GNU General Public License as published by
-the Free Software Foundation; either version 3 of the License, or (at
-your option) any later version\&.
-
-This program is distributed in the hope that it will be useful, but
-WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE\&.  See the GNU
-General Public License for more details\&.
-
-You should have received a copy of the GNU General Public License
-along with this program; if not, see http://www\&.gnu\&.org/licenses/\&.
-.fi
-.if n \{\
-.RE
-.\}

@@ -18,8 +18,7 @@
    along with this program; if not, see <http://www.gnu.org/licenses/>.
 */
 #include "includes.h"
-#include "lib/events/events.h"
-#include "lib/tdb/include/tdb.h"
+#include "tdb.h"
 #include "system/time.h"
 #include "system/network.h"
 #include "system/filesys.h"
@@ -27,80 +26,6 @@
 #include "../include/ctdb_private.h"
 #include "lib/util/dlinklist.h"
 #include "db_wrap.h"
-
-/*
-  lock all databases - mark only
- */
-static int ctdb_lock_all_databases_mark(struct ctdb_context *ctdb, uint32_t priority)
-{
-	struct ctdb_db_context *ctdb_db;
-
-	if ((priority < 1) || (priority > NUM_DB_PRIORITIES)) {
-		DEBUG(DEBUG_ERR,(__location__ " Illegal priority when trying to mark all databases Prio:%u\n", priority));
-		return -1;
-	}
-
-	if (ctdb->freeze_mode[priority] != CTDB_FREEZE_FROZEN) {
-		DEBUG(DEBUG_ERR,("Attempt to mark all databases locked when not frozen\n"));
-		return -1;
-	}
-	/* The dual loop is a woraround for older versions of samba
-	   that does not yet support the set-db-priority/lock order
-	   call. So that we get basic deadlock avoiidance also for
-	   these old versions of samba.
-	   This code will be removed in the future.
-	*/
-	for (ctdb_db=ctdb->db_list;ctdb_db;ctdb_db=ctdb_db->next) {
-		if (ctdb_db->priority != priority) {
-			continue;
-		}
-		if (strstr(ctdb_db->db_name, "notify") != NULL) {
-			continue;
-		}
-		if (tdb_lockall_mark(ctdb_db->ltdb->tdb) != 0) {
-			return -1;
-		}
-	}
-	for (ctdb_db=ctdb->db_list;ctdb_db;ctdb_db=ctdb_db->next) {
-		if (ctdb_db->priority != priority) {
-			continue;
-		}
-		if (strstr(ctdb_db->db_name, "notify") == NULL) {
-			continue;
-		}
-		if (tdb_lockall_mark(ctdb_db->ltdb->tdb) != 0) {
-			return -1;
-		}
-	}
-	return 0;
-}
-
-/*
-  lock all databases - unmark only
- */
-static int ctdb_lock_all_databases_unmark(struct ctdb_context *ctdb, uint32_t priority)
-{
-	struct ctdb_db_context *ctdb_db;
-
-	if ((priority < 1) || (priority > NUM_DB_PRIORITIES)) {
-		DEBUG(DEBUG_ERR,(__location__ " Illegal priority when trying to mark all databases Prio:%u\n", priority));
-		return -1;
-	}
-
-	if (ctdb->freeze_mode[priority] != CTDB_FREEZE_FROZEN) {
-		DEBUG(DEBUG_ERR,("Attempt to unmark all databases locked when not frozen\n"));
-		return -1;
-	}
-	for (ctdb_db=ctdb->db_list;ctdb_db;ctdb_db=ctdb_db->next) {
-		if (ctdb_db->priority != priority) {
-			continue;
-		}
-		if (tdb_lockall_unmark(ctdb_db->ltdb->tdb) != 0) {
-			return -1;
-		}
-	}
-	return 0;
-}
 
 
 int 
@@ -178,7 +103,15 @@ ctdb_control_getdbmap(struct ctdb_context *ctdb, uint32_t opcode, TDB_DATA indat
 	dbid_map->num = len;
 	for (i=0,ctdb_db=ctdb->db_list;ctdb_db;i++,ctdb_db=ctdb_db->next){
 		dbid_map->dbs[i].dbid       = ctdb_db->db_id;
-		dbid_map->dbs[i].persistent = ctdb_db->persistent;
+		if (ctdb_db->persistent != 0) {
+			dbid_map->dbs[i].flags |= CTDB_DB_FLAGS_PERSISTENT;
+		}
+		if (ctdb_db->readonly != 0) {
+			dbid_map->dbs[i].flags |= CTDB_DB_FLAGS_READONLY;
+		}
+		if (ctdb_db->sticky != 0) {
+			dbid_map->dbs[i].flags |= CTDB_DB_FLAGS_STICKY;
+		}
 	}
 
 	return 0;
@@ -322,8 +255,10 @@ ctdb_control_reload_nodes_file(struct ctdb_context *ctdb, uint32_t opcode)
  */
 struct pulldb_data {
 	struct ctdb_context *ctdb;
+	struct ctdb_db_context *ctdb_db;
 	struct ctdb_marshall_buffer *pulldata;
 	uint32_t len;
+	uint32_t allocated_len;
 	bool failed;
 };
 
@@ -331,6 +266,8 @@ static int traverse_pulldb(struct tdb_context *tdb, TDB_DATA key, TDB_DATA data,
 {
 	struct pulldb_data *params = (struct pulldb_data *)p;
 	struct ctdb_rec_data *rec;
+	struct ctdb_context *ctdb = params->ctdb;
+	struct ctdb_db_context *ctdb_db = params->ctdb_db;
 
 	/* add the record to the blob */
 	rec = ctdb_marshall_record(params->pulldata, 0, key, NULL, data);
@@ -338,23 +275,29 @@ static int traverse_pulldb(struct tdb_context *tdb, TDB_DATA key, TDB_DATA data,
 		params->failed = true;
 		return -1;
 	}
-	params->pulldata = talloc_realloc_size(NULL, params->pulldata, rec->length + params->len);
+	if (params->len + rec->length >= params->allocated_len) {
+		params->allocated_len = rec->length + params->len + ctdb->tunable.pulldb_preallocation_size;
+		params->pulldata = talloc_realloc_size(NULL, params->pulldata, params->allocated_len);
+	}
 	if (params->pulldata == NULL) {
-		DEBUG(DEBUG_ERR,(__location__ " Failed to expand pulldb_data to %u (%u records)\n", 
-			 rec->length + params->len, params->pulldata->count));
-		params->failed = true;
-		return -1;
+		DEBUG(DEBUG_CRIT,(__location__ " Failed to expand pulldb_data to %u\n", rec->length + params->len));
+		ctdb_fatal(params->ctdb, "failed to allocate memory for recovery. shutting down\n");
 	}
 	params->pulldata->count++;
 	memcpy(params->len+(uint8_t *)params->pulldata, rec, rec->length);
 	params->len += rec->length;
+
+	if (ctdb->tunable.db_record_size_warn != 0 && rec->length > ctdb->tunable.db_record_size_warn) {
+		DEBUG(DEBUG_ERR,("Data record in %s is big. Record size is %d bytes\n", ctdb_db->db_name, (int)rec->length));
+	}
+
 	talloc_free(rec);
 
 	return 0;
 }
 
 /*
-  pul a bunch of records from a ltdb, filtering by lmaster
+  pull a bunch of records from a ltdb, filtering by lmaster
  */
 int32_t ctdb_control_pull_db(struct ctdb_context *ctdb, TDB_DATA indata, TDB_DATA *outdata)
 {
@@ -382,8 +325,10 @@ int32_t ctdb_control_pull_db(struct ctdb_context *ctdb, TDB_DATA indata, TDB_DAT
 	reply->db_id = pull->db_id;
 
 	params.ctdb = ctdb;
+	params.ctdb_db = ctdb_db;
 	params.pulldata = reply;
 	params.len = offsetof(struct ctdb_marshall_buffer, data);
+	params.allocated_len = params.len;
 	params.failed = false;
 
 	if (ctdb_db->unhealthy_reason) {
@@ -392,22 +337,30 @@ int32_t ctdb_control_pull_db(struct ctdb_context *ctdb, TDB_DATA indata, TDB_DAT
 				     ctdb_db->db_name, ctdb_db->unhealthy_reason));
 	}
 
-	if (ctdb_lock_all_databases_mark(ctdb, ctdb_db->priority) != 0) {
+	if (ctdb_lockall_mark_prio(ctdb, ctdb_db->priority) != 0) {
 		DEBUG(DEBUG_ERR,(__location__ " Failed to get lock on entired db - failing\n"));
 		return -1;
 	}
 
 	if (tdb_traverse_read(ctdb_db->ltdb->tdb, traverse_pulldb, &params) == -1) {
 		DEBUG(DEBUG_ERR,(__location__ " Failed to get traverse db '%s'\n", ctdb_db->db_name));
-		ctdb_lock_all_databases_unmark(ctdb, ctdb_db->priority);
+		ctdb_lockall_unmark_prio(ctdb, ctdb_db->priority);
 		talloc_free(params.pulldata);
 		return -1;
 	}
 
-	ctdb_lock_all_databases_unmark(ctdb, ctdb_db->priority);
+	ctdb_lockall_unmark_prio(ctdb, ctdb_db->priority);
 
 	outdata->dptr = (uint8_t *)params.pulldata;
 	outdata->dsize = params.len;
+
+	if (ctdb->tunable.db_record_count_warn != 0 && params.pulldata->count > ctdb->tunable.db_record_count_warn) {
+		DEBUG(DEBUG_ERR,("Database %s is big. Contains %d records\n", ctdb_db->db_name, params.pulldata->count));
+	}
+	if (ctdb->tunable.db_size_warn != 0 && outdata->dsize > ctdb->tunable.db_size_warn) {
+		DEBUG(DEBUG_ERR,("Database %s is big. Contains %d bytes\n", ctdb_db->db_name, (int)outdata->dsize));
+	}
+
 
 	return 0;
 }
@@ -438,7 +391,7 @@ int32_t ctdb_control_push_db(struct ctdb_context *ctdb, TDB_DATA indata)
 		return -1;
 	}
 
-	if (ctdb_lock_all_databases_mark(ctdb, ctdb_db->priority) != 0) {
+	if (ctdb_lockall_mark_prio(ctdb, ctdb_db->priority) != 0) {
 		DEBUG(DEBUG_ERR,(__location__ " Failed to get lock on entired db - failing\n"));
 		return -1;
 	}
@@ -462,6 +415,11 @@ int32_t ctdb_control_push_db(struct ctdb_context *ctdb, TDB_DATA indata)
 			goto failed;
 		}
 		hdr = (struct ctdb_ltdb_header *)data.dptr;
+		/* strip off any read only record flags. All readonly records
+		   are revoked implicitely by a recovery
+		*/
+		hdr->flags &= ~CTDB_REC_RO_FLAGS;
+
 		data.dptr += sizeof(*hdr);
 		data.dsize -= sizeof(*hdr);
 
@@ -477,65 +435,27 @@ int32_t ctdb_control_push_db(struct ctdb_context *ctdb, TDB_DATA indata)
 	DEBUG(DEBUG_DEBUG,("finished push of %u records for dbid 0x%x\n",
 		 reply->count, reply->db_id));
 
-	ctdb_lock_all_databases_unmark(ctdb, ctdb_db->priority);
+	if (ctdb_db->readonly) {
+		DEBUG(DEBUG_CRIT,("Clearing the tracking database for dbid 0x%x\n",
+				  ctdb_db->db_id));
+		if (tdb_wipe_all(ctdb_db->rottdb) != 0) {
+			DEBUG(DEBUG_ERR,("Failed to wipe tracking database for 0x%x. Dropping read-only delegation support\n", ctdb_db->db_id));
+			ctdb_db->readonly = false;
+			tdb_close(ctdb_db->rottdb);
+			ctdb_db->rottdb = NULL;
+			ctdb_db->readonly = false;
+		}
+		while (ctdb_db->revokechild_active != NULL) {
+			talloc_free(ctdb_db->revokechild_active);
+		}
+	}
+
+	ctdb_lockall_unmark_prio(ctdb, ctdb_db->priority);
 	return 0;
 
 failed:
-	ctdb_lock_all_databases_unmark(ctdb, ctdb_db->priority);
+	ctdb_lockall_unmark_prio(ctdb, ctdb_db->priority);
 	return -1;
-}
-
-
-static int traverse_setdmaster(struct tdb_context *tdb, TDB_DATA key, TDB_DATA data, void *p)
-{
-	uint32_t *dmaster = (uint32_t *)p;
-	struct ctdb_ltdb_header *header = (struct ctdb_ltdb_header *)data.dptr;
-	int ret;
-
-	/* skip if already correct */
-	if (header->dmaster == *dmaster) {
-		return 0;
-	}
-
-	header->dmaster = *dmaster;
-
-	ret = tdb_store(tdb, key, data, TDB_REPLACE);
-	if (ret) {
-		DEBUG(DEBUG_CRIT,(__location__ " failed to write tdb data back  ret:%d\n",ret));
-		return ret;
-	}
-
-	/* TODO: add error checking here */
-
-	return 0;
-}
-
-int32_t ctdb_control_set_dmaster(struct ctdb_context *ctdb, TDB_DATA indata)
-{
-	struct ctdb_control_set_dmaster *p = (struct ctdb_control_set_dmaster *)indata.dptr;
-	struct ctdb_db_context *ctdb_db;
-
-	ctdb_db = find_ctdb_db(ctdb, p->db_id);
-	if (!ctdb_db) {
-		DEBUG(DEBUG_ERR,(__location__ " Unknown db 0x%08x\n", p->db_id));
-		return -1;
-	}
-
-	if (ctdb->freeze_mode[ctdb_db->priority] != CTDB_FREEZE_FROZEN) {
-		DEBUG(DEBUG_DEBUG,("rejecting ctdb_control_set_dmaster when not frozen\n"));
-		return -1;
-	}
-
-	if (ctdb_lock_all_databases_mark(ctdb, 	ctdb_db->priority) != 0) {
-		DEBUG(DEBUG_ERR,(__location__ " Failed to get lock on entired db - failing\n"));
-		return -1;
-	}
-
-	tdb_traverse(ctdb_db->ltdb->tdb, traverse_setdmaster, &p->dmaster);
-
-	ctdb_lock_all_databases_unmark(ctdb, ctdb_db->priority);
-	
-	return 0;
 }
 
 struct ctdb_set_recmode_state {
@@ -577,7 +497,7 @@ static int set_recmode_destructor(struct ctdb_set_recmode_state *state)
 {
 	double l = timeval_elapsed(&state->start_time);
 
-	ctdb_reclock_latency(state->ctdb, "daemon reclock", &state->ctdb->statistics.reclock.ctdbd, l);
+	CTDB_UPDATE_RECLOCK_LATENCY(state->ctdb, "daemon reclock", reclock.ctdbd, l);
 
 	if (state->fd[0] != -1) {
 		state->fd[0] = -1;
@@ -585,7 +505,7 @@ static int set_recmode_destructor(struct ctdb_set_recmode_state *state)
 	if (state->fd[1] != -1) {
 		state->fd[1] = -1;
 	}
-	kill(state->child, SIGKILL);
+	ctdb_kill(state->ctdb, state->child, SIGKILL);
 	return 0;
 }
 
@@ -623,6 +543,11 @@ static void set_recmode_handler(struct event_context *ev, struct fd_event *fde,
 
 	state->ctdb->recovery_mode = state->recmode;
 
+	/* release any deferred attach calls from clients */
+	if (state->recmode == CTDB_RECOVERY_NORMAL) {
+		ctdb_process_deferred_attach(state->ctdb);
+	}
+
 	ctdb_request_control_reply(state->ctdb, state->c, NULL, 0, NULL);
 	talloc_free(state);
 	return;
@@ -639,6 +564,22 @@ ctdb_drop_all_ips_event(struct event_context *ev, struct timed_event *te,
 	ctdb->release_ips_ctx = NULL;
 
 	ctdb_release_all_ips(ctdb);
+}
+
+/*
+ * Set up an event to drop all public ips if we remain in recovery for too
+ * long
+ */
+int ctdb_deferred_drop_all_ips(struct ctdb_context *ctdb)
+{
+	if (ctdb->release_ips_ctx != NULL) {
+		talloc_free(ctdb->release_ips_ctx);
+	}
+	ctdb->release_ips_ctx = talloc_new(ctdb);
+	CTDB_NO_MEMORY(ctdb, ctdb->release_ips_ctx);
+
+	event_add_timed(ctdb->ev, ctdb->release_ips_ctx, timeval_current_ofs(ctdb->tunable.recovery_drop_all_ips, 0), ctdb_drop_all_ips_event, ctdb);
+	return 0;
 }
 
 /*
@@ -661,11 +602,9 @@ int32_t ctdb_control_set_recmode(struct ctdb_context *ctdb,
 		talloc_free(ctdb->release_ips_ctx);
 		ctdb->release_ips_ctx = NULL;
 	} else {
-		talloc_free(ctdb->release_ips_ctx);
-		ctdb->release_ips_ctx = talloc_new(ctdb);
-		CTDB_NO_MEMORY(ctdb, ctdb->release_ips_ctx);
-
-		event_add_timed(ctdb->ev, ctdb->release_ips_ctx, timeval_current_ofs(ctdb->tunable.recovery_drop_all_ips, 0), ctdb_drop_all_ips_event, ctdb);
+		if (ctdb_deferred_drop_all_ips(ctdb) != 0) {
+			DEBUG(DEBUG_ERR,("Failed to set up deferred drop all ips\n"));
+		}
 	}
 
 	if (recmode != ctdb->recovery_mode) {
@@ -695,6 +634,11 @@ int32_t ctdb_control_set_recmode(struct ctdb_context *ctdb,
 	state->fd[0] = -1;
 	state->fd[1] = -1;
 
+	/* release any deferred attach calls from clients */
+	if (recmode == CTDB_RECOVERY_NORMAL) {
+		ctdb_process_deferred_attach(ctdb);
+	}
+
 	if (ctdb->tunable.verify_recovery_lock == 0) {
 		/* dont need to verify the reclock file */
 		ctdb->recovery_mode = recmode;
@@ -713,7 +657,7 @@ int32_t ctdb_control_set_recmode(struct ctdb_context *ctdb,
 		return -1;
 	}
 
-	state->child = fork();
+	state->child = ctdb_fork(ctdb);
 	if (state->child == (pid_t)-1) {
 		close(state->fd[0]);
 		close(state->fd[1]);
@@ -725,6 +669,8 @@ int32_t ctdb_control_set_recmode(struct ctdb_context *ctdb,
 		char cc = 0;
 		close(state->fd[0]);
 
+		ctdb_set_process_name("ctdb_recmode");
+		debug_extra = talloc_asprintf(NULL, "set_recmode:");
 		/* we should not be able to get the lock on the reclock file, 
 		  as it should  be held by the recovery master 
 		*/
@@ -735,7 +681,7 @@ int32_t ctdb_control_set_recmode(struct ctdb_context *ctdb,
 
 		write(state->fd[1], &cc, 1);
 		/* make sure we die when our parent dies */
-		while (kill(parent, 0) == 0 || errno != ESRCH) {
+		while (ctdb_kill(ctdb, parent, 0) == 0 || errno != ESRCH) {
 			sleep(5);
 			write(state->fd[1], &cc, 1);
 		}
@@ -754,7 +700,7 @@ int32_t ctdb_control_set_recmode(struct ctdb_context *ctdb,
 				    ctdb_set_recmode_timeout, state);
 
 	state->fde = event_add_fd(ctdb->ev, state, state->fd[0],
-				EVENT_FD_READ|EVENT_FD_AUTOCLOSE,
+				EVENT_FD_READ,
 				set_recmode_handler,
 				(void *)state);
 
@@ -762,6 +708,7 @@ int32_t ctdb_control_set_recmode(struct ctdb_context *ctdb,
 		talloc_free(state);
 		return -1;
 	}
+	tevent_fd_set_auto_close(state->fde);
 
 	state->ctdb    = ctdb;
 	state->recmode = recmode;
@@ -819,7 +766,7 @@ bool ctdb_recovery_lock(struct ctdb_context *ctdb, bool keep)
 	}
 
 	if (keep) {
-		DEBUG(DEBUG_ERR, ("Recovery lock taken successfully\n"));
+		DEBUG(DEBUG_NOTICE, ("Recovery lock taken successfully\n"));
 	}
 
 	DEBUG(DEBUG_NOTICE,("ctdb_recovery_lock: Got recovery lock on '%s'\n", ctdb->recovery_lock_file));
@@ -838,7 +785,7 @@ bool ctdb_recovery_lock(struct ctdb_context *ctdb, bool keep)
  */
 static int delete_tdb_record(struct ctdb_context *ctdb, struct ctdb_db_context *ctdb_db, struct ctdb_rec_data *rec)
 {
-	TDB_DATA key, data;
+	TDB_DATA key, data, data2;
 	struct ctdb_ltdb_header *hdr, *hdr2;
 	
 	/* these are really internal tdb functions - but we need them here for
@@ -869,58 +816,74 @@ static int delete_tdb_record(struct ctdb_context *ctdb, struct ctdb_db_context *
 		return -1;
 	}
 
-	data = tdb_fetch(ctdb_db->ltdb->tdb, key);
-	if (data.dptr == NULL) {
+	data2 = tdb_fetch(ctdb_db->ltdb->tdb, key);
+	if (data2.dptr == NULL) {
 		tdb_chainunlock(ctdb_db->ltdb->tdb, key);
 		return 0;
 	}
 
-	if (data.dsize < sizeof(struct ctdb_ltdb_header)) {
+	if (data2.dsize < sizeof(struct ctdb_ltdb_header)) {
 		if (tdb_lock_nonblock(ctdb_db->ltdb->tdb, -1, F_WRLCK) == 0) {
-			tdb_delete(ctdb_db->ltdb->tdb, key);
+			if (tdb_delete(ctdb_db->ltdb->tdb, key) != 0) {
+				DEBUG(DEBUG_CRIT,(__location__ " Failed to delete corrupt record\n"));
+			}
 			tdb_unlock(ctdb_db->ltdb->tdb, -1, F_WRLCK);
 			DEBUG(DEBUG_CRIT,(__location__ " Deleted corrupt record\n"));
 		}
 		tdb_chainunlock(ctdb_db->ltdb->tdb, key);
-		free(data.dptr);
+		free(data2.dptr);
 		return 0;
 	}
 	
-	hdr2 = (struct ctdb_ltdb_header *)data.dptr;
+	hdr2 = (struct ctdb_ltdb_header *)data2.dptr;
 
 	if (hdr2->rsn > hdr->rsn) {
 		tdb_chainunlock(ctdb_db->ltdb->tdb, key);
 		DEBUG(DEBUG_INFO,(__location__ " Skipping record with rsn=%llu - called with rsn=%llu\n",
 			 (unsigned long long)hdr2->rsn, (unsigned long long)hdr->rsn));
-		free(data.dptr);
-		return -1;		
+		free(data2.dptr);
+		return -1;
+	}
+
+	/* do not allow deleting record that have readonly flags set. */
+	if (hdr->flags & CTDB_REC_RO_FLAGS) {
+		tdb_chainunlock(ctdb_db->ltdb->tdb, key);
+		DEBUG(DEBUG_INFO,(__location__ " Skipping record with readonly flags set\n"));
+		free(data2.dptr);
+		return -1;
+	}
+	if (hdr2->flags & CTDB_REC_RO_FLAGS) {
+		tdb_chainunlock(ctdb_db->ltdb->tdb, key);
+		DEBUG(DEBUG_INFO,(__location__ " Skipping record with readonly flags set\n"));
+		free(data2.dptr);
+		return -1;
 	}
 
 	if (hdr2->dmaster == ctdb->pnn) {
 		tdb_chainunlock(ctdb_db->ltdb->tdb, key);
 		DEBUG(DEBUG_INFO,(__location__ " Attempted delete record where we are the dmaster\n"));
-		free(data.dptr);
-		return -1;				
+		free(data2.dptr);
+		return -1;
 	}
 
 	if (tdb_lock_nonblock(ctdb_db->ltdb->tdb, -1, F_WRLCK) != 0) {
 		tdb_chainunlock(ctdb_db->ltdb->tdb, key);
-		free(data.dptr);
-		return -1;				
+		free(data2.dptr);
+		return -1;
 	}
 
 	if (tdb_delete(ctdb_db->ltdb->tdb, key) != 0) {
 		tdb_unlock(ctdb_db->ltdb->tdb, -1, F_WRLCK);
 		tdb_chainunlock(ctdb_db->ltdb->tdb, key);
 		DEBUG(DEBUG_INFO,(__location__ " Failed to delete record\n"));
-		free(data.dptr);
-		return -1;						
+		free(data2.dptr);
+		return -1;
 	}
 
 	tdb_unlock(ctdb_db->ltdb->tdb, -1, F_WRLCK);
 	tdb_chainunlock(ctdb_db->ltdb->tdb, key);
-	free(data.dptr);
-	return 0;	
+	free(data2.dptr);
+	return 0;
 }
 
 
@@ -938,6 +901,7 @@ static void ctdb_end_recovery_callback(struct ctdb_context *ctdb, int status, vo
 	struct recovery_callback_state *state = talloc_get_type(p, struct recovery_callback_state);
 
 	ctdb_enable_monitoring(ctdb);
+	CTDB_INCREMENT_STAT(ctdb, num_recoveries);
 
 	if (status != 0) {
 		DEBUG(DEBUG_ERR,(__location__ " recovered event script failed (status %d)\n", status));
@@ -950,6 +914,10 @@ static void ctdb_end_recovery_callback(struct ctdb_context *ctdb, int status, vo
 	talloc_free(state);
 
 	gettimeofday(&ctdb->last_recovery_finished, NULL);
+
+	if (ctdb->runstate == CTDB_RUNSTATE_FIRST_RECOVERY) {
+		ctdb_set_runstate(ctdb, CTDB_RUNSTATE_STARTUP);
+	}
 }
 
 /*
@@ -1131,6 +1099,206 @@ int32_t ctdb_control_try_delete_records(struct ctdb_context *ctdb, TDB_DATA inda
 	return 0;
 }
 
+/**
+ * Store a record as part of the vacuum process:
+ * This is called from the RECEIVE_RECORD control which
+ * the lmaster uses to send the current empty copy
+ * to all nodes for storing, before it lets the other
+ * nodes delete the records in the second phase with
+ * the TRY_DELETE_RECORDS control.
+ *
+ * Only store if we are not lmaster or dmaster, and our
+ * rsn is <= the provided rsn. Use non-blocking locks.
+ *
+ * return 0 if the record was successfully stored.
+ * return !0 if the record still exists in the tdb after returning.
+ */
+static int store_tdb_record(struct ctdb_context *ctdb,
+			    struct ctdb_db_context *ctdb_db,
+			    struct ctdb_rec_data *rec)
+{
+	TDB_DATA key, data, data2;
+	struct ctdb_ltdb_header *hdr, *hdr2;
+	int ret;
+
+	key.dsize = rec->keylen;
+	key.dptr = &rec->data[0];
+	data.dsize = rec->datalen;
+	data.dptr = &rec->data[rec->keylen];
+
+	if (ctdb_lmaster(ctdb, &key) == ctdb->pnn) {
+		DEBUG(DEBUG_INFO, (__location__ " Called store_tdb_record "
+				   "where we are lmaster\n"));
+		return -1;
+	}
+
+	if (data.dsize != sizeof(struct ctdb_ltdb_header)) {
+		DEBUG(DEBUG_ERR, (__location__ " Bad record size\n"));
+		return -1;
+	}
+
+	hdr = (struct ctdb_ltdb_header *)data.dptr;
+
+	/* use a non-blocking lock */
+	if (tdb_chainlock_nonblock(ctdb_db->ltdb->tdb, key) != 0) {
+		DEBUG(DEBUG_INFO, (__location__ " Failed to lock chain in non-blocking mode\n"));
+		return -1;
+	}
+
+	data2 = tdb_fetch(ctdb_db->ltdb->tdb, key);
+	if (data2.dptr == NULL || data2.dsize < sizeof(struct ctdb_ltdb_header)) {
+		if (tdb_store(ctdb_db->ltdb->tdb, key, data, 0) == -1) {
+			DEBUG(DEBUG_ERR, (__location__ "Failed to store record\n"));
+			ret = -1;
+			goto done;
+		}
+		DEBUG(DEBUG_INFO, (__location__ " Stored record\n"));
+		ret = 0;
+		goto done;
+	}
+
+	hdr2 = (struct ctdb_ltdb_header *)data2.dptr;
+
+	if (hdr2->rsn > hdr->rsn) {
+		DEBUG(DEBUG_INFO, (__location__ " Skipping record with "
+				   "rsn=%llu - called with rsn=%llu\n",
+				   (unsigned long long)hdr2->rsn,
+				   (unsigned long long)hdr->rsn));
+		ret = -1;
+		goto done;
+	}
+
+	/* do not allow vacuuming of records that have readonly flags set. */
+	if (hdr->flags & CTDB_REC_RO_FLAGS) {
+		DEBUG(DEBUG_INFO,(__location__ " Skipping record with readonly "
+				  "flags set\n"));
+		ret = -1;
+		goto done;
+	}
+	if (hdr2->flags & CTDB_REC_RO_FLAGS) {
+		DEBUG(DEBUG_INFO,(__location__ " Skipping record with readonly "
+				  "flags set\n"));
+		ret = -1;
+		goto done;
+	}
+
+	if (hdr2->dmaster == ctdb->pnn) {
+		DEBUG(DEBUG_INFO, (__location__ " Attempted to store record "
+				   "where we are the dmaster\n"));
+		ret = -1;
+		goto done;
+	}
+
+	if (tdb_store(ctdb_db->ltdb->tdb, key, data, 0) != 0) {
+		DEBUG(DEBUG_INFO,(__location__ " Failed to store record\n"));
+		ret = -1;
+		goto done;
+	}
+
+	ret = 0;
+
+done:
+	tdb_chainunlock(ctdb_db->ltdb->tdb, key);
+	free(data2.dptr);
+	return  ret;
+}
+
+
+
+/**
+ * Try to store all these records as part of the vacuuming process
+ * and return the records we failed to store.
+ */
+int32_t ctdb_control_receive_records(struct ctdb_context *ctdb,
+				     TDB_DATA indata, TDB_DATA *outdata)
+{
+	struct ctdb_marshall_buffer *reply = (struct ctdb_marshall_buffer *)indata.dptr;
+	struct ctdb_db_context *ctdb_db;
+	int i;
+	struct ctdb_rec_data *rec;
+	struct ctdb_marshall_buffer *records;
+
+	if (indata.dsize < offsetof(struct ctdb_marshall_buffer, data)) {
+		DEBUG(DEBUG_ERR,
+		      (__location__ " invalid data in receive_records\n"));
+		return -1;
+	}
+
+	ctdb_db = find_ctdb_db(ctdb, reply->db_id);
+	if (!ctdb_db) {
+		DEBUG(DEBUG_ERR, (__location__ " Unknown db 0x%08x\n",
+				  reply->db_id));
+		return -1;
+	}
+
+	DEBUG(DEBUG_DEBUG, ("starting receive_records of %u records for "
+			    "dbid 0x%x\n", reply->count, reply->db_id));
+
+	/* create a blob to send back the records we could not store */
+	records = (struct ctdb_marshall_buffer *)
+			talloc_zero_size(outdata,
+				offsetof(struct ctdb_marshall_buffer, data));
+	if (records == NULL) {
+		DEBUG(DEBUG_ERR, (__location__ " Out of memory\n"));
+		return -1;
+	}
+	records->db_id = ctdb_db->db_id;
+
+	rec = (struct ctdb_rec_data *)&reply->data[0];
+	for (i=0; i<reply->count; i++) {
+		TDB_DATA key, data;
+
+		key.dptr = &rec->data[0];
+		key.dsize = rec->keylen;
+		data.dptr = &rec->data[key.dsize];
+		data.dsize = rec->datalen;
+
+		if (data.dsize < sizeof(struct ctdb_ltdb_header)) {
+			DEBUG(DEBUG_CRIT, (__location__ " bad ltdb record "
+					   "in indata\n"));
+			return -1;
+		}
+
+		/*
+		 * If we can not store the record we must add it to the reply
+		 * so the lmaster knows it may not purge this record.
+		 */
+		if (store_tdb_record(ctdb, ctdb_db, rec) != 0) {
+			size_t old_size;
+			struct ctdb_ltdb_header *hdr;
+
+			hdr = (struct ctdb_ltdb_header *)data.dptr;
+			data.dptr += sizeof(*hdr);
+			data.dsize -= sizeof(*hdr);
+
+			DEBUG(DEBUG_INFO, (__location__ " Failed to store "
+					   "record with hash 0x%08x in vacuum "
+					   "via RECEIVE_RECORDS\n",
+					   ctdb_hash(&key)));
+
+			old_size = talloc_get_size(records);
+			records = talloc_realloc_size(outdata, records,
+						      old_size + rec->length);
+			if (records == NULL) {
+				DEBUG(DEBUG_ERR, (__location__ " Failed to "
+						  "expand\n"));
+				return -1;
+			}
+			records->count++;
+			memcpy(old_size+(uint8_t *)records, rec, rec->length);
+		}
+
+		rec = (struct ctdb_rec_data *)(rec->length + (uint8_t *)rec);
+	}
+
+
+	outdata->dptr = (uint8_t *)records;
+	outdata->dsize = talloc_get_size(records);
+
+	return 0;
+}
+
+
 /*
   report capabilities
  */
@@ -1148,6 +1316,10 @@ int32_t ctdb_control_get_capabilities(struct ctdb_context *ctdb, TDB_DATA *outda
 	return 0;	
 }
 
+/* The recovery daemon will ping us at regular intervals.
+   If we havent been pinged for a while we assume the recovery
+   daemon is inoperable and we restart.
+*/
 static void ctdb_recd_ping_timeout(struct event_context *ev, struct timed_event *te, struct timeval t, void *p)
 {
 	struct ctdb_context *ctdb = talloc_get_type(p, struct ctdb_context);
@@ -1163,24 +1335,12 @@ static void ctdb_recd_ping_timeout(struct event_context *ev, struct timed_event 
 		return;
 	}
 
-	DEBUG(DEBUG_ERR, ("Final timeout for recovery daemon ping. Shutting down ctdb daemon. (This can be caused if the cluster filesystem has hung)\n"));
+	DEBUG(DEBUG_ERR, ("Final timeout for recovery daemon ping. Restarting recovery daemon. (This can be caused if the cluster filesystem has hung)\n"));
 
 	ctdb_stop_recoverd(ctdb);
-	ctdb_stop_keepalive(ctdb);
-	ctdb_stop_monitoring(ctdb);
-	ctdb_release_all_ips(ctdb);
-	if (ctdb->methods != NULL) {
-		ctdb->methods->shutdown(ctdb);
-	}
-	ctdb_event_script(ctdb, CTDB_EVENT_SHUTDOWN);
-	DEBUG(DEBUG_ERR, ("Recovery daemon ping timeout. Daemon has been shut down.\n"));
-	exit(0);
+	ctdb_start_recoverd(ctdb);
 }
 
-/* The recovery daemon will ping us at regular intervals.
-   If we havent been pinged for a while we assume the recovery
-   daemon is inoperable and we shut down.
-*/
 int32_t ctdb_control_recd_ping(struct ctdb_context *ctdb)
 {
 	talloc_free(ctdb->recd_ping_count);
@@ -1201,74 +1361,40 @@ int32_t ctdb_control_recd_ping(struct ctdb_context *ctdb)
 
 int32_t ctdb_control_set_recmaster(struct ctdb_context *ctdb, uint32_t opcode, TDB_DATA indata)
 {
-	CHECK_CONTROL_DATA_SIZE(sizeof(uint32_t));
+	uint32_t new_recmaster;
 
-	ctdb->recovery_master = ((uint32_t *)(&indata.dptr[0]))[0];
+	CHECK_CONTROL_DATA_SIZE(sizeof(uint32_t));
+	new_recmaster = ((uint32_t *)(&indata.dptr[0]))[0];
+
+	if (ctdb->pnn != new_recmaster && ctdb->recovery_master == ctdb->pnn) {
+		DEBUG(DEBUG_NOTICE,
+		      ("This node (%u) is no longer the recovery master\n", ctdb->pnn));
+	}
+
+	if (ctdb->pnn == new_recmaster && ctdb->recovery_master != new_recmaster) {
+		DEBUG(DEBUG_NOTICE,
+		      ("This node (%u) is now the recovery master\n", ctdb->pnn));
+	}
+
+	ctdb->recovery_master = new_recmaster;
 	return 0;
 }
 
 
-struct stop_node_callback_state {
-	struct ctdb_req_control *c;
-};
-
-/*
-  called when the 'stopped' event script has finished
- */
-static void ctdb_stop_node_callback(struct ctdb_context *ctdb, int status, void *p)
+int32_t ctdb_control_stop_node(struct ctdb_context *ctdb)
 {
-	struct stop_node_callback_state *state = talloc_get_type(p, struct stop_node_callback_state);
-
-	if (status != 0) {
-		DEBUG(DEBUG_ERR,(__location__ " stopped event script failed (status %d)\n", status));
-		ctdb->nodes[ctdb->pnn]->flags &= ~NODE_FLAGS_STOPPED;
-		if (status == -ETIME) {
-			ctdb_ban_self(ctdb);
-		}
-	}
-
-	ctdb_request_control_reply(ctdb, state->c, NULL, status, NULL);
-	talloc_free(state);
-}
-
-int32_t ctdb_control_stop_node(struct ctdb_context *ctdb, struct ctdb_req_control *c, bool *async_reply)
-{
-	int ret;
-	struct stop_node_callback_state *state;
-
-	DEBUG(DEBUG_INFO,(__location__ " Stopping node\n"));
-
-	state = talloc(ctdb, struct stop_node_callback_state);
-	CTDB_NO_MEMORY(ctdb, state);
-
-	state->c    = talloc_steal(state, c);
-
+	DEBUG(DEBUG_NOTICE, ("Stopping node\n"));
 	ctdb_disable_monitoring(ctdb);
-
-	ret = ctdb_event_script_callback(ctdb, state,
-					 ctdb_stop_node_callback, 
-					 state, false,
-					 CTDB_EVENT_STOPPED, "%s", "");
-
-	if (ret != 0) {
-		ctdb_enable_monitoring(ctdb);
-
-		DEBUG(DEBUG_ERR,(__location__ " Failed to stop node\n"));
-		talloc_free(state);
-		return -1;
-	}
-
 	ctdb->nodes[ctdb->pnn]->flags |= NODE_FLAGS_STOPPED;
-
-	*async_reply = true;
 
 	return 0;
 }
 
 int32_t ctdb_control_continue_node(struct ctdb_context *ctdb)
 {
-	DEBUG(DEBUG_INFO,(__location__ " Continue node\n"));
+	DEBUG(DEBUG_NOTICE, ("Continue node\n"));
 	ctdb->nodes[ctdb->pnn]->flags &= ~NODE_FLAGS_STOPPED;
 
 	return 0;
 }
+

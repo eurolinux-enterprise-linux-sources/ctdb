@@ -21,7 +21,6 @@
  */
 
 #include "includes.h"
-#include "lib/events/events.h"
 #include <system/network.h>
 #include <assert.h>
 #include "ctdb_private.h"

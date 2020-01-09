@@ -1,11 +1,11 @@
+%define with_systemd  %{?_with_systemd: 1} %{?!_with_systemd: 0}
 %define initdir %{_sysconfdir}/init.d
-
+Name: ctdb
 Summary: Clustered TDB
 Vendor: Samba Team
 Packager: Samba Team <samba@samba.org>
-Name: ctdb
-Version: 1.0.114.5
-Release: 1GITHASH
+Version: @VERSION@
+Release: @RELEASE@
 Epoch: 0
 License: GNU GPL version 3
 Group: System Environment/Daemons
@@ -13,19 +13,59 @@ URL: http://ctdb.samba.org/
 
 Source: ctdb-%{version}.tar.gz
 
-Prereq: /bin/mktemp /usr/bin/killall
-Prereq: fileutils sed /etc/init.d
+# Packages
+Requires: coreutils, sed, gawk, iptables, iproute, procps, ethtool, sudo
+# Commands - package name might vary
+Requires: /usr/bin/killall, /bin/kill, /bin/netstat
 
 Provides: ctdb = %{version}
 
 Prefix: /usr
 BuildRoot: %{_tmppath}/%{name}-%{version}-root
 
+# Allow build with system libraries
+# To enable, run rpmbuild with,
+#      "--with system_talloc"
+#      "--with system_tdb"
+#      "--with system_tevent"
+%define with_included_talloc %{?_with_system_talloc: 0} %{?!_with_system_talloc: 1}
+%define with_included_tdb %{?_with_system_tdb: 0} %{?!_with_system_tdb: 1}
+%define with_included_tevent %{?_with_system_tevent: 0} %{?!_with_system_tevent: 1}
+
+# Required minimum library versions when building with system libraries
+%define libtalloc_version 2.0.8
+%define libtdb_version 1.2.11
+%define libtevent_version 0.9.18
+
+%if ! %with_included_talloc
+BuildRequires: libtalloc-devel >= %{libtalloc_version}
+Requires: libtalloc >= %{libtalloc_version}
+%endif
+%if ! %with_included_tdb
+BuildRequires: libtdb-devel >= %{libtdb_version}
+Requires: libtdb >= %{libtdb_version}
+%endif
+%if ! %with_included_tevent
+BuildRequires: libtevent-devel >= %{libtevent_version}
+Requires: libtevent >= %{libtevent_version}
+%endif
+
+# To build the ctdb-pcp-pmda package, run rpmbuild with "--with pmda"
+%define with_pcp_pmda  %{?_with_pmda: 1} %{?!_with_pmda: 0}
+%if %with_pcp_pmda
+BuildRequires: pcp-libs-devel
+%endif
+
+%if %{with_systemd}
+BuildRequires: systemd-units
+%endif
+
 %description
 ctdb is the clustered database used by samba
 
-
 #######################################################################
+
+
 
 %prep
 %setup -q
@@ -46,7 +86,19 @@ export CC
 ## always run autogen.sh
 ./autogen.sh
 
-CFLAGS="$RPM_OPT_FLAGS $EXTRA -O0 -D_GNU_SOURCE -DCTDB_VERS=\"%{version}-%{release}\"" ./configure \
+CFLAGS="$RPM_OPT_FLAGS $EXTRA -D_GNU_SOURCE" ./configure \
+%if %with_included_talloc
+	--with-included-talloc \
+%endif
+%if %with_included_tdb
+	--with-included-tdb \
+%endif
+%if %with_included_tevent
+	--with-included-tevent \
+%endif
+%if %with_pcp_pmda
+	--enable-pmda \
+%endif
 	--prefix=%{_prefix} \
 	--sysconfdir=%{_sysconfdir} \
 	--mandir=%{_mandir} \
@@ -61,15 +113,22 @@ rm -rf $RPM_BUILD_ROOT
 
 # Create the target build directory hierarchy
 mkdir -p $RPM_BUILD_ROOT%{_sysconfdir}/sysconfig
-mkdir -p $RPM_BUILD_ROOT%{_sysconfdir}/init.d
+mkdir -p $RPM_BUILD_ROOT%{_sysconfdir}/sudoers.d
 
-make DESTDIR=$RPM_BUILD_ROOT docdir=%{_docdir} install
+make DESTDIR=$RPM_BUILD_ROOT docdir=%{_docdir} install install_tests
 
 install -m644 config/ctdb.sysconfig $RPM_BUILD_ROOT%{_sysconfdir}/sysconfig/ctdb
-install -m755 config/ctdb.init $RPM_BUILD_ROOT%{initdir}/ctdb
 
-mkdir -p $RPM_BUILD_ROOT%{_docdir}/ctdb/tests/bin
-install -m755 tests/bin/ctdb_transaction $RPM_BUILD_ROOT%{_docdir}/ctdb/tests/bin
+%if %{with_systemd}
+mkdir -p $RPM_BUILD_ROOT%{_unitdir}
+install -m 755 config/ctdb.service $RPM_BUILD_ROOT%{_unitdir}
+%else
+mkdir -p $RPM_BUILD_ROOT%{initdir}
+install -m755 config/ctdb.init $RPM_BUILD_ROOT%{initdir}/ctdb
+%endif
+
+cp config/events.d/README README.eventscripts
+cp config/notify.d.README README.notify.d
 
 # Remove "*.old" files
 find $RPM_BUILD_ROOT -name "*.old" -exec rm -f {} \;
@@ -87,11 +146,26 @@ rm -rf $RPM_BUILD_ROOT
 
 %config(noreplace) %{_sysconfdir}/sysconfig/ctdb
 %config(noreplace) %{_sysconfdir}/ctdb/notify.sh
-%config(noreplace) %{_sysconfdir}/ctdb/functions
-%attr(755,root,root) %{initdir}/ctdb
+%config(noreplace) %{_sysconfdir}/ctdb/debug-hung-script.sh
+%config(noreplace) %{_sysconfdir}/ctdb/ctdb-crash-cleanup.sh
+%config(noreplace) %{_sysconfdir}/ctdb/gcore_trace.sh
+%config(noreplace) %{_sysconfdir}/ctdb/debug_locks.sh
 
-%{_docdir}/ctdb/README.eventscripts
-%{_docdir}/ctdb/recovery-process.txt
+%if %{with_systemd}
+%{_unitdir}/ctdb.service
+%else
+%attr(755,root,root) %{initdir}/ctdb
+%endif
+
+%attr(755,root,root) %{_sysconfdir}/ctdb/notify.d
+
+%doc README COPYING NEWS
+%doc README.eventscripts README.notify.d
+%doc doc/recovery-process.txt
+%doc doc/*.html
+%doc doc/examples
+%{_sysconfdir}/sudoers.d/ctdb
+%{_sysconfdir}/ctdb/functions
 %{_sysconfdir}/ctdb/events.d/00.ctdb
 %{_sysconfdir}/ctdb/events.d/01.reclock
 %{_sysconfdir}/ctdb/events.d/10.interface
@@ -100,17 +174,27 @@ rm -rf $RPM_BUILD_ROOT
 %{_sysconfdir}/ctdb/events.d/11.routing
 %{_sysconfdir}/ctdb/events.d/20.multipathd
 %{_sysconfdir}/ctdb/events.d/31.clamd
+%{_sysconfdir}/ctdb/events.d/40.fs_use
 %{_sysconfdir}/ctdb/events.d/40.vsftpd
 %{_sysconfdir}/ctdb/events.d/41.httpd
+%{_sysconfdir}/ctdb/events.d/49.winbind
 %{_sysconfdir}/ctdb/events.d/50.samba
 %{_sysconfdir}/ctdb/events.d/60.nfs
-%{_sysconfdir}/ctdb/events.d/61.nfstickle
+%{_sysconfdir}/ctdb/events.d/60.ganesha
+%{_sysconfdir}/ctdb/events.d/62.cnfs
 %{_sysconfdir}/ctdb/events.d/70.iscsi
 %{_sysconfdir}/ctdb/events.d/91.lvs
+%{_sysconfdir}/ctdb/events.d/99.timeout
+%config(noreplace) %{_sysconfdir}/ctdb/nfs-rpc-checks.d/10.statd.check
+%config(noreplace) %{_sysconfdir}/ctdb/nfs-rpc-checks.d/20.nfsd.check
+%config(noreplace) %{_sysconfdir}/ctdb/nfs-rpc-checks.d/30.lockd.check
+%config(noreplace) %{_sysconfdir}/ctdb/nfs-rpc-checks.d/40.mountd.check
+%config(noreplace) %{_sysconfdir}/ctdb/nfs-rpc-checks.d/50.rquotad.check
 %{_sysconfdir}/ctdb/statd-callout
-%{_sysconfdir}/ctdb/interface_modify.sh
 %{_sbindir}/ctdbd
+%{_sbindir}/ctdbd_wrapper
 %{_bindir}/ctdb
+%{_bindir}/ctdb_lock_helper
 %{_bindir}/smnotify
 %{_bindir}/ping_pong
 %{_bindir}/ltdbtool
@@ -120,43 +204,92 @@ rm -rf $RPM_BUILD_ROOT
 %{_mandir}/man1/ctdbd.1.gz
 %{_mandir}/man1/onnode.1.gz
 %{_mandir}/man1/ltdbtool.1.gz
-%{_includedir}/ctdb.h
-%{_includedir}/ctdb_private.h
+%{_mandir}/man1/ping_pong.1.gz
 %{_libdir}/pkgconfig/ctdb.pc
 
-%{_docdir}/ctdb/tests/bin/ctdb_transaction
+
+%package devel
+Summary: CTDB development libraries
+Group: Development/Libraries
+
+%description devel
+development libraries for ctdb
+
+%files devel
+%defattr(-,root,root)
+%{_includedir}/ctdb.h
+%{_includedir}/ctdb_client.h
+%{_includedir}/ctdb_protocol.h
+%{_includedir}/ctdb_private.h
+%{_includedir}/ctdb_typesafe_cb.h
+
+%package tests
+Summary: CTDB test suite
+Group: Development/Tools
+Requires: ctdb = %{version}
+Requires: nc
+
+%description tests
+test suite for ctdb
+
+%files tests
+%defattr(-,root,root)
+%dir %{_datadir}/%{name}-tests
+%{_datadir}/%{name}-tests/*
+%dir %{_libdir}/%{name}-tests
+%{_libdir}/%{name}-tests/*
+%{_bindir}/ctdb_run_tests
+%{_bindir}/ctdb_run_cluster_tests
+%doc tests/README
+
+%if %with_pcp_pmda
+
+%package pcp-pmda
+Summary: CTDB PCP pmda support
+Group: Development/Tools
+Requires: ctdb = %{version}
+Requires: pcp-libs
+
+%description pcp-pmda
+Performance Co-Pilot (PCP) support for CTDB
+
+%files pcp-pmda
+%dir /var/lib/pcp/pmdas/ctdb
+/var/lib/pcp/pmdas/ctdb/*
+
+%endif
+
+
 
 %changelog
-* Mon May 07 2012 : Version 1.0.114.5
- - Rusty Russell: wrap iptables in flock to avoid concurrancy
-   (backported from master)
- - Michael Adam: let recovery finish a transaction_commit
-   (backported from master)
- - Michael Adam: let error in transaction_commit trigger a recovery
-   (backported from master)
-* Thu Jan 12 2012 : Version 1.0.114.4
- - Rusty Russell: crash fix in takeover
- - Rusty Russell: robustness fix regarding freeze vs vacuum
- - David Disseldorp: Make queue_io_read() safe for reentry
- - Gregor Beck: in ltdbtool, ignore empty (deleted) records per default
- - Michael Adam: vacuuming code cleanup and improved logging
- - Michael Adam and Stefan Metzmacher: add remove_from_delete_queue mechanism
- - Michael Adam: improved of output format control for "ctdb catdb"
- - ctdb catdb improvements
- - documentation improvements and typo fixes
-* Wed Jul 13 2011 : Version 1.0.114.3
- - Stefan Metzmacher: make sure the recovery master has CTDB_CAP_RECMASTER
-* Fri May 20 2011 : Version 1.0.114.2
- - new series of releases based off 1.0.114
- - Stefan Metzmacher: robustness fixes for banning/recovery lock
- - Stefan Metzmacher: fixes for per-ip-routing
- - Ronnie Sahlberg: always migrate a record in a ctdb call
- - Michael Adam: Test program fixes
- - Michael Adam and Stefan Metzmacher: vacuuming rewrite
- - Stefan Metzmacher: upgrade tdb version to master
- - Stefan Metzmacher: re-install handling of timeout of event scripts
- - Gregor Beck: add ltdbtool
- - Michael Adam: packaging fixes
+* Thu Mar 1 2012 : Version 1.13
+ - This is the new stable branch for modern features for ctdb.
+   Main new features are performance/scaling improvements for
+   concurrnet fetch and fetch_lock operations.
+* Tue Nov 8 2011 : Version 1.12
+ - Add new tunable : AllowClientDBAttach that can be used to stop
+   client db access during maintenance operations
+ - Updated logging for interfaces that are missing or dont exist but are
+   configured to be used.
+ - Add timeout argument to ctdb_cmdline_client
+ - PDMA support
+ - Initial support for 'readonly' delegations for ctdb databases
+   This will when finished greatly improve performance for contended hot
+   records that are used for just read-access.
+ - New 'ctdb cattdb' command
+ - Massive updates to tests and eventscripts
+ - LCP2 ip allocation algorithm
+ - Record Fetch collapse. Collapse multiple fetch-lock requests from cients
+   to a single network fetch and defer other concurrent requests until the 
+   initial fetch completes, and then service the deferred calls locally.
+   This will greatly improve performance for contended hot records 
+   where clients request write-locks.
+* Thu Sep 1 2011 : Version 1.11
+ - Major updates.
+* Tue May 25 2010 : Version 1.10
+ - New version 1.10
+* Tue May 25 2010 : Version 1.9
+ - Lots of changes
 * Wed Mar 25 2010 : Version 1.0.114
  - Lots of changes from Metze
 * Wed Jan 13 2010 : Version 1.0.113

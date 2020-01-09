@@ -23,7 +23,7 @@ Steps:
    the node are failed over to one of the other nodes.
 5. Use 'ctdb continue' to bring the node back online.
 6. Verify that the status of the node changes back to 'OK' and that
-   the public IP addresses move back to the node.
+   some public IP addresses move back to the node.
 
 Expected results:
 
@@ -31,7 +31,7 @@ Expected results:
 EOF
 }
 
-. ctdb_test_functions.bash
+. "${TEST_SCRIPTS_DIR}/integration.bash"
 
 ctdb_test_init "$@"
 
@@ -49,7 +49,7 @@ try_command_on_node 1 $CTDB stop -n $test_node
 
 wait_until_node_has_status $test_node stopped
 
-if wait_until_ips_are_on_nodeglob "[!${test_node}]" $ips ; then
+if wait_until_ips_are_on_nodeglob "[!${test_node}]" $test_node_ips ; then
     echo "All IPs moved."
 else
     echo "Some IPs didn't move."
@@ -61,11 +61,4 @@ try_command_on_node 1 $CTDB continue -n $test_node
 
 wait_until_node_has_status $test_node notstopped
 
-# BUG: this is only guaranteed if DeterministicIPs is 1 and
-#      NoIPFailback is 0.
-if wait_until_ips_are_on_nodeglob "$test_node" $ips ; then
-    echo "All IPs moved."
-else
-    echo "Some IPs didn't move."
-    testfailures=1
-fi
+wait_until_node_has_some_ips "$test_node"

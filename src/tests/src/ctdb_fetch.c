@@ -18,7 +18,6 @@
 */
 
 #include "includes.h"
-#include "lib/events/events.h"
 #include "system/filesys.h"
 #include "popt.h"
 #include "cmdline.h"
@@ -84,6 +83,11 @@ static void bench_fetch_1node(struct ctdb_context *ctdb)
 	data.dptr = (uint8_t *)talloc_asprintf_append((char *)data.dptr, 
 						      "msg_count=%d on node %d\n",
 						      msg_count, ctdb_get_pnn(ctdb));
+	if (data.dptr == NULL) {
+		printf("Failed to create record\n");
+		talloc_free(tmp_ctx);
+		return;
+	}
 	data.dsize = strlen((const char *)data.dptr)+1;
 
 	ret = ctdb_record_store(h, data);
@@ -99,7 +103,7 @@ static void bench_fetch_1node(struct ctdb_context *ctdb)
 	nulldata.dsize = 0;
 
 	dest = (ctdb_get_pnn(ctdb) + 1) % num_nodes;
-	ctdb_send_message(ctdb, dest, 0, nulldata);
+	ctdb_client_send_message(ctdb, dest, 0, nulldata);
 }
 
 /*
@@ -112,6 +116,15 @@ static void message_handler(struct ctdb_context *ctdb, uint64_t srvid,
 	bench_fetch_1node(ctdb);
 }
 
+
+/*
+ * timeout handler - noop
+ */
+static void timeout_handler(struct event_context *ev, struct timed_event *timer,
+			    struct timeval curtime, void *private_data)
+{
+	return;
+}
 
 /*
   benchmark the following:
@@ -130,6 +143,7 @@ static void bench_fetch(struct ctdb_context *ctdb, struct event_context *ev)
 	}
 	
 	start_timer();
+	event_add_timed(ev, ctdb, timeval_current_ofs(timelimit,0), timeout_handler, NULL);
 
 	while (end_timer() < timelimit) {
 		if (pnn == 0 && msg_count % 100 == 0 && end_timer() > 0) {
@@ -206,25 +220,27 @@ int main(int argc, const char *argv[])
 	}
 
 	ev = event_context_init(NULL);
+	tevent_loop_allow_nesting(ev);
 
-	ctdb = ctdb_cmdline_client(ev);
+	ctdb = ctdb_cmdline_client(ev, timeval_current_ofs(3, 0));
 
 	if (ctdb == NULL) {
 		printf("failed to connect to ctdb daemon.\n");
 		exit(1);
 	}
 
-	ctdb_set_message_handler(ctdb, CTDB_SRVID_RECONFIGURE, reconfigure_handler, 
+	ctdb_client_set_message_handler(ctdb, CTDB_SRVID_RECONFIGURE, reconfigure_handler, 
 				 &cluster_ready);
 
 	/* attach to a specific database */
-	ctdb_db = ctdb_attach(ctdb, "test.tdb", false, 0);
+	ctdb_db = ctdb_attach(ctdb, timeval_current_ofs(2, 0), "test.tdb",
+			      false, 0);
 	if (!ctdb_db) {
 		printf("ctdb_attach failed - %s\n", ctdb_errstr(ctdb));
 		exit(1);
 	}
 
-	ctdb_set_message_handler(ctdb, 0, message_handler, &msg_count);
+	ctdb_client_set_message_handler(ctdb, 0, message_handler, &msg_count);
 
 	printf("Waiting for cluster\n");
 	while (1) {
@@ -234,6 +250,13 @@ int main(int argc, const char *argv[])
 		event_loop_once(ev);
 	}
 
+	/* This test has a race condition. If CTDB receives the message from previous
+	 * node, before this node has registered for that message, this node will never
+	 * receive that message and will block on receive. Sleeping for some time will
+	 * hopefully ensure that the test program on all the nodes register for messages.
+	 */
+	printf("Sleeping for %d seconds\n", num_nodes);
+	sleep(num_nodes);
 	bench_fetch(ctdb, ev);
 
 	key.dptr = discard_const(TESTKEY);

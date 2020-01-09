@@ -18,8 +18,7 @@
 */
 
 #include "includes.h"
-#include "lib/events/events.h"
-#include "lib/tdb/include/tdb.h"
+#include "tdb.h"
 #include "system/network.h"
 #include "system/filesys.h"
 #include "system/wait.h"
@@ -61,6 +60,39 @@ void ctdb_fatal(struct ctdb_context *ctdb, const char *msg)
 }
 
 /*
+  like ctdb_fatal() but a core/backtrace would not be useful
+*/
+void ctdb_die(struct ctdb_context *ctdb, const char *msg)
+{
+	DEBUG(DEBUG_ALERT,("ctdb exiting with error: %s\n", msg));
+	exit(1);
+}
+
+/* Invoke an external program to do some sort of tracing on the CTDB
+ * process.  This might block for a little while.  The external
+ * program is specified by the environment variable
+ * CTDB_EXTERNAL_TRACE.  This program should take one argument: the
+ * pid of the process to trace.  Commonly, the program would be a
+ * wrapper script around gcore.
+ */
+void ctdb_external_trace(void)
+{
+
+	const char * t = getenv("CTDB_EXTERNAL_TRACE");
+	char * cmd;
+
+	if (t == NULL) {
+		return;
+	}
+
+	cmd = talloc_asprintf(NULL, "%s %lu", t, (unsigned long) getpid());
+	DEBUG(DEBUG_WARNING,("begin external trace: %s\n", cmd));
+	system(cmd);
+	DEBUG(DEBUG_WARNING,("end external trace: %s\n", cmd));
+	talloc_free(cmd);
+}
+
+/*
   parse a IP:port pair
 */
 int ctdb_parse_address(struct ctdb_context *ctdb,
@@ -99,14 +131,7 @@ bool ctdb_same_address(struct ctdb_address *a1, struct ctdb_address *a2)
 */
 uint32_t ctdb_hash(const TDB_DATA *key)
 {
-	uint32_t value;	/* Used to compute the hash value.  */
-	uint32_t i;	/* Used to cycle through random values. */
-
-	/* Set the initial value from the key size. */
-	for (value = 0x238F13AF * key->dsize, i=0; i < key->dsize; i++)
-		value = (value + (key->dptr[i] << (i*5 % 24)));
-
-	return (1103515243 * value + 12345);  
+	return tdb_jenkins_hash(discard_const(key));
 }
 
 /*
@@ -123,46 +148,14 @@ static void *_idr_find_type(struct idr_context *idp, int id, const char *type, c
 	return p;
 }
 
-
-/*
-  update a max latency number
- */
-void ctdb_latency(struct ctdb_db_context *ctdb_db, const char *name, double *latency, struct timeval t)
-{
-	double l = timeval_elapsed(&t);
-	if (l > *latency) {
-		*latency = l;
-	}
-
-	if (ctdb_db->ctdb->tunable.log_latency_ms !=0) {
-		if (l*1000 > ctdb_db->ctdb->tunable.log_latency_ms) {
-			DEBUG(DEBUG_WARNING, ("High latency %.6fs for operation %s on database %s\n", l, name, ctdb_db->db_name));
-		}
-	}
-}
-
-/*
-  update a reclock latency number
- */
-void ctdb_reclock_latency(struct ctdb_context *ctdb, const char *name, double *latency, double l)
-{
-	if (l > *latency) {
-		*latency = l;
-	}
-
-	if (ctdb->tunable.reclock_latency_ms !=0) {
-		if (l*1000 > ctdb->tunable.reclock_latency_ms) {
-			DEBUG(DEBUG_ERR, ("High RECLOCK latency %fs for operation %s\n", l, name));
-		}
-	}
-}
-
 uint32_t ctdb_reqid_new(struct ctdb_context *ctdb, void *state)
 {
-	uint32_t id;
-
-	id  = ctdb->idr_cnt++ & 0xFFFF;
-	id |= (idr_get_new(ctdb->idr, state, 0xFFFF)<<16);
+	int id = idr_get_new_above(ctdb->idr, state, ctdb->lastid+1, INT_MAX);
+	if (id < 0) {
+		DEBUG(DEBUG_DEBUG, ("Reqid wrap!\n"));
+		id = idr_get_new(ctdb->idr, state, INT_MAX);
+	}
+	ctdb->lastid = id;
 	return id;
 }
 
@@ -170,7 +163,7 @@ void *_ctdb_reqid_find(struct ctdb_context *ctdb, uint32_t reqid, const char *ty
 {
 	void *p;
 
-	p = _idr_find_type(ctdb->idr, (reqid>>16)&0xFFFF, type, location);
+	p = _idr_find_type(ctdb->idr, reqid, type, location);
 	if (p == NULL) {
 		DEBUG(DEBUG_WARNING, ("Could not find idr:%u\n",reqid));
 	}
@@ -183,7 +176,7 @@ void ctdb_reqid_remove(struct ctdb_context *ctdb, uint32_t reqid)
 {
 	int ret;
 
-	ret = idr_remove(ctdb->idr, (reqid>>16)&0xFFFF);
+	ret = idr_remove(ctdb->idr, reqid);
 	if (ret != 0) {
 		DEBUG(DEBUG_ERR, ("Removing idr that does not exist\n"));
 	}
@@ -324,33 +317,132 @@ struct ctdb_rec_data *ctdb_marshall_loop_next(struct ctdb_marshall_buffer *m, st
 	return r;
 }
 
+
+#if HAVE_SCHED_H
+#include <sched.h>
+#endif
+
+#if HAVE_PROCINFO_H
+#include <procinfo.h>
+#endif
+
 /*
-  if possible, make this task very high priority
+  if possible, make this task real time
  */
-void ctdb_high_priority(struct ctdb_context *ctdb)
+void ctdb_set_scheduler(struct ctdb_context *ctdb)
 {
-	errno = 0;
-	if (nice(-20) == -1 && errno != 0) {
-		DEBUG(DEBUG_WARNING,("Unable to renice self: %s\n",
-				     strerror(errno)));
-	} else {
-		DEBUG(DEBUG_NOTICE,("Scheduler says I'm nice: %i\n",
-				    getpriority(PRIO_PROCESS, getpid())));
+#ifdef _AIX_
+#if HAVE_THREAD_SETSCHED
+	struct thrdentry64 te;
+	tid64_t ti;
+
+	ti = 0ULL;
+	if (getthrds64(getpid(), &te, sizeof(te), &ti, 1) != 1) {
+		DEBUG(DEBUG_ERR, ("Unable to get thread information\n"));
+		return;
 	}
+
+	if (ctdb->saved_scheduler_param == NULL) {
+		ctdb->saved_scheduler_param = talloc_size(ctdb, sizeof(te));
+	}
+	*(struct thrdentry64 *)ctdb->saved_scheduler_param = te;
+
+	if (thread_setsched(te.ti_tid, 0, SCHED_RR) == -1) {
+		DEBUG(DEBUG_ERR, ("Unable to set scheduler to SCHED_RR (%s)\n",
+				  strerror(errno)));
+	} else {
+		DEBUG(DEBUG_NOTICE, ("Set scheduler to SCHED_RR\n"));
+	}
+#endif
+#else /* no AIX */
+#if HAVE_SCHED_SETSCHEDULER
+	struct sched_param p;
+	if (ctdb->saved_scheduler_param == NULL) {
+		ctdb->saved_scheduler_param = talloc_size(ctdb, sizeof(p));
+	}
+
+	if (sched_getparam(0, (struct sched_param *)ctdb->saved_scheduler_param) == -1) {
+		DEBUG(DEBUG_ERR,("Unable to get old scheduler params\n"));
+		return;
+	}
+
+	p = *(struct sched_param *)ctdb->saved_scheduler_param;
+	p.sched_priority = 1;
+
+	if (sched_setscheduler(0, SCHED_FIFO, &p) == -1) {
+		DEBUG(DEBUG_CRIT,("Unable to set scheduler to SCHED_FIFO (%s)\n", 
+			 strerror(errno)));
+	} else {
+		DEBUG(DEBUG_NOTICE,("Set scheduler to SCHED_FIFO\n"));
+	}
+#endif
+#endif
+}
+
+/*
+  restore previous scheduler parameters
+ */
+void ctdb_restore_scheduler(struct ctdb_context *ctdb)
+{
+#ifdef _AIX_
+#if HAVE_THREAD_SETSCHED
+	struct thrdentry64 te, *saved;
+	tid64_t ti;
+
+	ti = 0ULL;
+	if (getthrds64(getpid(), &te, sizeof(te), &ti, 1) != 1) {
+		ctdb_fatal(ctdb, "Unable to get thread information\n");
+	}
+	if (ctdb->saved_scheduler_param == NULL) {
+		ctdb_fatal(ctdb, "No saved scheduler parameters\n");
+	}
+	saved = (struct thrdentry64 *)ctdb->saved_scheduler_param;
+	if (thread_setsched(te.ti_tid, saved->ti_pri, saved->ti_policy) == -1) {
+		ctdb_fatal(ctdb, "Unable to restore old scheduler parameters\n");
+	}
+#endif
+#else /* no AIX */
+#if HAVE_SCHED_SETSCHEDULER
+	if (ctdb->saved_scheduler_param == NULL) {
+		ctdb_fatal(ctdb, "No saved scheduler parameters\n");
+	}
+	if (sched_setscheduler(0, SCHED_OTHER, (struct sched_param *)ctdb->saved_scheduler_param) == -1) {
+		ctdb_fatal(ctdb, "Unable to restore old scheduler parameters\n");
+	}
+#endif
+#endif
 }
 
 void set_nonblocking(int fd)
 {
-	unsigned v;
+	int v;
+
 	v = fcntl(fd, F_GETFL, 0);
-        fcntl(fd, F_SETFL, v | O_NONBLOCK);
+	if (v == -1) {
+		DEBUG(DEBUG_WARNING, ("Failed to get file status flags - %s\n",
+				      strerror(errno)));
+		return;
+	}
+        if (fcntl(fd, F_SETFL, v | O_NONBLOCK) == -1) {
+		DEBUG(DEBUG_WARNING, ("Failed to set non_blocking on fd - %s\n",
+				      strerror(errno)));
+	}
 }
 
 void set_close_on_exec(int fd)
 {
-	unsigned v;
+	int v;
+
 	v = fcntl(fd, F_GETFD, 0);
-        fcntl(fd, F_SETFD, v | FD_CLOEXEC);
+	if (v == -1) {
+		DEBUG(DEBUG_WARNING, ("Failed to get file descriptor flags - %s\n",
+				      strerror(errno)));
+		return;
+	}
+	if (fcntl(fd, F_SETFD, v | FD_CLOEXEC) != 0) {
+		DEBUG(DEBUG_WARNING, ("Failed to set close_on_exec on fd - %s\n",
+				      strerror(errno)));
+	}
 }
 
 
@@ -441,6 +533,8 @@ bool parse_ip(const char *addr, const char *ifaces, unsigned port, ctdb_sock_add
 	char *p;
 	bool ret;
 
+	ZERO_STRUCTP(saddr); /* valgrind :-) */
+
 	/* now is this a ipv4 or ipv6 address ?*/
 	p = index(addr, ':');
 	if (p == NULL) {
@@ -511,7 +605,7 @@ void ctdb_canonicalize_ip(const ctdb_sock_addr *ip, ctdb_sock_addr *cip)
 #endif
 		cip->ip.sin_family = AF_INET;
 		cip->ip.sin_port   = ip->ip6.sin6_port;
-		memcpy(&cip->ip.sin_addr, &ip->ip6.sin6_addr.s6_addr32[3], 4);
+		memcpy(&cip->ip.sin_addr, &ip->ip6.sin6_addr.s6_addr[12], 4);
 	}
 }
 
@@ -562,6 +656,7 @@ char *ctdb_addr_to_str(ctdb_sock_addr *addr)
 		break;
 	default:
 		DEBUG(DEBUG_ERR, (__location__ " ERROR, unknown family %u\n", addr->sa.sa_family));
+		ctdb_external_trace();
 	}
 
 	return cip;
@@ -628,7 +723,7 @@ int32_t get_debug_by_desc(const char *desc)
 	int i;
 
 	for (i=0; debug_levels[i].description != NULL; i++) {
-		if (!strcmp(debug_levels[i].description, desc)) {
+		if (!strcasecmp(debug_levels[i].description, desc)) {
 			return debug_levels[i].level;
 		}
 	}
@@ -649,10 +744,20 @@ void ctdb_lockdown_memory(struct ctdb_context *ctdb)
 		return;
 	}
 
+	/* TODO: Add a command line option to disable memory lockdown.
+	 *       This can be a performance issue on AIX since fork() copies
+	 *       all locked memory pages. 
+	 */
+
+	/* Ignore when running in local daemons mode */
+	if (getuid() != 0) {
+		return;
+	}
+
 	/* Avoid compiler optimizing out dummy. */
 	mlock(dummy, sizeof(dummy));
 	if (mlockall(MCL_CURRENT) != 0) {
-		DEBUG(DEBUG_WARNING,("Failed to lock memory: %s'\n",
+		DEBUG(DEBUG_WARNING,("Failed to lockdown memory: %s'\n",
 				     strerror(errno)));
 	}
 #endif
@@ -671,5 +776,70 @@ const char *ctdb_eventscript_call_names[] = {
 	"status",
 	"shutdown",
 	"reload",
-	"updateip"
+	"updateip",
+	"ipreallocated"
 };
+
+/* Runstate handling */
+static struct {
+	enum ctdb_runstate runstate;
+	const char * label;
+} runstate_map[] = {
+	{ CTDB_RUNSTATE_UNKNOWN, "UNKNOWN" },
+	{ CTDB_RUNSTATE_INIT, "INIT" },
+	{ CTDB_RUNSTATE_SETUP, "SETUP" },
+	{ CTDB_RUNSTATE_FIRST_RECOVERY, "FIRST_RECOVERY" },
+	{ CTDB_RUNSTATE_STARTUP, "STARTUP" },
+	{ CTDB_RUNSTATE_RUNNING, "RUNNING" },
+	{ CTDB_RUNSTATE_SHUTDOWN, "SHUTDOWN" },
+	{ -1, NULL },
+};
+
+const char *runstate_to_string(enum ctdb_runstate runstate)
+{
+	int i;
+	for (i=0; runstate_map[i].label != NULL ; i++) {
+		if (runstate_map[i].runstate == runstate) {
+			return runstate_map[i].label;
+		}
+	}
+
+	return runstate_map[0].label;
+}
+
+enum ctdb_runstate runstate_from_string(const char *label)
+{
+	int i;
+	for (i=0; runstate_map[i].label != NULL; i++) {
+		if (strcasecmp(runstate_map[i].label, label) == 0) {
+			return runstate_map[i].runstate;
+		}
+	}
+
+	return CTDB_RUNSTATE_UNKNOWN;
+}
+
+void ctdb_set_runstate(struct ctdb_context *ctdb, enum ctdb_runstate runstate)
+{
+	if (runstate <= ctdb->runstate) {
+		ctdb_fatal(ctdb, "runstate must always increase");
+	}
+
+	DEBUG(DEBUG_NOTICE,("Set runstate to %s (%d)\n",
+			    runstate_to_string(runstate), runstate));
+	ctdb->runstate = runstate;
+}
+
+void ctdb_mkdir_p_or_die(struct ctdb_context *ctdb, const char *dir, int mode)
+{
+	int ret;
+
+	ret = mkdir_p(dir, mode);
+	if (ret != 0) {
+		DEBUG(DEBUG_ALERT,
+		      ("ctdb exiting with error: "
+		       "failed to create directory \"%s\" (%s)\n",
+		       dir, strerror(errno)));
+		exit(1);
+	}
+}

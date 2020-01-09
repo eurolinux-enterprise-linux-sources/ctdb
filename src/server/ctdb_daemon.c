@@ -19,14 +19,15 @@
 
 #include "includes.h"
 #include "db_wrap.h"
-#include "lib/tdb/include/tdb.h"
-#include "lib/events/events.h"
+#include "tdb.h"
 #include "lib/util/dlinklist.h"
 #include "system/network.h"
 #include "system/filesys.h"
 #include "system/wait.h"
-#include "../include/ctdb.h"
+#include "../include/ctdb_version.h"
+#include "../include/ctdb_client.h"
 #include "../include/ctdb_private.h"
+#include "../common/rb_tree.h"
 #include <sys/socket.h>
 
 struct ctdb_client_pid_list {
@@ -36,36 +37,50 @@ struct ctdb_client_pid_list {
 	struct ctdb_client *client;
 };
 
+const char *ctdbd_pidfile = NULL;
+
 static void daemon_incoming_packet(void *, struct ctdb_req_header *);
 
 static void print_exit_message(void)
 {
-	DEBUG(DEBUG_NOTICE,("CTDB daemon shutting down\n"));
+	if (debug_extra != NULL && debug_extra[0] != '\0') {
+		DEBUG(DEBUG_NOTICE,("CTDB %s shutting down\n", debug_extra));
+	} else {
+		DEBUG(DEBUG_NOTICE,("CTDB daemon shutting down\n"));
+
+		/* Wait a second to allow pending log messages to be flushed */
+		sleep(1);
+	}
 }
 
-/* called when the "startup" event script has finished */
-static void ctdb_start_transport(struct ctdb_context *ctdb)
+
+
+static void ctdb_time_tick(struct event_context *ev, struct timed_event *te, 
+				  struct timeval t, void *private_data)
 {
-	if (ctdb->methods == NULL) {
-		DEBUG(DEBUG_ALERT,(__location__ " startup event finished but transport is DOWN.\n"));
-		ctdb_fatal(ctdb, "transport is not initialized but startup completed");
+	struct ctdb_context *ctdb = talloc_get_type(private_data, struct ctdb_context);
+
+	if (getpid() != ctdbd_pid) {
+		return;
 	}
 
-	/* start the transport running */
-	if (ctdb->methods->start(ctdb) != 0) {
-		DEBUG(DEBUG_ALERT,("transport failed to start!\n"));
-		ctdb_fatal(ctdb, "transport failed to start");
-	}
+	event_add_timed(ctdb->ev, ctdb, 
+			timeval_current_ofs(1, 0), 
+			ctdb_time_tick, ctdb);
+}
 
-	/* start the recovery daemon process */
-	if (ctdb_start_recoverd(ctdb) != 0) {
-		DEBUG(DEBUG_ALERT,("Failed to start recovery daemon\n"));
-		exit(11);
-	}
+/* Used to trigger a dummy event once per second, to make
+ * detection of hangs more reliable.
+ */
+static void ctdb_start_time_tickd(struct ctdb_context *ctdb)
+{
+	event_add_timed(ctdb->ev, ctdb, 
+			timeval_current_ofs(1, 0), 
+			ctdb_time_tick, ctdb);
+}
 
-	/* Make sure we log something when the daemon terminates */
-	atexit(print_exit_message);
-
+static void ctdb_start_periodic_events(struct ctdb_context *ctdb)
+{
 	/* start monitoring for connected/disconnected nodes */
 	ctdb_start_keepalive(ctdb);
 
@@ -77,6 +92,9 @@ static void ctdb_start_transport(struct ctdb_context *ctdb)
 
 	/* start listening for recovery daemon pings */
 	ctdb_control_recd_ping(ctdb);
+
+	/* start listening to timer ticks */
+	ctdb_start_time_tickd(ctdb);
 }
 
 static void block_signal(int signum)
@@ -97,7 +115,7 @@ static void block_signal(int signum)
  */
 static int daemon_queue_send(struct ctdb_client *client, struct ctdb_req_header *hdr)
 {
-	client->ctdb->statistics.client_packets_sent++;
+	CTDB_INCREMENT_STAT(client->ctdb, client_packets_sent);
 	if (hdr->operation == CTDB_REQ_MESSAGE) {
 		if (ctdb_queue_length(client->queue) > client->ctdb->tunable.max_queue_depth_drop_msg) {
 			DEBUG(DEBUG_ERR,("CTDB_REQ_MESSAGE queue full - killing client connection.\n"));
@@ -174,6 +192,36 @@ int daemon_deregister_message_handler(struct ctdb_context *ctdb, uint32_t client
 	return ctdb_deregister_message_handler(ctdb, srvid, client);
 }
 
+int daemon_check_srvids(struct ctdb_context *ctdb, TDB_DATA indata,
+			TDB_DATA *outdata)
+{
+	uint64_t *ids;
+	int i, num_ids;
+	uint8_t *results;
+
+	if ((indata.dsize % sizeof(uint64_t)) != 0) {
+		DEBUG(DEBUG_ERR, ("Bad indata in daemon_check_srvids, "
+				  "size=%d\n", (int)indata.dsize));
+		return -1;
+	}
+
+	ids = (uint64_t *)indata.dptr;
+	num_ids = indata.dsize / 8;
+
+	results = talloc_zero_array(outdata, uint8_t, (num_ids+7)/8);
+	if (results == NULL) {
+		DEBUG(DEBUG_ERR, ("talloc failed in daemon_check_srvids\n"));
+		return -1;
+	}
+	for (i=0; i<num_ids; i++) {
+		if (ctdb_check_message_handler(ctdb, ids[i])) {
+			results[i/8] |= (1 << (i%8));
+		}
+	}
+	outdata->dptr = (uint8_t *)results;
+	outdata->dsize = talloc_get_size(results);
+	return 0;
+}
 
 /*
   destroy a ctdb_client
@@ -184,9 +232,7 @@ static int ctdb_client_destructor(struct ctdb_client *client)
 
 	ctdb_takeover_client_destructor_hook(client);
 	ctdb_reqid_remove(client->ctdb, client->client_id);
-	if (client->ctdb->statistics.num_clients) {
-		client->ctdb->statistics.num_clients--;
-	}
+	client->ctdb->num_clients--;
 
 	if (client->num_persistent_updates != 0) {
 		DEBUG(DEBUG_ERR,(__location__ " Client disconnecting with %u persistent updates in flight. Starting recovery\n", client->num_persistent_updates));
@@ -197,9 +243,6 @@ static int ctdb_client_destructor(struct ctdb_client *client)
 		DEBUG(DEBUG_ERR, (__location__ " client exit while transaction "
 				  "commit active. Forcing recovery.\n"));
 		client->ctdb->recovery_mode = CTDB_RECOVERY_ACTIVE;
-
-		/* legacy trans2 transaction state: */
-		ctdb_db->transaction_active = false;
 
 		/*
 		 * trans3 transaction state:
@@ -222,6 +265,10 @@ static void daemon_request_message_from_client(struct ctdb_client *client,
 {
 	TDB_DATA data;
 	int res;
+
+	if (c->hdr.destnode == CTDB_CURRENT_NODE) {
+		c->hdr.destnode = ctdb_get_pnn(client->ctdb);
+	}
 
 	/* maybe the message is for another client on this node */
 	if (ctdb_get_pnn(client->ctdb)==c->hdr.destnode) {
@@ -246,6 +293,10 @@ struct daemon_call_state {
 	uint32_t reqid;
 	struct ctdb_call *call;
 	struct timeval start_time;
+
+	/* readonly request ? */
+	uint32_t readonly_fetch;
+	uint32_t client_callid;
 };
 
 /* 
@@ -267,27 +318,45 @@ static void daemon_call_from_client_callback(struct ctdb_call_state *state)
 	res = ctdb_daemon_call_recv(state, dstate->call);
 	if (res != 0) {
 		DEBUG(DEBUG_ERR, (__location__ " ctdbd_call_recv() returned error\n"));
-		if (client->ctdb->statistics.pending_calls > 0) {
-			client->ctdb->statistics.pending_calls--;
-		}
-		ctdb_latency(ctdb_db, "call_from_client_cb 1", &client->ctdb->statistics.max_call_latency, dstate->start_time);
+		CTDB_DECREMENT_STAT(client->ctdb, pending_calls);
+
+		CTDB_UPDATE_LATENCY(client->ctdb, ctdb_db, "call_from_client_cb 1", call_latency, dstate->start_time);
 		return;
 	}
 
 	length = offsetof(struct ctdb_reply_call, data) + dstate->call->reply_data.dsize;
+	/* If the client asked for readonly FETCH, we remapped this to 
+	   FETCH_WITH_HEADER when calling the daemon. So we must
+	   strip the extra header off the reply data before passing
+	   it back to the client.
+	*/
+	if (dstate->readonly_fetch
+	&& dstate->client_callid == CTDB_FETCH_FUNC) {
+		length -= sizeof(struct ctdb_ltdb_header);
+	}
+
 	r = ctdbd_allocate_pkt(client->ctdb, dstate, CTDB_REPLY_CALL, 
 			       length, struct ctdb_reply_call);
 	if (r == NULL) {
 		DEBUG(DEBUG_ERR, (__location__ " Failed to allocate reply_call in ctdb daemon\n"));
-		if (client->ctdb->statistics.pending_calls > 0) {
-			client->ctdb->statistics.pending_calls--;
-		}
-		ctdb_latency(ctdb_db, "call_from_client_cb 2", &client->ctdb->statistics.max_call_latency, dstate->start_time);
+		CTDB_DECREMENT_STAT(client->ctdb, pending_calls);
+		CTDB_UPDATE_LATENCY(client->ctdb, ctdb_db, "call_from_client_cb 2", call_latency, dstate->start_time);
 		return;
 	}
 	r->hdr.reqid        = dstate->reqid;
-	r->datalen          = dstate->call->reply_data.dsize;
-	memcpy(&r->data[0], dstate->call->reply_data.dptr, r->datalen);
+	r->status           = dstate->call->status;
+
+	if (dstate->readonly_fetch
+	&& dstate->client_callid == CTDB_FETCH_FUNC) {
+		/* client only asked for a FETCH so we must strip off
+		   the extra ctdb_ltdb header
+		*/
+		r->datalen          = dstate->call->reply_data.dsize - sizeof(struct ctdb_ltdb_header);
+		memcpy(&r->data[0], dstate->call->reply_data.dptr + sizeof(struct ctdb_ltdb_header), r->datalen);
+	} else {
+		r->datalen          = dstate->call->reply_data.dsize;
+		memcpy(&r->data[0], dstate->call->reply_data.dptr, r->datalen);
+	}
 
 	res = daemon_queue_send(client, &r->hdr);
 	if (res == -1) {
@@ -297,11 +366,9 @@ static void daemon_call_from_client_callback(struct ctdb_call_state *state)
 	if (res != 0) {
 		DEBUG(DEBUG_ERR, (__location__ " Failed to queue packet from daemon to client\n"));
 	}
-	ctdb_latency(ctdb_db, "call_from_client_cb 3", &client->ctdb->statistics.max_call_latency, dstate->start_time);
+	CTDB_UPDATE_LATENCY(client->ctdb, ctdb_db, "call_from_client_cb 3", call_latency, dstate->start_time);
+	CTDB_DECREMENT_STAT(client->ctdb, pending_calls);
 	talloc_free(dstate);
-	if (client->ctdb->statistics.pending_calls > 0) {
-		client->ctdb->statistics.pending_calls--;
-	}
 }
 
 struct ctdb_daemon_packet_wrap {
@@ -335,6 +402,190 @@ static void daemon_incoming_packet_wrap(void *p, struct ctdb_req_header *hdr)
 	daemon_incoming_packet(client, hdr);	
 }
 
+struct ctdb_deferred_fetch_call {
+	struct ctdb_deferred_fetch_call *next, *prev;
+	struct ctdb_req_call *c;
+	struct ctdb_daemon_packet_wrap *w;
+};
+
+struct ctdb_deferred_fetch_queue {
+	struct ctdb_deferred_fetch_call *deferred_calls;
+};
+
+struct ctdb_deferred_requeue {
+	struct ctdb_deferred_fetch_call *dfc;
+	struct ctdb_client *client;
+};
+
+/* called from a timer event and starts reprocessing the deferred call.*/
+static void reprocess_deferred_call(struct event_context *ev, struct timed_event *te, 
+				       struct timeval t, void *private_data)
+{
+	struct ctdb_deferred_requeue *dfr = (struct ctdb_deferred_requeue *)private_data;
+	struct ctdb_client *client = dfr->client;
+
+	talloc_steal(client, dfr->dfc->c);
+	daemon_incoming_packet(client, (struct ctdb_req_header *)dfr->dfc->c);
+	talloc_free(dfr);
+}
+
+/* the referral context is destroyed either after a timeout or when the initial
+   fetch-lock has finished.
+   at this stage, immediately start reprocessing the queued up deferred
+   calls so they get reprocessed immediately (and since we are dmaster at
+   this stage, trigger the waiting smbd processes to pick up and aquire the
+   record right away.
+*/
+static int deferred_fetch_queue_destructor(struct ctdb_deferred_fetch_queue *dfq)
+{
+
+	/* need to reprocess the packets from the queue explicitely instead of
+	   just using a normal destructor since we want, need, to
+	   call the clients in the same oder as the requests queued up
+	*/
+	while (dfq->deferred_calls != NULL) {
+		struct ctdb_client *client;
+		struct ctdb_deferred_fetch_call *dfc = dfq->deferred_calls;
+		struct ctdb_deferred_requeue *dfr;
+
+		DLIST_REMOVE(dfq->deferred_calls, dfc);
+
+		client = ctdb_reqid_find(dfc->w->ctdb, dfc->w->client_id, struct ctdb_client);
+		if (client == NULL) {
+			DEBUG(DEBUG_ERR,(__location__ " Packet for disconnected client %u\n",
+				 dfc->w->client_id));
+			continue;
+		}
+
+		/* process it by pushing it back onto the eventloop */
+		dfr = talloc(client, struct ctdb_deferred_requeue);
+		if (dfr == NULL) {
+			DEBUG(DEBUG_ERR,("Failed to allocate deferred fetch requeue structure\n"));
+			continue;
+		}
+
+		dfr->dfc    = talloc_steal(dfr, dfc);
+		dfr->client = client;
+
+		event_add_timed(dfc->w->ctdb->ev, client, timeval_zero(), reprocess_deferred_call, dfr);
+	}
+
+	return 0;
+}
+
+/* insert the new deferral context into the rb tree.
+   there should never be a pre-existing context here, but check for it
+   warn and destroy the previous context if there is already a deferral context
+   for this key.
+*/
+static void *insert_dfq_callback(void *parm, void *data)
+{
+        if (data) {
+		DEBUG(DEBUG_ERR,("Already have DFQ registered. Free old %p and create new %p\n", data, parm));
+                talloc_free(data);
+        }
+        return parm;
+}
+
+/* if the original fetch-lock did not complete within a reasonable time,
+   free the context and context for all deferred requests to cause them to be
+   re-inserted into the event system.
+*/
+static void dfq_timeout(struct event_context *ev, struct timed_event *te, 
+				  struct timeval t, void *private_data)
+{
+	talloc_free(private_data);
+}
+
+/* This function is used in the local daemon to register a KEY in a database
+   for being "fetched"
+   While the remote fetch is in-flight, any futher attempts to re-fetch the
+   same record will be deferred until the fetch completes.
+*/
+static int setup_deferred_fetch_locks(struct ctdb_db_context *ctdb_db, struct ctdb_call *call)
+{
+	uint32_t *k;
+	struct ctdb_deferred_fetch_queue *dfq;
+
+	k = talloc_zero_size(call, ((call->key.dsize + 3) & 0xfffffffc) + 4);
+	if (k == NULL) {
+		DEBUG(DEBUG_ERR,("Failed to allocate key for deferred fetch\n"));
+		return -1;
+	}
+
+	k[0] = (call->key.dsize + 3) / 4 + 1;
+	memcpy(&k[1], call->key.dptr, call->key.dsize);
+
+	dfq  = talloc(call, struct ctdb_deferred_fetch_queue);
+	if (dfq == NULL) {
+		DEBUG(DEBUG_ERR,("Failed to allocate key for deferred fetch queue structure\n"));
+		talloc_free(k);
+		return -1;
+	}
+	dfq->deferred_calls = NULL;
+
+	trbt_insertarray32_callback(ctdb_db->deferred_fetch, k[0], &k[0], insert_dfq_callback, dfq);
+
+	talloc_set_destructor(dfq, deferred_fetch_queue_destructor);
+
+	/* if the fetch havent completed in 30 seconds, just tear it all down
+	   and let it try again as the events are reissued */
+	event_add_timed(ctdb_db->ctdb->ev, dfq, timeval_current_ofs(30, 0), dfq_timeout, dfq);
+
+	talloc_free(k);
+	return 0;
+}
+
+/* check if this is a duplicate request to a fetch already in-flight
+   if it is, make this call deferred to be reprocessed later when
+   the in-flight fetch completes.
+*/
+static int requeue_duplicate_fetch(struct ctdb_db_context *ctdb_db, struct ctdb_client *client, TDB_DATA key, struct ctdb_req_call *c)
+{
+	uint32_t *k;
+	struct ctdb_deferred_fetch_queue *dfq;
+	struct ctdb_deferred_fetch_call *dfc;
+
+	k = talloc_zero_size(c, ((key.dsize + 3) & 0xfffffffc) + 4);
+	if (k == NULL) {
+		DEBUG(DEBUG_ERR,("Failed to allocate key for deferred fetch\n"));
+		return -1;
+	}
+
+	k[0] = (key.dsize + 3) / 4 + 1;
+	memcpy(&k[1], key.dptr, key.dsize);
+
+	dfq = trbt_lookuparray32(ctdb_db->deferred_fetch, k[0], &k[0]);
+	if (dfq == NULL) {
+		talloc_free(k);
+		return -1;
+	}
+
+
+	talloc_free(k);
+
+	dfc = talloc(dfq, struct ctdb_deferred_fetch_call);
+	if (dfc == NULL) {
+		DEBUG(DEBUG_ERR, ("Failed to allocate deferred fetch call structure\n"));
+		return -1;
+	}
+
+	dfc->w = talloc(dfc, struct ctdb_daemon_packet_wrap);
+	if (dfc->w == NULL) {
+		DEBUG(DEBUG_ERR,("Failed to allocate deferred fetch daemon packet wrap structure\n"));
+		talloc_free(dfc);
+		return -1;
+	}
+
+	dfc->c = talloc_steal(dfc, c);
+	dfc->w->ctdb = ctdb_db->ctdb;
+	dfc->w->client_id = client->client_id;
+
+	DLIST_ADD_END(dfq->deferred_calls, dfc, NULL);
+
+	return 0;
+}
+
 
 /*
   this is called when the ctdb daemon received a ctdb request call
@@ -353,18 +604,14 @@ static void daemon_request_call_from_client(struct ctdb_client *client,
 	struct ctdb_context *ctdb = client->ctdb;
 	struct ctdb_daemon_packet_wrap *w;
 
-	ctdb->statistics.total_calls++;
-	if (client->ctdb->statistics.pending_calls > 0) {
-		ctdb->statistics.pending_calls++;
-	}
+	CTDB_INCREMENT_STAT(ctdb, total_calls);
+	CTDB_DECREMENT_STAT(ctdb, pending_calls);
 
 	ctdb_db = find_ctdb_db(client->ctdb, c->db_id);
 	if (!ctdb_db) {
 		DEBUG(DEBUG_ERR, (__location__ " Unknown database in request. db_id==0x%08x",
 			  c->db_id));
-		if (client->ctdb->statistics.pending_calls > 0) {
-			ctdb->statistics.pending_calls--;
-		}
+		CTDB_DECREMENT_STAT(ctdb, pending_calls);
 		return;
 	}
 
@@ -389,12 +636,10 @@ static void daemon_request_call_from_client(struct ctdb_client *client,
 
 	ret = ctdb_ltdb_lock_fetch_requeue(ctdb_db, key, &header, 
 					   (struct ctdb_req_header *)c, &data,
-					   daemon_incoming_packet_wrap, w, True);
+					   daemon_incoming_packet_wrap, w, true);
 	if (ret == -2) {
 		/* will retry later */
-		if (client->ctdb->statistics.pending_calls > 0) {
-			ctdb->statistics.pending_calls--;
-		}
+		CTDB_DECREMENT_STAT(ctdb, pending_calls);
 		return;
 	}
 
@@ -402,19 +647,86 @@ static void daemon_request_call_from_client(struct ctdb_client *client,
 
 	if (ret != 0) {
 		DEBUG(DEBUG_ERR,(__location__ " Unable to fetch record\n"));
-		if (client->ctdb->statistics.pending_calls > 0) {
-			ctdb->statistics.pending_calls--;
+		CTDB_DECREMENT_STAT(ctdb, pending_calls);
+		return;
+	}
+
+
+	/* check if this fetch request is a duplicate for a
+	   request we already have in flight. If so defer it until
+	   the first request completes.
+	*/
+	if (ctdb->tunable.fetch_collapse == 1) {
+		if (requeue_duplicate_fetch(ctdb_db, client, key, c) == 0) {
+			ret = ctdb_ltdb_unlock(ctdb_db, key);
+			if (ret != 0) {
+				DEBUG(DEBUG_ERR,(__location__ " ctdb_ltdb_unlock() failed with error %d\n", ret));
+			}
+			return;
+		}
+	}
+
+	/* Dont do READONLY if we dont have a tracking database */
+	if ((c->flags & CTDB_WANT_READONLY) && !ctdb_db->readonly) {
+		c->flags &= ~CTDB_WANT_READONLY;
+	}
+
+	if (header.flags & CTDB_REC_RO_REVOKE_COMPLETE) {
+		header.flags &= ~CTDB_REC_RO_FLAGS;
+		CTDB_INCREMENT_STAT(ctdb, total_ro_revokes);
+		CTDB_INCREMENT_DB_STAT(ctdb_db, db_ro_revokes);
+		if (ctdb_ltdb_store(ctdb_db, key, &header, data) != 0) {
+			ctdb_fatal(ctdb, "Failed to write header with cleared REVOKE flag");
+		}
+		/* and clear out the tracking data */
+		if (tdb_delete(ctdb_db->rottdb, key) != 0) {
+			DEBUG(DEBUG_ERR,(__location__ " Failed to clear out trackingdb record\n"));
+		}
+	}
+
+	/* if we are revoking, we must defer all other calls until the revoke
+	 * had completed.
+	 */
+	if (header.flags & CTDB_REC_RO_REVOKING_READONLY) {
+		talloc_free(data.dptr);
+		ret = ctdb_ltdb_unlock(ctdb_db, key);
+
+		if (ctdb_add_revoke_deferred_call(ctdb, ctdb_db, key, (struct ctdb_req_header *)c, daemon_incoming_packet, client) != 0) {
+			ctdb_fatal(ctdb, "Failed to add deferred call for revoke child");
 		}
 		return;
 	}
 
+	if ((header.dmaster == ctdb->pnn)
+	&& (!(c->flags & CTDB_WANT_READONLY))
+	&& (header.flags & (CTDB_REC_RO_HAVE_DELEGATIONS|CTDB_REC_RO_HAVE_READONLY)) ) {
+		header.flags   |= CTDB_REC_RO_REVOKING_READONLY;
+		if (ctdb_ltdb_store(ctdb_db, key, &header, data) != 0) {
+			ctdb_fatal(ctdb, "Failed to store record with HAVE_DELEGATIONS set");
+		}
+		ret = ctdb_ltdb_unlock(ctdb_db, key);
+
+		if (ctdb_start_revoke_ro_record(ctdb, ctdb_db, key, &header, data) != 0) {
+			ctdb_fatal(ctdb, "Failed to start record revoke");
+		}
+		talloc_free(data.dptr);
+
+		if (ctdb_add_revoke_deferred_call(ctdb, ctdb_db, key, (struct ctdb_req_header *)c, daemon_incoming_packet, client) != 0) {
+			ctdb_fatal(ctdb, "Failed to add deferred call for revoke child");
+		}
+
+		return;
+	}		
+
 	dstate = talloc(client, struct daemon_call_state);
 	if (dstate == NULL) {
-		ctdb_ltdb_unlock(ctdb_db, key);
-		DEBUG(DEBUG_ERR,(__location__ " Unable to allocate dstate\n"));
-		if (client->ctdb->statistics.pending_calls > 0) {
-			ctdb->statistics.pending_calls--;
+		ret = ctdb_ltdb_unlock(ctdb_db, key);
+		if (ret != 0) {
+			DEBUG(DEBUG_ERR,(__location__ " ctdb_ltdb_unlock() failed with error %d\n", ret));
 		}
+
+		DEBUG(DEBUG_ERR,(__location__ " Unable to allocate dstate\n"));
+		CTDB_DECREMENT_STAT(ctdb, pending_calls);
 		return;
 	}
 	dstate->start_time = timeval_current();
@@ -424,35 +736,58 @@ static void daemon_request_call_from_client(struct ctdb_client *client,
 
 	call = dstate->call = talloc_zero(dstate, struct ctdb_call);
 	if (call == NULL) {
-		ctdb_ltdb_unlock(ctdb_db, key);
-		DEBUG(DEBUG_ERR,(__location__ " Unable to allocate call\n"));
-		if (client->ctdb->statistics.pending_calls > 0) {
-			ctdb->statistics.pending_calls--;
+		ret = ctdb_ltdb_unlock(ctdb_db, key);
+		if (ret != 0) {
+			DEBUG(DEBUG_ERR,(__location__ " ctdb_ltdb_unlock() failed with error %d\n", ret));
 		}
-		ctdb_latency(ctdb_db, "call_from_client 1", &ctdb->statistics.max_call_latency, dstate->start_time);
+
+		DEBUG(DEBUG_ERR,(__location__ " Unable to allocate call\n"));
+		CTDB_DECREMENT_STAT(ctdb, pending_calls);
+		CTDB_UPDATE_LATENCY(ctdb, ctdb_db, "call_from_client 1", call_latency, dstate->start_time);
 		return;
 	}
 
+	dstate->readonly_fetch = 0;
 	call->call_id = c->callid;
 	call->key = key;
 	call->call_data.dptr = c->data + c->keylen;
 	call->call_data.dsize = c->calldatalen;
 	call->flags = c->flags;
 
+	if (c->flags & CTDB_WANT_READONLY) {
+		/* client wants readonly record, so translate this into a 
+		   fetch with header. remember what the client asked for
+		   so we can remap the reply back to the proper format for
+		   the client in the reply
+		 */
+		dstate->client_callid = call->call_id;
+		call->call_id = CTDB_FETCH_WITH_HEADER_FUNC;
+		dstate->readonly_fetch = 1;
+	}
+
 	if (header.dmaster == ctdb->pnn) {
 		state = ctdb_call_local_send(ctdb_db, call, &header, &data);
 	} else {
 		state = ctdb_daemon_call_send_remote(ctdb_db, call, &header);
+		if (ctdb->tunable.fetch_collapse == 1) {
+			/* This request triggered a remote fetch-lock.
+			   set up a deferral for this key so any additional
+			   fetch-locks are deferred until the current one
+			   finishes.
+			 */
+			setup_deferred_fetch_locks(ctdb_db, call);
+		}
 	}
 
-	ctdb_ltdb_unlock(ctdb_db, key);
+	ret = ctdb_ltdb_unlock(ctdb_db, key);
+	if (ret != 0) {
+		DEBUG(DEBUG_ERR,(__location__ " ctdb_ltdb_unlock() failed with error %d\n", ret));
+	}
 
 	if (state == NULL) {
 		DEBUG(DEBUG_ERR,(__location__ " Unable to setup call send\n"));
-		if (client->ctdb->statistics.pending_calls > 0) {
-			ctdb->statistics.pending_calls--;
-		}
-		ctdb_latency(ctdb_db, "call_from_client 2", &ctdb->statistics.max_call_latency, dstate->start_time);
+		CTDB_DECREMENT_STAT(ctdb, pending_calls);
+		CTDB_UPDATE_LATENCY(ctdb, ctdb_db, "call_from_client 2", call_latency, dstate->start_time);
 		return;
 	}
 	talloc_steal(state, dstate);
@@ -492,17 +827,17 @@ static void daemon_incoming_packet(void *p, struct ctdb_req_header *hdr)
 
 	switch (hdr->operation) {
 	case CTDB_REQ_CALL:
-		ctdb->statistics.client.req_call++;
+		CTDB_INCREMENT_STAT(ctdb, client.req_call);
 		daemon_request_call_from_client(client, (struct ctdb_req_call *)hdr);
 		break;
 
 	case CTDB_REQ_MESSAGE:
-		ctdb->statistics.client.req_message++;
+		CTDB_INCREMENT_STAT(ctdb, client.req_message);
 		daemon_request_message_from_client(client, (struct ctdb_req_message *)hdr);
 		break;
 
 	case CTDB_REQ_CONTROL:
-		ctdb->statistics.client.req_control++;
+		CTDB_INCREMENT_STAT(ctdb, client.req_control);
 		daemon_request_control_from_client(client, (struct ctdb_req_control *)hdr);
 		break;
 
@@ -528,7 +863,7 @@ static void ctdb_daemon_read_cb(uint8_t *data, size_t cnt, void *args)
 		return;
 	}
 
-	client->ctdb->statistics.client_packets_recv++;
+	CTDB_INCREMENT_STAT(client->ctdb, client_packets_recv);
 
 	if (cnt < sizeof(*hdr)) {
 		ctdb_set_error(client->ctdb, "Bad packet length %u in daemon\n", 
@@ -580,13 +915,7 @@ static void ctdb_accept_client(struct event_context *ev, struct fd_event *fde,
 	struct ctdb_context *ctdb = talloc_get_type(private_data, struct ctdb_context);
 	struct ctdb_client *client;
 	struct ctdb_client_pid_list *client_pid;
-#ifdef _AIX
-	struct peercred_struct cr;
-	socklen_t crl = sizeof(struct peercred_struct);
-#else
-	struct ucred cr;
-	socklen_t crl = sizeof(struct ucred);
-#endif
+	pid_t peer_pid = 0;
 
 	memset(&addr, 0, sizeof(addr));
 	len = sizeof(addr);
@@ -601,18 +930,14 @@ static void ctdb_accept_client(struct event_context *ev, struct fd_event *fde,
 	DEBUG(DEBUG_DEBUG,(__location__ " Created SOCKET FD:%d to connected child\n", fd));
 
 	client = talloc_zero(ctdb, struct ctdb_client);
-#ifdef _AIX
-	if (getsockopt(fd, SOL_SOCKET, SO_PEERID, &cr, &crl) == 0) {
-#else
-	if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cr, &crl) == 0) {
-#endif
-		DEBUG(DEBUG_INFO,("Connected client with pid:%u\n", (unsigned)cr.pid));
+	if (ctdb_get_peer_pid(fd, &peer_pid) == 0) {
+		DEBUG(DEBUG_INFO,("Connected client with pid:%u\n", (unsigned)peer_pid));
 	}
 
 	client->ctdb = ctdb;
 	client->fd = fd;
 	client->client_id = ctdb_reqid_new(ctdb, client);
-	client->pid = cr.pid;
+	client->pid = peer_pid;
 
 	client_pid = talloc(client, struct ctdb_client_pid_list);
 	if (client_pid == NULL) {
@@ -622,17 +947,18 @@ static void ctdb_accept_client(struct event_context *ev, struct fd_event *fde,
 		return;
 	}		
 	client_pid->ctdb   = ctdb;
-	client_pid->pid    = cr.pid;
+	client_pid->pid    = peer_pid;
 	client_pid->client = client;
 
 	DLIST_ADD(ctdb->client_pids, client_pid);
 
 	client->queue = ctdb_queue_setup(ctdb, client, fd, CTDB_DS_ALIGNMENT, 
-					 ctdb_daemon_read_cb, client);
+					 ctdb_daemon_read_cb, client,
+					 "client-%u", client->pid);
 
 	talloc_set_destructor(client, ctdb_client_destructor);
 	talloc_set_destructor(client_pid, ctdb_clientpid_destructor);
-	ctdb->statistics.num_clients++;
+	ctdb->num_clients++;
 }
 
 
@@ -650,23 +976,35 @@ static int ux_socket_bind(struct ctdb_context *ctdb)
 		return -1;
 	}
 
-	set_close_on_exec(ctdb->daemon.sd);
-	set_nonblocking(ctdb->daemon.sd);
-
 	memset(&addr, 0, sizeof(addr));
 	addr.sun_family = AF_UNIX;
-	strncpy(addr.sun_path, ctdb->daemon.name, sizeof(addr.sun_path));
+	strncpy(addr.sun_path, ctdb->daemon.name, sizeof(addr.sun_path)-1);
+
+	/* First check if an old ctdbd might be running */
+	if (connect(ctdb->daemon.sd,
+		    (struct sockaddr *)&addr, sizeof(addr)) == 0) {
+		DEBUG(DEBUG_CRIT,
+		      ("Something is already listening on ctdb socket '%s'\n",
+		       ctdb->daemon.name));
+		goto failed;
+	}
+
+	/* Remove any old socket */
+	unlink(ctdb->daemon.name);
+
+	set_close_on_exec(ctdb->daemon.sd);
+	set_nonblocking(ctdb->daemon.sd);
 
 	if (bind(ctdb->daemon.sd, (struct sockaddr *)&addr, sizeof(addr)) == -1) {
 		DEBUG(DEBUG_CRIT,("Unable to bind on ctdb socket '%s'\n", ctdb->daemon.name));
 		goto failed;
-	}	
+	}
 
 	if (chown(ctdb->daemon.name, geteuid(), getegid()) != 0 ||
 	    chmod(ctdb->daemon.name, 0700) != 0) {
 		DEBUG(DEBUG_CRIT,("Unable to secure ctdb socket '%s', ctdb->daemon.name\n", ctdb->daemon.name));
 		goto failed;
-	} 
+	}
 
 
 	if (listen(ctdb->daemon.sd, 100) != 0) {
@@ -682,24 +1020,23 @@ failed:
 	return -1;	
 }
 
-static void sig_child_handler(struct event_context *ev,
-	struct signal_event *se, int signum, int count,
-	void *dont_care, 
-	void *private_data)
+static void initialise_node_flags (struct ctdb_context *ctdb)
 {
-//	struct ctdb_context *ctdb = talloc_get_type(private_data, struct ctdb_context);
-	int status;
-	pid_t pid = -1;
+	if (ctdb->pnn == -1) {
+		ctdb_fatal(ctdb, "PNN is set to -1 (unknown value)");
+	}
 
-	while (pid != 0) {
-		pid = waitpid(-1, &status, WNOHANG);
-		if (pid == -1) {
-			DEBUG(DEBUG_ERR, (__location__ " waitpid() returned error. errno:%d\n", errno));
-			return;
-		}
-		if (pid > 0) {
-			DEBUG(DEBUG_DEBUG, ("SIGCHLD from %d\n", (int)pid));
-		}
+	ctdb->nodes[ctdb->pnn]->flags &= ~NODE_FLAGS_DISCONNECTED;
+
+	/* do we start out in DISABLED mode? */
+	if (ctdb->start_as_disabled != 0) {
+		DEBUG(DEBUG_INFO, ("This node is configured to start in DISABLED state\n"));
+		ctdb->nodes[ctdb->pnn]->flags |= NODE_FLAGS_DISABLED;
+	}
+	/* do we start out in STOPPED mode? */
+	if (ctdb->start_as_stopped != 0) {
+		DEBUG(DEBUG_INFO, ("This node is configured to start in STOPPED state\n"));
+		ctdb->nodes[ctdb->pnn]->flags |= NODE_FLAGS_STOPPED;
 	}
 }
 
@@ -707,16 +1044,102 @@ static void ctdb_setup_event_callback(struct ctdb_context *ctdb, int status,
 				      void *private_data)
 {
 	if (status != 0) {
-		ctdb_fatal(ctdb, "Failed to run setup event\n");
-		return;
+		ctdb_die(ctdb, "Failed to run setup event");
 	}
 	ctdb_run_notification_script(ctdb, "setup");
+
+	ctdb_set_runstate(ctdb, CTDB_RUNSTATE_FIRST_RECOVERY);
 
 	/* tell all other nodes we've just started up */
 	ctdb_daemon_send_control(ctdb, CTDB_BROADCAST_ALL,
 				 0, CTDB_CONTROL_STARTUP, 0,
 				 CTDB_CTRL_FLAG_NOREPLY,
 				 tdb_null, NULL, NULL);
+
+	/* Start the recovery daemon */
+	if (ctdb_start_recoverd(ctdb) != 0) {
+		DEBUG(DEBUG_ALERT,("Failed to start recovery daemon\n"));
+		exit(11);
+	}
+
+	ctdb_start_periodic_events(ctdb);
+}
+
+static struct timeval tevent_before_wait_ts;
+static struct timeval tevent_after_wait_ts;
+
+static void ctdb_tevent_trace(enum tevent_trace_point tp,
+			      void *private_data)
+{
+	struct timeval diff;
+	struct timeval now;
+
+	if (getpid() != ctdbd_pid) {
+		return;
+	}
+
+	now = timeval_current();
+
+	switch (tp) {
+	case TEVENT_TRACE_BEFORE_WAIT:
+		if (!timeval_is_zero(&tevent_after_wait_ts)) {
+			diff = timeval_until(&tevent_after_wait_ts, &now);
+			if (diff.tv_sec > 3) {
+				DEBUG(DEBUG_ERR,
+				      ("Handling event took %ld seconds!\n",
+				       diff.tv_sec));
+			}
+		}
+		tevent_before_wait_ts = now;
+		break;
+
+	case TEVENT_TRACE_AFTER_WAIT:
+		if (!timeval_is_zero(&tevent_before_wait_ts)) {
+			diff = timeval_until(&tevent_before_wait_ts, &now);
+			if (diff.tv_sec > 3) {
+				DEBUG(DEBUG_CRIT,
+				      ("No event for %ld seconds!\n",
+				       diff.tv_sec));
+			}
+		}
+		tevent_after_wait_ts = now;
+		break;
+
+	default:
+		/* Do nothing for future tevent trace points */ ;
+	}
+}
+
+static void ctdb_remove_pidfile(void)
+{
+	if (ctdbd_pidfile != NULL && !ctdb_is_child_process()) {
+		if (unlink(ctdbd_pidfile) == 0) {
+			DEBUG(DEBUG_NOTICE, ("Removed PID file %s\n",
+					     ctdbd_pidfile));
+		} else {
+			DEBUG(DEBUG_WARNING, ("Failed to Remove PID file %s\n",
+					      ctdbd_pidfile));
+		}
+	}
+}
+
+static void ctdb_create_pidfile(pid_t pid)
+{
+	if (ctdbd_pidfile != NULL) {
+		FILE *fp;
+
+		fp = fopen(ctdbd_pidfile, "w");
+		if (fp == NULL) {
+			DEBUG(DEBUG_ALERT,
+			      ("Failed to open PID file %s\n", ctdbd_pidfile));
+			exit(11);
+		}
+
+		fprintf(fp, "%d\n", pid);
+		fclose(fp);
+		DEBUG(DEBUG_NOTICE, ("Created PID file %s\n", ctdbd_pidfile));
+		atexit(ctdb_remove_pidfile);
+	}
 }
 
 /*
@@ -727,15 +1150,11 @@ int ctdb_start_daemon(struct ctdb_context *ctdb, bool do_fork, bool use_syslog)
 	int res, ret = -1;
 	struct fd_event *fde;
 	const char *domain_socket_name;
-	struct signal_event *se;
-
-	/* get rid of any old sockets */
-	unlink(ctdb->daemon.name);
 
 	/* create a unix domain stream socket to listen to */
 	res = ux_socket_bind(ctdb);
 	if (res!=0) {
-		DEBUG(DEBUG_ALERT,(__location__ " Failed to open CTDB unix domain socket\n"));
+		DEBUG(DEBUG_ALERT,("Cannot continue.  Exiting!\n"));
 		exit(10);
 	}
 
@@ -743,7 +1162,7 @@ int ctdb_start_daemon(struct ctdb_context *ctdb, bool do_fork, bool use_syslog)
 		return 0;
 	}
 
-	tdb_reopen_all(False);
+	tdb_reopen_all(false);
 
 	if (do_fork) {
 		setsid();
@@ -757,11 +1176,20 @@ int ctdb_start_daemon(struct ctdb_context *ctdb, bool do_fork, bool use_syslog)
 
 	ctdbd_pid = getpid();
 	ctdb->ctdbd_pid = ctdbd_pid;
+	DEBUG(DEBUG_ERR, ("Starting CTDBD (Version %s) as PID: %u\n",
+			  CTDB_VERSION_STRING, ctdbd_pid));
+	ctdb_create_pidfile(ctdb->ctdbd_pid);
 
+	/* Make sure we log something when the daemon terminates.
+	 * This must be the first exit handler to run (so the last to
+	 * be registered.
+	 */
+	atexit(print_exit_message);
 
-	DEBUG(DEBUG_ERR, ("Starting CTDBD as pid : %u\n", ctdbd_pid));
-
-	ctdb_high_priority(ctdb);
+	if (ctdb->do_setsched) {
+		/* try to set us up as realtime */
+		ctdb_set_scheduler(ctdb);
+	}
 
 	/* ensure the socket is deleted on exit of the daemon */
 	domain_socket_name = talloc_strdup(talloc_autofree_context(), ctdb->daemon.name);
@@ -771,11 +1199,40 @@ int ctdb_start_daemon(struct ctdb_context *ctdb, bool do_fork, bool use_syslog)
 	}
 
 	ctdb->ev = event_context_init(NULL);
+	tevent_loop_allow_nesting(ctdb->ev);
+	tevent_set_trace_callback(ctdb->ev, ctdb_tevent_trace, NULL);
+	ret = ctdb_init_tevent_logging(ctdb);
+	if (ret != 0) {
+		DEBUG(DEBUG_ALERT,("Failed to initialize TEVENT logging\n"));
+		exit(1);
+	}
+
+	/* set up a handler to pick up sigchld */
+	if (ctdb_init_sigchld(ctdb) == NULL) {
+		DEBUG(DEBUG_CRIT,("Failed to set up signal handler for SIGCHLD\n"));
+		exit(1);
+	}
 
 	ctdb_set_child_logging(ctdb);
+	if (use_syslog) {
+		if (start_syslog_daemon(ctdb)) {
+			DEBUG(DEBUG_CRIT, ("Failed to start syslog daemon\n"));
+			exit(10);
+		}
+	}
+
+	/* initialize statistics collection */
+	ctdb_statistics_init(ctdb);
 
 	/* force initial recovery for election */
 	ctdb->recovery_mode = CTDB_RECOVERY_ACTIVE;
+
+	ctdb_set_runstate(ctdb, CTDB_RUNSTATE_INIT);
+	ret = ctdb_event_script(ctdb, CTDB_EVENT_INIT);
+	if (ret != 0) {
+		ctdb_die(ctdb, "Failed to run init event\n");
+	}
+	ctdb_run_notification_script(ctdb, "init");
 
 	if (strcmp(ctdb->transport, "tcp") == 0) {
 		int ctdb_tcp_init(struct ctdb_context *);
@@ -802,60 +1259,66 @@ int ctdb_start_daemon(struct ctdb_context *ctdb, bool do_fork, bool use_syslog)
 		ctdb_fatal(ctdb, "transport failed to initialise");
 	}
 
+	initialise_node_flags(ctdb);
+
+	if (ctdb->public_addresses_file) {
+		ret = ctdb_set_public_addresses(ctdb, true);
+		if (ret == -1) {
+			DEBUG(DEBUG_ALERT,("Unable to setup public address list\n"));
+			exit(1);
+		}
+		if (ctdb->do_checkpublicip) {
+			ctdb_start_monitoring_interfaces(ctdb);
+		}
+	}
+
+
 	/* attach to existing databases */
 	if (ctdb_attach_databases(ctdb) != 0) {
 		ctdb_fatal(ctdb, "Failed to attach to databases\n");
 	}
 
 	/* start frozen, then let the first election sort things out */
-	if (ctdb_blocking_freeze(ctdb)) {
+	if (!ctdb_blocking_freeze(ctdb)) {
 		ctdb_fatal(ctdb, "Failed to get initial freeze\n");
 	}
 
-	ret = ctdb_event_script(ctdb, CTDB_EVENT_INIT);
-	if (ret != 0) {
-		ctdb_fatal(ctdb, "Failed to run init event\n");
-	}
-	ctdb_run_notification_script(ctdb, "init");
-
 	/* now start accepting clients, only can do this once frozen */
 	fde = event_add_fd(ctdb->ev, ctdb, ctdb->daemon.sd, 
-			   EVENT_FD_READ|EVENT_FD_AUTOCLOSE, 
+			   EVENT_FD_READ,
 			   ctdb_accept_client, ctdb);
+	if (fde == NULL) {
+		ctdb_fatal(ctdb, "Failed to add daemon socket to event loop");
+	}
+	tevent_fd_set_auto_close(fde);
 
 	/* release any IPs we hold from previous runs of the daemon */
-	ctdb_release_all_ips(ctdb);
-
-	/* start the transport going */
-	ctdb_start_transport(ctdb);
-
-	/* set up a handler to pick up sigchld */
-	se = event_add_signal(ctdb->ev, ctdb,
-				     SIGCHLD, 0,
-				     sig_child_handler,
-				     ctdb);
-	if (se == NULL) {
-		DEBUG(DEBUG_CRIT,("Failed to set up signal handler for SIGCHLD\n"));
-		exit(1);
+	if (ctdb->tunable.disable_ip_failover == 0) {
+		ctdb_release_all_ips(ctdb);
 	}
 
+	/* Start the transport */
+	if (ctdb->methods->start(ctdb) != 0) {
+		DEBUG(DEBUG_ALERT,("transport failed to start!\n"));
+		ctdb_fatal(ctdb, "transport failed to start");
+	}
+
+	/* Recovery daemon and timed events are started from the
+	 * callback, only after the setup event completes
+	 * successfully.
+	 */
+	ctdb_set_runstate(ctdb, CTDB_RUNSTATE_SETUP);
 	ret = ctdb_event_script_callback(ctdb,
 					 ctdb,
 					 ctdb_setup_event_callback,
 					 ctdb,
 					 false,
 					 CTDB_EVENT_SETUP,
+					 "%s",
 					 "");
 	if (ret != 0) {
 		DEBUG(DEBUG_CRIT,("Failed to set up 'setup' event\n"));
 		exit(1);
-	}
-
-	if (use_syslog) {
-		if (start_syslog_daemon(ctdb)) {
-			DEBUG(DEBUG_CRIT, ("Failed to start syslog daemon\n"));
-			exit(10);
-		}
 	}
 
 	ctdb_lockdown_memory(ctdb);
@@ -883,7 +1346,7 @@ struct ctdb_req_header *_ctdb_transport_allocate(struct ctdb_context *ctdb,
 	size = (length+(CTDB_DS_ALIGNMENT-1)) & ~(CTDB_DS_ALIGNMENT-1);
 
 	if (ctdb->methods == NULL) {
-		DEBUG(DEBUG_ERR,(__location__ " Unable to allocate transport packet for operation %u of length %u. Transport is DOWN.\n",
+		DEBUG(DEBUG_INFO,(__location__ " Unable to allocate transport packet for operation %u of length %u. Transport is DOWN.\n",
 			 operation, (unsigned)length));
 		return NULL;
 	}
@@ -1108,7 +1571,7 @@ int ctdb_daemon_send_message(struct ctdb_context *ctdb, uint32_t pnn,
 	int len;
 
 	if (ctdb->methods == NULL) {
-		DEBUG(DEBUG_ERR,(__location__ " Failed to send message. Transport is DOWN\n"));
+		DEBUG(DEBUG_INFO,(__location__ " Failed to send message. Transport is DOWN\n"));
 		return -1;
 	}
 
@@ -1163,7 +1626,7 @@ int32_t ctdb_control_register_notify(struct ctdb_context *ctdb, uint32_t client_
         struct ctdb_client *client = ctdb_reqid_find(ctdb, client_id, struct ctdb_client); 
 	struct ctdb_client_notify_list *nl;
 
-	DEBUG(DEBUG_ERR,("Register srvid %llu for client %d\n", (unsigned long long)notify->srvid, client_id));
+	DEBUG(DEBUG_INFO,("Register srvid %llu for client %d\n", (unsigned long long)notify->srvid, client_id));
 
 	if (indata.dsize < offsetof(struct ctdb_client_notify_register, notify_data)) {
 		DEBUG(DEBUG_ERR,(__location__ " Too little data in control : %d\n", (int)indata.dsize));
@@ -1212,7 +1675,7 @@ int32_t ctdb_control_deregister_notify(struct ctdb_context *ctdb, uint32_t clien
         struct ctdb_client *client = ctdb_reqid_find(ctdb, client_id, struct ctdb_client); 
 	struct ctdb_client_notify_list *nl;
 
-	DEBUG(DEBUG_ERR,("Deregister srvid %llu for client %d\n", (unsigned long long)notify->srvid, client_id));
+	DEBUG(DEBUG_INFO,("Deregister srvid %llu for client %d\n", (unsigned long long)notify->srvid, client_id));
 
         if (client == NULL) {
                 DEBUG(DEBUG_ERR,(__location__ " Could not find client parent structure. You can not send this control to a remote node\n"));
@@ -1273,4 +1736,26 @@ int32_t ctdb_control_process_exists(struct ctdb_context *ctdb, pid_t pid)
 	}
 
 	return kill(pid, 0);
+}
+
+void ctdb_shutdown_sequence(struct ctdb_context *ctdb, int exit_code)
+{
+	if (ctdb->runstate == CTDB_RUNSTATE_SHUTDOWN) {
+		DEBUG(DEBUG_NOTICE,("Already shutting down so will not proceed.\n"));
+		return;
+	}
+
+	DEBUG(DEBUG_NOTICE,("Shutdown sequence commencing.\n"));
+	ctdb_set_runstate(ctdb, CTDB_RUNSTATE_SHUTDOWN);
+	ctdb_stop_recoverd(ctdb);
+	ctdb_stop_keepalive(ctdb);
+	ctdb_stop_monitoring(ctdb);
+	ctdb_release_all_ips(ctdb);
+	ctdb_event_script(ctdb, CTDB_EVENT_SHUTDOWN);
+	if (ctdb->methods != NULL) {
+		ctdb->methods->shutdown(ctdb);
+	}
+
+	DEBUG(DEBUG_NOTICE,("Shutdown sequence complete, exiting.\n"));
+	exit(exit_code);
 }

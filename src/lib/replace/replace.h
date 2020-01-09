@@ -4,7 +4,7 @@
    macros to go along with the lib/replace/ portability layer code
 
    Copyright (C) Andrew Tridgell 2005
-   Copyright (C) Jelmer Vernooij 2006
+   Copyright (C) Jelmer Vernooij 2006-2008
    Copyright (C) Jeremy Allison 2007.
 
      ** NOTE! The following LGPL license applies to the replace
@@ -46,13 +46,113 @@
 #endif
 
 
-#ifdef HAVE_STDINT_H
+#ifdef HAVE_INTTYPES_H
+#define __STDC_FORMAT_MACROS
+#include <inttypes.h>
+#elif HAVE_STDINT_H
 #include <stdint.h>
 /* force off HAVE_INTTYPES_H so that roken doesn't try to include both,
    which causes a warning storm on irix */
 #undef HAVE_INTTYPES_H
-#elif HAVE_INTTYPES_H
-#include <inttypes.h>
+#endif
+
+#ifdef HAVE_MALLOC_H
+#include <malloc.h>
+#endif
+
+#ifndef __PRI64_PREFIX
+# if __WORDSIZE == 64 && ! defined __APPLE__
+#  define __PRI64_PREFIX	"l"
+# else
+#  define __PRI64_PREFIX	"ll"
+# endif
+#endif
+
+/* Decimal notation.  */
+#ifndef PRId8
+# define PRId8		"d"
+#endif
+#ifndef PRId16
+# define PRId16		"d"
+#endif
+#ifndef PRId32
+# define PRId32		"d"
+#endif
+#ifndef PRId64
+# define PRId64		__PRI64_PREFIX "d"
+#endif
+
+#ifndef PRIi8
+# define PRIi8		"i"
+#endif
+#ifndef PRIi16
+# define PRIi16		"i"
+#endif
+#ifndef PRIi32
+# define PRIi32		"i"
+#endif
+#ifndef PRIi64
+# define PRIi64		__PRI64_PREFIX "i"
+#endif
+
+#ifndef PRIu8
+# define PRIu8		"u"
+#endif
+#ifndef PRIu16
+# define PRIu16		"u"
+#endif
+#ifndef PRIu32
+# define PRIu32		"u"
+#endif
+#ifndef PRIu64
+# define PRIu64		__PRI64_PREFIX "u"
+#endif
+
+#ifndef SCNd8
+# define SCNd8		"hhd"
+#endif
+#ifndef SCNd16
+# define SCNd16		"hd"
+#endif
+#ifndef SCNd32
+# define SCNd32		"d"
+#endif
+#ifndef SCNd64
+# define SCNd64		__PRI64_PREFIX "d"
+#endif
+
+#ifndef SCNi8
+# define SCNi8		"hhi"
+#endif
+#ifndef SCNi16
+# define SCNi16		"hi"
+#endif
+#ifndef SCNi32
+# define SCNi32		"i"
+#endif
+#ifndef SCNi64
+# define SCNi64		__PRI64_PREFIX "i"
+#endif
+
+#ifndef SCNu8
+# define SCNu8		"hhu"
+#endif
+#ifndef SCNu16
+# define SCNu16		"hu"
+#endif
+#ifndef SCNu32
+# define SCNu32		"u"
+#endif
+#ifndef SCNu64
+# define SCNu64		__PRI64_PREFIX "u"
+#endif
+
+#ifdef HAVE_BSD_STRING_H
+#include <bsd/string.h>
+#endif
+
+#ifdef HAVE_BSD_UNISTD_H
+#include <bsd/unistd.h>
 #endif
 
 #ifdef HAVE_STRING_H
@@ -67,9 +167,20 @@
 #include <sys/types.h>
 #endif
 
+#ifdef HAVE_SETPROCTITLE_H
+#include <setproctitle.h>
+#endif
+
 #if STDC_HEADERS
 #include <stdlib.h>
 #include <stddef.h>
+#endif
+
+#ifdef HAVE_LINUX_TYPES_H
+/*
+ * This is needed as some broken header files require this to be included early
+ */
+#include <linux/types.h>
 #endif
 
 #ifndef HAVE_STRERROR
@@ -91,6 +202,17 @@ char *rep_strdup(const char *s);
 void *rep_memmove(void *dest,const void *src,int size);
 #endif
 
+#ifndef HAVE_MEMMEM
+#define memmem rep_memmem
+void *rep_memmem(const void *haystack, size_t haystacklen,
+		 const void *needle, size_t needlelen);
+#endif
+
+#ifndef HAVE_MEMALIGN
+#define memalign rep_memalign
+void *rep_memalign(size_t boundary, size_t size);
+#endif
+
 #ifndef HAVE_MKTIME
 #define mktime rep_mktime
 /* prototype is in "system/time.h" */
@@ -98,6 +220,16 @@ void *rep_memmove(void *dest,const void *src,int size);
 
 #ifndef HAVE_TIMEGM
 #define timegm rep_timegm
+/* prototype is in "system/time.h" */
+#endif
+
+#ifndef HAVE_UTIME
+#define utime rep_utime
+/* prototype is in "system/time.h" */
+#endif
+
+#ifndef HAVE_UTIMES
+#define utimes rep_utimes
 /* prototype is in "system/time.h" */
 #endif
 
@@ -121,6 +253,15 @@ char *rep_strndup(const char *s, size_t n);
 #undef HAVE_STRNLEN
 #define strnlen rep_strnlen
 size_t rep_strnlen(const char *s, size_t n);
+#endif
+
+#if !HAVE_DECL_ENVIRON
+#ifdef __APPLE__
+#include <crt_externs.h>
+#define environ (*_NSGetEnviron())
+#else
+extern char **environ;
+#endif
 #endif
 
 #ifndef HAVE_SETENV
@@ -147,6 +288,53 @@ int rep_seteuid(uid_t);
 int rep_setegid(gid_t);
 #endif
 
+#if (defined(USE_SETRESUID) && !defined(HAVE_SETRESUID_DECL))
+/* stupid glibc */
+int setresuid(uid_t ruid, uid_t euid, uid_t suid);
+#endif
+#if (defined(USE_SETRESUID) && !defined(HAVE_SETRESGID_DECL))
+int setresgid(gid_t rgid, gid_t egid, gid_t sgid);
+#endif
+
+#ifndef HAVE_CHOWN
+#define chown rep_chown
+int rep_chown(const char *path, uid_t uid, gid_t gid);
+#endif
+
+#ifndef HAVE_CHROOT
+#define chroot rep_chroot
+int rep_chroot(const char *dirname);
+#endif
+
+#ifndef HAVE_LINK
+#define link rep_link
+int rep_link(const char *oldpath, const char *newpath);
+#endif
+
+#ifndef HAVE_READLINK
+#define readlink rep_readlink
+ssize_t rep_readlink(const char *path, char *buf, size_t bufsize);
+#endif
+
+#ifndef HAVE_SYMLINK
+#define symlink rep_symlink
+int rep_symlink(const char *oldpath, const char *newpath);
+#endif
+
+#ifndef HAVE_REALPATH
+#define realpath rep_realpath
+char *rep_realpath(const char *path, char *resolved_path);
+#endif
+
+#ifndef HAVE_LCHOWN
+#define lchown rep_lchown
+int rep_lchown(const char *fname,uid_t uid,gid_t gid);
+#endif
+
+#ifdef HAVE_UNIX_H
+#include <unix.h>
+#endif
+
 #ifndef HAVE_SETLINEBUF
 #define setlinebuf rep_setlinebuf
 void rep_setlinebuf(FILE *);
@@ -162,14 +350,26 @@ char *rep_strcasestr(const char *haystack, const char *needle);
 char *rep_strtok_r(char *s, const char *delim, char **save_ptr);
 #endif
 
+
+
 #ifndef HAVE_STRTOLL
 #define strtoll rep_strtoll
 long long int rep_strtoll(const char *str, char **endptr, int base);
+#else
+#ifdef HAVE_BSD_STRTOLL
+#define strtoll rep_strtoll
+long long int rep_strtoll(const char *str, char **endptr, int base);
+#endif
 #endif
 
 #ifndef HAVE_STRTOULL
 #define strtoull rep_strtoull
 unsigned long long int rep_strtoull(const char *str, char **endptr, int base);
+#else
+#ifdef HAVE_BSD_STRTOLL /* yes, it's not HAVE_BSD_STRTOULL */
+#define strtoull rep_strtoull
+unsigned long long int rep_strtoull(const char *str, char **endptr, int base);
+#endif
 #endif
 
 #ifndef HAVE_FTRUNCATE
@@ -212,7 +412,7 @@ int rep_dlclose(void *handle);
 
 #ifndef HAVE_SOCKETPAIR
 #define socketpair rep_socketpair
-int rep_socketpair(int d, int type, int protocol, int sv[2]);
+/* prototype is in system/network.h */
 #endif
 
 #ifndef PRINTF_ATTRIBUTE
@@ -235,7 +435,17 @@ int rep_socketpair(int d, int type, int protocol, int sv[2]);
 #endif
 #endif
 
-#ifndef HAVE_VASPRINTF
+#if !defined(HAVE_VDPRINTF) || !defined(HAVE_C99_VSNPRINTF)
+#define vdprintf rep_vdprintf
+int rep_vdprintf(int fd, const char *format, va_list ap) PRINTF_ATTRIBUTE(2,0);
+#endif
+
+#if !defined(HAVE_DPRINTF) || !defined(HAVE_C99_VSNPRINTF)
+#define dprintf rep_dprintf
+int rep_dprintf(int fd, const char *format, ...) PRINTF_ATTRIBUTE(2,3);
+#endif
+
+#if !defined(HAVE_VASPRINTF) || !defined(HAVE_C99_VSNPRINTF)
 #define vasprintf rep_vasprintf
 int rep_vasprintf(char **ptr, const char *format, va_list ap) PRINTF_ATTRIBUTE(2,0);
 #endif
@@ -250,9 +460,27 @@ int rep_snprintf(char *,size_t ,const char *, ...) PRINTF_ATTRIBUTE(3,4);
 int rep_vsnprintf(char *,size_t ,const char *, va_list ap) PRINTF_ATTRIBUTE(3,0);
 #endif
 
-#ifndef HAVE_ASPRINTF
+#if !defined(HAVE_ASPRINTF) || !defined(HAVE_C99_VSNPRINTF)
 #define asprintf rep_asprintf
 int rep_asprintf(char **,const char *, ...) PRINTF_ATTRIBUTE(2,3);
+#endif
+
+#if !defined(HAVE_C99_VSNPRINTF)
+#ifdef REPLACE_BROKEN_PRINTF
+/*
+ * We do not redefine printf by default
+ * as it breaks the build if system headers
+ * use __attribute__((format(printf, 3, 0)))
+ * instead of __attribute__((format(__printf__, 3, 0)))
+ */
+#define printf rep_printf
+#endif
+int rep_printf(const char *, ...) PRINTF_ATTRIBUTE(1,2);
+#endif
+
+#if !defined(HAVE_C99_VSNPRINTF)
+#define fprintf rep_fprintf
+int rep_fprintf(FILE *stream, const char *, ...) PRINTF_ATTRIBUTE(2,3);
 #endif
 
 #ifndef HAVE_VSYSLOG
@@ -284,10 +512,15 @@ void rep_vsyslog (int facility_priority, const char *format, va_list arglist) PR
 typedef int (*comparison_fn_t)(const void *, const void *);
 #endif
 
-#ifdef REPLACE_STRPTIME
+#ifndef HAVE_WORKING_STRPTIME
 #define strptime rep_strptime
 struct tm;
 char *rep_strptime(const char *buf, const char *format, struct tm *tm);
+#endif
+
+#ifndef HAVE_DUP2
+#define dup2 rep_dup2
+int rep_dup2(int oldfd, int newfd);
 #endif
 
 /* Load header file for dynamic linking stuff */
@@ -318,14 +551,20 @@ char *rep_mkdtemp(char *template);
 #ifndef HAVE_PREAD
 #define pread rep_pread
 ssize_t rep_pread(int __fd, void *__buf, size_t __nbytes, off_t __offset);
+#define LIBREPLACE_PREAD_REPLACED 1
+#else
+#define LIBREPLACE_PREAD_NOT_REPLACED 1
 #endif
 
 #ifndef HAVE_PWRITE
 #define pwrite rep_pwrite
 ssize_t rep_pwrite(int __fd, const void *__buf, size_t __nbytes, off_t __offset);
+#define LIBREPLACE_PWRITE_REPLACED 1
+#else
+#define LIBREPLACE_PWRITE_NOT_REPLACED 1
 #endif
 
-#ifdef REPLACE_INET_NTOA
+#if !defined(HAVE_INET_NTOA) || defined(REPLACE_INET_NTOA)
 #define inet_ntoa rep_inet_ntoa
 /* prototype is in "system/network.h" */
 #endif
@@ -340,6 +579,21 @@ ssize_t rep_pwrite(int __fd, const void *__buf, size_t __nbytes, off_t __offset)
 /* prototype is in "system/network.h" */
 #endif
 
+#ifndef HAVE_INET_ATON
+#define inet_aton rep_inet_aton
+/* prototype is in "system/network.h" */
+#endif
+
+#ifndef HAVE_CONNECT
+#define connect rep_connect
+/* prototype is in "system/network.h" */
+#endif
+
+#ifndef HAVE_GETHOSTBYNAME
+#define gethostbyname rep_gethostbyname
+/* prototype is in "system/network.h" */
+#endif
+
 #ifndef HAVE_GETIFADDRS
 #define getifaddrs rep_getifaddrs
 /* prototype is in "system/network.h" */
@@ -348,6 +602,20 @@ ssize_t rep_pwrite(int __fd, const void *__buf, size_t __nbytes, off_t __offset)
 #ifndef HAVE_FREEIFADDRS
 #define freeifaddrs rep_freeifaddrs
 /* prototype is in "system/network.h" */
+#endif
+
+#ifndef HAVE_GET_CURRENT_DIR_NAME
+#define get_current_dir_name rep_get_current_dir_name
+char *rep_get_current_dir_name(void);
+#endif
+
+#ifndef HAVE_STRERROR_R
+#define strerror_r rep_strerror_r
+int rep_strerror_r(int errnum, char *buf, size_t buflen);
+#endif
+
+#if !defined(HAVE_CLOCK_GETTIME)
+#define clock_gettime rep_clock_gettime
 #endif
 
 #ifdef HAVE_LIMITS_H
@@ -366,18 +634,6 @@ ssize_t rep_pwrite(int __fd, const void *__buf, size_t __nbytes, off_t __offset)
   			      ? ~ (t) 0 << (sizeof (t) * CHAR_BIT - 1) : (t) 0))
 #define _TYPE_MAXIMUM(t) ((t) (~ (t) 0 - _TYPE_MINIMUM (t)))
 
-#ifndef HOST_NAME_MAX
-#define HOST_NAME_MAX 255
-#endif
-
-/*
- * Some older systems seem not to have MAXHOSTNAMELEN
- * defined.
- */
-#ifndef MAXHOSTNAMELEN
-#define MAXHOSTNAMELEN HOST_NAME_MAX
-#endif
-
 #ifndef UINT16_MAX
 #define UINT16_MAX 65535
 #endif
@@ -388,6 +644,10 @@ ssize_t rep_pwrite(int __fd, const void *__buf, size_t __nbytes, off_t __offset)
 
 #ifndef UINT64_MAX
 #define UINT64_MAX ((uint64_t)-1)
+#endif
+
+#ifndef INT64_MAX
+#define INT64_MAX 9223372036854775807LL
 #endif
 
 #ifndef CHAR_BIT
@@ -408,6 +668,18 @@ ssize_t rep_pwrite(int __fd, const void *__buf, size_t __nbytes, off_t __offset)
 #else
 typedef int bool;
 #endif
+#endif
+
+#if !defined(HAVE_INTPTR_T)
+typedef long long intptr_t ;
+#endif
+
+#if !defined(HAVE_UINTPTR_T)
+typedef unsigned long long uintptr_t ;
+#endif
+
+#if !defined(HAVE_PTRDIFF_T)
+typedef unsigned long long ptrdiff_t ;
 #endif
 
 /*
@@ -484,7 +756,7 @@ typedef int bool;
   Also, please call this via the discard_const_p() macro interface, as that
   makes the return type safe.
 */
-#define discard_const(ptr) ((void *)((intptr_t)(ptr)))
+#define discard_const(ptr) ((void *)((uintptr_t)(ptr)))
 
 /** Type-safe version of discard_const */
 #define discard_const_p(type, ptr) ((type *)discard_const(ptr))
@@ -544,6 +816,87 @@ typedef int bool;
 
 #ifndef QSORT_CAST
 #define QSORT_CAST (int (*)(const void *, const void *))
+#endif
+
+#ifndef PATH_MAX
+#define PATH_MAX 1024
+#endif
+
+#ifndef MAX_DNS_NAME_LENGTH
+#define MAX_DNS_NAME_LENGTH 256 /* Actually 255 but +1 for terminating null. */
+#endif
+
+#ifndef HAVE_CRYPT
+char *ufc_crypt(const char *key, const char *salt);
+#define crypt ufc_crypt
+#else
+#ifdef HAVE_CRYPT_H
+#include <crypt.h>
+#endif
+#endif
+
+/* these macros gain us a few percent of speed on gcc */
+#if (__GNUC__ >= 3)
+/* the strange !! is to ensure that __builtin_expect() takes either 0 or 1
+   as its first argument */
+#ifndef likely
+#define likely(x)   __builtin_expect(!!(x), 1)
+#endif
+#ifndef unlikely
+#define unlikely(x) __builtin_expect(!!(x), 0)
+#endif
+#else
+#ifndef likely
+#define likely(x) (x)
+#endif
+#ifndef unlikely
+#define unlikely(x) (x)
+#endif
+#endif
+
+#ifndef HAVE_FDATASYNC
+#define fdatasync(fd) fsync(fd)
+#elif !defined(HAVE_DECL_FDATASYNC)
+int fdatasync(int );
+#endif
+
+/* these are used to mark symbols as local to a shared lib, or
+ * publicly available via the shared lib API */
+#ifndef _PUBLIC_
+#ifdef HAVE_VISIBILITY_ATTR
+#define _PUBLIC_ __attribute__((visibility("default")))
+#else
+#define _PUBLIC_
+#endif
+#endif
+
+#ifndef _PRIVATE_
+#ifdef HAVE_VISIBILITY_ATTR
+#  define _PRIVATE_ __attribute__((visibility("hidden")))
+#else
+#  define _PRIVATE_
+#endif
+#endif
+
+#ifndef HAVE_POLL
+#define poll rep_poll
+/* prototype is in "system/network.h" */
+#endif
+
+#ifndef HAVE_GETPEEREID
+#define getpeereid rep_getpeereid
+int rep_getpeereid(int s, uid_t *uid, gid_t *gid);
+#endif
+
+#ifndef HAVE_USLEEP
+#define usleep rep_usleep
+typedef long useconds_t;
+int usleep(useconds_t);
+#endif
+
+#ifndef HAVE_SETPROCTITLE
+#define setproctitle rep_setproctitle
+void rep_setproctitle(const char *fmt, ...) PRINTF_ATTRIBUTE(1, 2);
 #endif
 
 #endif /* _LIBREPLACE_REPLACE_H */

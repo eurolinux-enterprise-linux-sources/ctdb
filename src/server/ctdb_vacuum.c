@@ -2,7 +2,7 @@
    ctdb vacuuming events
 
    Copyright (C) Ronnie Sahlberg  2009
-   Copyright (C) Michael Adam 2010-2011
+   Copyright (C) Michael Adam 2010-2013
    Copyright (C) Stefan Metzmacher 2010-2011
 
    This program is free software; you can redistribute it and/or modify
@@ -20,15 +20,13 @@
 */
 
 #include "includes.h"
-#include "lib/events/events.h"
-#include "lib/tdb/include/tdb.h"
+#include "tdb.h"
 #include "system/network.h"
 #include "system/filesys.h"
 #include "system/dir.h"
 #include "../include/ctdb_private.h"
 #include "db_wrap.h"
 #include "lib/util/dlinklist.h"
-#include "lib/events/events.h"
 #include "../include/ctdb_private.h"
 #include "../common/rb_tree.h"
 
@@ -93,10 +91,12 @@ struct delete_record_data {
 	struct ctdb_db_context *ctdb_db;
 	struct ctdb_ltdb_header hdr;
 	TDB_DATA key;
+	uint8_t keydata[1];
 };
 
 struct delete_records_list {
 	struct ctdb_marshall_buffer *records;
+	struct vacuum_data *vdata;
 };
 
 /**
@@ -110,25 +110,26 @@ static int insert_delete_record_data_into_tree(struct ctdb_context *ctdb,
 {
 	struct delete_record_data *dd;
 	uint32_t hash;
+	size_t len;
 
-	dd = talloc_zero(tree, struct delete_record_data);
+	len = offsetof(struct delete_record_data, keydata) + key.dsize;
+
+	dd = (struct delete_record_data *)talloc_size(tree, len);
 	if (dd == NULL) {
 		DEBUG(DEBUG_ERR,(__location__ " Out of memory\n"));
 		return -1;
 	}
+	talloc_set_name_const(dd, "struct delete_record_data");
 
 	dd->ctdb      = ctdb;
 	dd->ctdb_db   = ctdb_db;
 	dd->key.dsize = key.dsize;
-	dd->key.dptr  = talloc_memdup(dd, key.dptr, key.dsize);
-	if (dd->key.dptr == NULL) {
-		DEBUG(DEBUG_ERR,(__location__ " Out of memory\n"));
-		return -1;
-	}
+	dd->key.dptr  = dd->keydata;
+	memcpy(dd->keydata, key.dptr, key.dsize);
 
 	dd->hdr = *hdr;
 
-	hash = (uint32_t)tdb_jenkins_hash(&key);
+	hash = ctdb_hash(&key);
 
 	trbt_insert32(tree, hash, dd);
 
@@ -143,7 +144,7 @@ static int add_record_to_delete_list(struct vacuum_data *vdata, TDB_DATA key,
 	uint32_t hash;
 	int ret;
 
-	hash = (uint32_t)tdb_jenkins_hash(&key);
+	hash = ctdb_hash(&key);
 
 	if (trbt_lookup32(vdata->delete_list, hash)) {
 		DEBUG(DEBUG_INFO, (__location__ " Hash collission when vacuuming, skipping this record.\n"));
@@ -300,6 +301,141 @@ static int delete_marshall_traverse(void *param, void *data)
 	recs->records->count++;
 	memcpy(old_size+(uint8_t *)(recs->records), rec, rec->length);
 	return 0;
+}
+
+/**
+ * Variant of delete_marshall_traverse() that bumps the
+ * RSN of each traversed record in the database.
+ *
+ * This is needed to ensure that when rolling out our
+ * empty record copy before remote deletion, we as the
+ * record's dmaster keep a higher RSN than the non-dmaster
+ * nodes. This is needed to prevent old copies from
+ * resurrection in recoveries.
+ */
+static int delete_marshall_traverse_first(void *param, void *data)
+{
+	struct delete_record_data *dd = talloc_get_type(data, struct delete_record_data);
+	struct delete_records_list *recs = talloc_get_type(param, struct delete_records_list);
+	struct ctdb_db_context *ctdb_db = dd->ctdb_db;
+	struct ctdb_context *ctdb = ctdb_db->ctdb;
+	struct ctdb_ltdb_header *header;
+	TDB_DATA tdb_data, ctdb_data;
+	uint32_t lmaster;
+	uint32_t hash = ctdb_hash(&(dd->key));
+	int res;
+
+	res = tdb_chainlock(ctdb_db->ltdb->tdb, dd->key);
+	if (res != 0) {
+		DEBUG(DEBUG_ERR,
+		      (__location__ " Error getting chainlock on record with "
+		       "key hash [0x%08x] on database db[%s].\n",
+		       hash, ctdb_db->db_name));
+		recs->vdata->delete_skipped++;
+		talloc_free(dd);
+		return 0;
+	}
+
+	/*
+	 * Verify that the record is still empty, its RSN has not
+	 * changed and that we are still its lmaster and dmaster.
+	 */
+
+	tdb_data = tdb_fetch(ctdb_db->ltdb->tdb, dd->key);
+	if (tdb_data.dsize < sizeof(struct ctdb_ltdb_header)) {
+		DEBUG(DEBUG_INFO, (__location__ ": record with hash [0x%08x] "
+				   "on database db[%s] does not exist or is not"
+				   " a ctdb-record.  skipping.\n",
+				   hash, ctdb_db->db_name));
+		goto skip;
+	}
+
+	if (tdb_data.dsize > sizeof(struct ctdb_ltdb_header)) {
+		DEBUG(DEBUG_INFO, (__location__ ": record with hash [0x%08x] "
+				   "on database db[%s] has been recycled. "
+				   "skipping.\n",
+				   hash, ctdb_db->db_name));
+		goto skip;
+	}
+
+	header = (struct ctdb_ltdb_header *)tdb_data.dptr;
+
+	if (header->flags & CTDB_REC_RO_FLAGS) {
+		DEBUG(DEBUG_INFO, (__location__ ": record with hash [0x%08x] "
+				   "on database db[%s] has read-only flags. "
+				   "skipping.\n",
+				   hash, ctdb_db->db_name));
+		goto skip;
+	}
+
+	if (header->dmaster != ctdb->pnn) {
+		DEBUG(DEBUG_INFO, (__location__ ": record with hash [0x%08x] "
+				   "on database db[%s] has been migrated away. "
+				   "skipping.\n",
+				   hash, ctdb_db->db_name));
+		goto skip;
+	}
+
+	if (header->rsn != dd->hdr.rsn) {
+		DEBUG(DEBUG_INFO, (__location__ ": record with hash [0x%08x] "
+				   "on database db[%s] seems to have been "
+				   "migrated away and back again (with empty "
+				   "data). skipping.\n",
+				   hash, ctdb_db->db_name));
+		goto skip;
+	}
+
+	lmaster = ctdb_lmaster(ctdb_db->ctdb, &dd->key);
+
+	if (lmaster != ctdb->pnn) {
+		DEBUG(DEBUG_INFO, (__location__ ": not lmaster for record in "
+				   "delete list (key hash [0x%08x], db[%s]). "
+				   "Strange! skipping.\n",
+				   hash, ctdb_db->db_name));
+		goto skip;
+	}
+
+	/*
+	 * Increment the record's RSN to ensure the dmaster (i.e. the current
+	 * node) has the highest RSN of the record in the cluster.
+	 * This is to prevent old record copies from resurrecting in recoveries
+	 * if something should fail during the deletion process.
+	 * Note that ctdb_ltdb_store_server() increments the RSN if called
+	 * on the record's dmaster.
+	 */
+
+	ctdb_data.dptr = tdb_data.dptr + sizeof(struct ctdb_ltdb_header);
+	ctdb_data.dsize = tdb_data.dsize - sizeof(struct ctdb_ltdb_header);
+
+	res = ctdb_ltdb_store(ctdb_db, dd->key, header, ctdb_data);
+	if (res != 0) {
+		DEBUG(DEBUG_ERR, (__location__ ": Failed to store record with "
+				  "key hash [0x%08x] on database db[%s].\n",
+				  hash, ctdb_db->db_name));
+		goto skip;
+	}
+
+	tdb_chainunlock(ctdb_db->ltdb->tdb, dd->key);
+
+	goto done;
+
+skip:
+	tdb_chainunlock(ctdb_db->ltdb->tdb, dd->key);
+
+	recs->vdata->delete_skipped++;
+	talloc_free(dd);
+	dd = NULL;
+
+done:
+	if (tdb_data.dptr != NULL) {
+		free(tdb_data.dptr);
+	}
+
+	if (dd == NULL) {
+		return 0;
+	}
+
+	return delete_marshall_traverse(param, data);
 }
 
 /**
@@ -478,31 +614,55 @@ static int delete_record_traverse(void *param, void *data)
 
 	tdb_data = tdb_fetch(ctdb_db->ltdb->tdb, dd->key);
 	if (tdb_data.dsize < sizeof(struct ctdb_ltdb_header)) {
-		/* Does not exist or not a ctdb record. Skip. */
+		DEBUG(DEBUG_INFO, (__location__ ": record with hash [0x%08x] "
+				   "on database db[%s] does not exist or is not"
+				   " a ctdb-record.  skipping.\n",
+				   hash, ctdb_db->db_name));
 		vdata->delete_skipped++;
 		goto done;
 	}
 
 	if (tdb_data.dsize > sizeof(struct ctdb_ltdb_header)) {
-		/* The record has been recycled (filled with data). Skip. */
+		DEBUG(DEBUG_INFO, (__location__ ": record with hash [0x%08x] "
+				   "on database db[%s] has been recycled. "
+				   "skipping.\n",
+				   hash, ctdb_db->db_name));
 		vdata->delete_skipped++;
 		goto done;
 	}
 
 	header = (struct ctdb_ltdb_header *)tdb_data.dptr;
 
-	if (header->dmaster != ctdb->pnn) {
-		/* The record has been migrated off the node. Skip. */
+	if (header->flags & CTDB_REC_RO_FLAGS) {
+		DEBUG(DEBUG_INFO, (__location__ ": record with hash [0x%08x] "
+				   "on database db[%s] has read-only flags. "
+				   "skipping.\n",
+				   hash, ctdb_db->db_name));
 		vdata->delete_skipped++;
 		goto done;
 	}
 
+	if (header->dmaster != ctdb->pnn) {
+		DEBUG(DEBUG_INFO, (__location__ ": record with hash [0x%08x] "
+				   "on database db[%s] has been migrated away. "
+				   "skipping.\n",
+				   hash, ctdb_db->db_name));
+		vdata->delete_skipped++;
+		goto done;
+	}
 
-	if (header->rsn != dd->hdr.rsn) {
+	if (header->rsn != dd->hdr.rsn + 1) {
 		/*
 		 * The record has been migrated off the node and back again.
 		 * But not requeued for deletion. Skip it.
+		 * (Note that the first marshall traverse has bumped the RSN
+		 *  on disk.)
 		 */
+		DEBUG(DEBUG_INFO, (__location__ ": record with hash [0x%08x] "
+				   "on database db[%s] seems to have been "
+				   "migrated away and back again (with empty "
+				   "data). skipping.\n",
+				   hash, ctdb_db->db_name));
 		vdata->delete_skipped++;
 		goto done;
 	}
@@ -510,7 +670,10 @@ static int delete_record_traverse(void *param, void *data)
 	lmaster = ctdb_lmaster(ctdb_db->ctdb, &dd->key);
 
 	if (lmaster != ctdb->pnn) {
-		/* we are not lmaster - strange */
+		DEBUG(DEBUG_INFO, (__location__ ": not lmaster for record in "
+				   "delete list (key hash [0x%08x], db[%s]). "
+				   "Strange! skipping.\n",
+				   hash, ctdb_db->db_name));
 		vdata->delete_skipped++;
 		goto done;
 	}
@@ -660,9 +823,9 @@ static int ctdb_process_vacuum_fetch_lists(struct ctdb_db_context *ctdb_db,
 
 		data.dsize = talloc_get_size(vfl);
 		data.dptr  = (void *)vfl;
-		if (ctdb_send_message(ctdb, ctdb->nodes[i]->pnn,
-				      CTDB_SRVID_VACUUM_FETCH,
-				      data) != 0)
+		if (ctdb_client_send_message(ctdb, ctdb->nodes[i]->pnn,
+					     CTDB_SRVID_VACUUM_FETCH,
+					     data) != 0)
 		{
 			DEBUG(DEBUG_ERR, (__location__ " Failed to send vacuum "
 					  "fetch message to %u\n",
@@ -675,154 +838,295 @@ static int ctdb_process_vacuum_fetch_lists(struct ctdb_db_context *ctdb_db,
 }
 
 /**
- * Proces the delete list:
- * Send the records to delete to all other nodes with the
- * try_delete_records control.
+ * Process the delete list:
+ *
+ * This is the last step of vacuuming that consistently deletes
+ * those records that have been migrated with data and can hence
+ * not be deleted when leaving a node.
+ *
+ * In this step, the lmaster does the final deletion of those empty
+ * records that it is also dmaster for. It has ususally received
+ * at least some of these records previously from the former dmasters
+ * with the vacuum fetch message.
+ *
+ * This last step is implemented as a 3-phase process to protect from
+ * races leading to data corruption:
+ *
+ *  1) Send the lmaster's copy to all other active nodes with the
+ *     RECEIVE_RECORDS control: The remote nodes store the lmaster's copy.
+ *  2) Send the records that could successfully be stored remotely
+ *     in step #1 to all active nodes with the TRY_DELETE_RECORDS
+ *     control. The remote notes delete their local copy.
+ *  3) The lmaster locally deletes its copies of all records that
+ *     could successfully be deleted remotely in step #2.
  */
 static int ctdb_process_delete_list(struct ctdb_db_context *ctdb_db,
 				    struct vacuum_data *vdata)
 {
 	int ret, i;
 	struct ctdb_context *ctdb = ctdb_db->ctdb;
+	struct delete_records_list *recs;
+	TDB_DATA indata;
+	struct ctdb_node_map *nodemap;
+	uint32_t *active_nodes;
+	int num_active_nodes;
+	TALLOC_CTX *tmp_ctx;
+
+	if (vdata->delete_count == 0) {
+		return 0;
+	}
+
+	tmp_ctx = talloc_new(vdata);
+	if (tmp_ctx == NULL) {
+		DEBUG(DEBUG_ERR,(__location__ " Out of memory\n"));
+		return 0;
+	}
 
 	vdata->delete_left = vdata->delete_count;
 
-	if (vdata->delete_count > 0) {
-		struct delete_records_list *recs;
-		TDB_DATA indata, outdata;
+	/*
+	 * get the list of currently active nodes
+	 */
+
+	ret = ctdb_ctrl_getnodemap(ctdb, TIMELIMIT(),
+				   CTDB_CURRENT_NODE,
+				   tmp_ctx,
+				   &nodemap);
+	if (ret != 0) {
+		DEBUG(DEBUG_ERR,(__location__ " unable to get node map\n"));
+		ret = -1;
+		goto done;
+	}
+
+	active_nodes = list_of_active_nodes(ctdb, nodemap,
+					    nodemap, /* talloc context */
+					    false /* include self */);
+	/* yuck! ;-) */
+	num_active_nodes = talloc_get_size(active_nodes)/sizeof(*active_nodes);
+
+	/*
+	 * Now delete the records all active nodes in a three-phase process:
+	 * 1) send all active remote nodes the current empty copy with this
+	 *    node as DMASTER
+	 * 2) if all nodes could store the new copy,
+	 *    tell all the active remote nodes to delete all their copy
+	 * 3) if all remote nodes deleted their record copy, delete it locally
+	 */
+
+	/*
+	 * Step 1:
+	 * Send currently empty record copy to all active nodes for storing.
+	 */
+
+	recs = talloc_zero(tmp_ctx, struct delete_records_list);
+	if (recs == NULL) {
+		DEBUG(DEBUG_ERR,(__location__ " Out of memory\n"));
+		ret = -1;
+		goto done;
+	}
+	recs->records = (struct ctdb_marshall_buffer *)
+		talloc_zero_size(recs,
+				 offsetof(struct ctdb_marshall_buffer, data));
+	if (recs->records == NULL) {
+		DEBUG(DEBUG_ERR,(__location__ " Out of memory\n"));
+		ret = -1;
+		goto done;
+	}
+	recs->records->db_id = ctdb_db->db_id;
+	recs->vdata = vdata;
+
+	/*
+	 * traverse the tree of all records we want to delete and
+	 * create a blob we can send to the other nodes.
+	 *
+	 * We call delete_marshall_traverse_first() to bump the
+	 * records' RSNs in the database, to ensure we (as dmaster)
+	 * keep the highest RSN of the records in the cluster.
+	 */
+	trbt_traversearray32(vdata->delete_list, 1,
+			     delete_marshall_traverse_first, recs);
+
+	indata.dsize = talloc_get_size(recs->records);
+	indata.dptr  = (void *)recs->records;
+
+	for (i = 0; i < num_active_nodes; i++) {
+		struct ctdb_marshall_buffer *records;
+		struct ctdb_rec_data *rec;
 		int32_t res;
-		struct ctdb_node_map *nodemap;
-		uint32_t *active_nodes;
-		int num_active_nodes;
+		TDB_DATA outdata;
 
-		recs = talloc_zero(vdata, struct delete_records_list);
-		if (recs == NULL) {
-			DEBUG(DEBUG_ERR,(__location__ " Out of memory\n"));
-			return -1;
+		ret = ctdb_control(ctdb, active_nodes[i], 0,
+				CTDB_CONTROL_RECEIVE_RECORDS, 0,
+				indata, recs, &outdata, &res,
+				NULL, NULL);
+		if (ret != 0 || res != 0) {
+			DEBUG(DEBUG_ERR, ("Error storing record copies on "
+					  "node %u: ret[%d] res[%d]\n",
+					  active_nodes[i], ret, res));
+			ret = -1;
+			goto done;
 		}
-		recs->records = (struct ctdb_marshall_buffer *)
-			talloc_zero_size(vdata,
-				    offsetof(struct ctdb_marshall_buffer, data));
-		if (recs->records == NULL) {
-			DEBUG(DEBUG_ERR,(__location__ " Out of memory\n"));
-			return -1;
-		}
-		recs->records->db_id = ctdb_db->db_id;
 
 		/*
-		 * traverse the tree of all records we want to delete and
-		 * create a blob we can send to the other nodes.
+		 * outdata contains the list of records coming back
+		 * from the node: These are the records that the
+		 * remote node could not store. We remove these from
+		 * the list to process further.
 		 */
-		trbt_traversearray32(vdata->delete_list, 1,
-				     delete_marshall_traverse, recs);
+		records = (struct ctdb_marshall_buffer *)outdata.dptr;
+		rec = (struct ctdb_rec_data *)&records->data[0];
+		while (records->count-- > 1) {
+			TDB_DATA reckey, recdata;
+			struct ctdb_ltdb_header *rechdr;
+			struct delete_record_data *dd;
 
-		indata.dsize = talloc_get_size(recs->records);
-		indata.dptr  = (void *)recs->records;
+			reckey.dptr = &rec->data[0];
+			reckey.dsize = rec->keylen;
+			recdata.dptr = &rec->data[reckey.dsize];
+			recdata.dsize = rec->datalen;
 
-		/*
-		 * now tell all the active nodes to delete all these records
-		 * (if possible)
-		 */
+			if (recdata.dsize < sizeof(struct ctdb_ltdb_header)) {
+				DEBUG(DEBUG_CRIT,(__location__ " bad ltdb record\n"));
+				ret = -1;
+				goto done;
+			}
+			rechdr = (struct ctdb_ltdb_header *)recdata.dptr;
+			recdata.dptr += sizeof(*rechdr);
+			recdata.dsize -= sizeof(*rechdr);
 
-		ret = ctdb_ctrl_getnodemap(ctdb, TIMELIMIT(),
-					   CTDB_CURRENT_NODE,
-					   recs, /* talloc context */
-					   &nodemap);
-		if (ret != 0) {
-			DEBUG(DEBUG_ERR,(__location__ " unable to get node map\n"));
-			return -1;
-		}
-
-		active_nodes = list_of_active_nodes(ctdb, nodemap,
-						    nodemap, /* talloc context */
-						    false /* include self */);
-		/* yuck! ;-) */
-		num_active_nodes = talloc_get_size(active_nodes)/sizeof(*active_nodes);
-
-		for (i = 0; i < num_active_nodes; i++) {
-			struct ctdb_marshall_buffer *records;
-			struct ctdb_rec_data *rec;
-
-			ret = ctdb_control(ctdb, active_nodes[i], 0,
-					CTDB_CONTROL_TRY_DELETE_RECORDS, 0,
-					indata, recs, &outdata, &res,
-					NULL, NULL);
-			if (ret != 0 || res != 0) {
-				DEBUG(DEBUG_ERR, ("Failed to delete records on "
-						  "node %u: ret[%d] res[%d]\n",
-						  active_nodes[i], ret, res));
-				return -1;
+			dd = (struct delete_record_data *)trbt_lookup32(
+					vdata->delete_list,
+					ctdb_hash(&reckey));
+			if (dd != NULL) {
+				/*
+				 * The other node could not store the record
+				 * copy and it is the first node that failed.
+				 * So we should remove it from the tree and
+				 * update statistics.
+				 */
+				talloc_free(dd);
+				vdata->delete_remote_error++;
+				vdata->delete_left--;
 			}
 
-			/*
-			 * outdata contains the list of records coming back
-			 * from the node: These are the records that the
-			 * remote node could not delete.
-			 *
-			 * NOTE: There is a problem here:
-			 *
-			 * When a node failed to delete the record, but
-			 * others succeeded, we may have created gaps in the
-			 * history of the record. Hence when a node dies, an
-			 * closed file handle might be resurrected or an open
-			 * file handle might be lost, leading to blocked access
-			 * or data corruption.
-			 *
-			 * TODO: This needs to be fixed!
-			 */
-			records = (struct ctdb_marshall_buffer *)outdata.dptr;
-			rec = (struct ctdb_rec_data *)&records->data[0];
-			while (records->count-- > 1) {
-				TDB_DATA reckey, recdata;
-				struct ctdb_ltdb_header *rechdr;
-				struct delete_record_data *dd;
+			rec = (struct ctdb_rec_data *)(rec->length + (uint8_t *)rec);
+		}
+	}
 
-				reckey.dptr = &rec->data[0];
-				reckey.dsize = rec->keylen;
-				recdata.dptr = &rec->data[reckey.dsize];
-				recdata.dsize = rec->datalen;
+	if (vdata->delete_left == 0) {
+		goto success;
+	}
 
-				if (recdata.dsize < sizeof(struct ctdb_ltdb_header)) {
-					DEBUG(DEBUG_CRIT,(__location__ " bad ltdb record\n"));
-					return -1;
-				}
-				rechdr = (struct ctdb_ltdb_header *)recdata.dptr;
-				recdata.dptr += sizeof(*rechdr);
-				recdata.dsize -= sizeof(*rechdr);
+	/*
+	 * Step 2:
+	 * Send the remaining records to all active nodes for deletion.
+	 *
+	 * The lmaster's (i.e. our) copies of these records have been stored
+	 * successfully on the other nodes.
+	 */
 
-				dd = (struct delete_record_data *)trbt_lookup32(
-						vdata->delete_list,
-						(uint32_t)tdb_jenkins_hash(&reckey));
-				if (dd != NULL) {
-					/*
-					 * The other node could not delete the
-					 * record and it is the first node that
-					 * failed. So we should remove it from
-					 * the tree and update statistics.
-					 */
-					talloc_free(dd);
-					vdata->delete_remote_error++;
-					vdata->delete_left--;
-				}
+	/*
+	 * Create a marshall blob from the remaining list of records to delete.
+	 */
 
-				rec = (struct ctdb_rec_data *)(rec->length + (uint8_t *)rec);
-			}
+	talloc_free(recs->records);
+
+	recs->records = (struct ctdb_marshall_buffer *)
+		talloc_zero_size(recs,
+				 offsetof(struct ctdb_marshall_buffer, data));
+	if (recs->records == NULL) {
+		DEBUG(DEBUG_ERR,(__location__ " Out of memory\n"));
+		ret = -1;
+		goto done;
+	}
+	recs->records->db_id = ctdb_db->db_id;
+
+	trbt_traversearray32(vdata->delete_list, 1,
+			     delete_marshall_traverse, recs);
+
+	indata.dsize = talloc_get_size(recs->records);
+	indata.dptr  = (void *)recs->records;
+
+	for (i = 0; i < num_active_nodes; i++) {
+		struct ctdb_marshall_buffer *records;
+		struct ctdb_rec_data *rec;
+		int32_t res;
+		TDB_DATA outdata;
+
+		ret = ctdb_control(ctdb, active_nodes[i], 0,
+				CTDB_CONTROL_TRY_DELETE_RECORDS, 0,
+				indata, recs, &outdata, &res,
+				NULL, NULL);
+		if (ret != 0 || res != 0) {
+			DEBUG(DEBUG_ERR, ("Failed to delete records on "
+					  "node %u: ret[%d] res[%d]\n",
+					  active_nodes[i], ret, res));
+			ret = -1;
+			goto done;
 		}
 
-		/* free nodemap and active_nodes */
-		talloc_free(nodemap);
+		/*
+		 * outdata contains the list of records coming back
+		 * from the node: These are the records that the
+		 * remote node could not delete. We remove these from
+		 * the list to delete locally.
+		 */
+		records = (struct ctdb_marshall_buffer *)outdata.dptr;
+		rec = (struct ctdb_rec_data *)&records->data[0];
+		while (records->count-- > 1) {
+			TDB_DATA reckey, recdata;
+			struct ctdb_ltdb_header *rechdr;
+			struct delete_record_data *dd;
+
+			reckey.dptr = &rec->data[0];
+			reckey.dsize = rec->keylen;
+			recdata.dptr = &rec->data[reckey.dsize];
+			recdata.dsize = rec->datalen;
+
+			if (recdata.dsize < sizeof(struct ctdb_ltdb_header)) {
+				DEBUG(DEBUG_CRIT,(__location__ " bad ltdb record\n"));
+				ret = -1;
+				goto done;
+			}
+			rechdr = (struct ctdb_ltdb_header *)recdata.dptr;
+			recdata.dptr += sizeof(*rechdr);
+			recdata.dsize -= sizeof(*rechdr);
+
+			dd = (struct delete_record_data *)trbt_lookup32(
+					vdata->delete_list,
+					ctdb_hash(&reckey));
+			if (dd != NULL) {
+				/*
+				 * The other node could not delete the
+				 * record and it is the first node that
+				 * failed. So we should remove it from
+				 * the tree and update statistics.
+				 */
+				talloc_free(dd);
+				vdata->delete_remote_error++;
+				vdata->delete_left--;
+			}
+
+			rec = (struct ctdb_rec_data *)(rec->length + (uint8_t *)rec);
+		}
 	}
 
-	if (vdata->delete_left > 0) {
-		/*
-		 * The only records remaining in the tree are those
-		 * records which all other nodes could successfully
-		 * delete, so we can safely delete them on the
-		 * lmaster as well.
-		 */
-		trbt_traversearray32(vdata->delete_list, 1,
-				     delete_record_traverse, vdata);
+	if (vdata->delete_left == 0) {
+		goto success;
 	}
+
+	/*
+	 * Step 3:
+	 * Delete the remaining records locally.
+	 *
+	 * These records have successfully been deleted on all
+	 * active remote nodes.
+	 */
+
+	trbt_traversearray32(vdata->delete_list, 1,
+			     delete_record_traverse, vdata);
+
+success:
 
 	if (vdata->delete_count > 0) {
 		DEBUG(DEBUG_INFO,
@@ -844,7 +1148,12 @@ static int ctdb_process_delete_list(struct ctdb_db_context *ctdb_db,
 		       (unsigned)vdata->delete_left));
 	}
 
-	return 0;
+	ret = 0;
+
+done:
+	talloc_free(tmp_ctx);
+
+	return ret;
 }
 
 /**
@@ -991,7 +1300,7 @@ static int repack_traverse(struct tdb_context *tdb, TDB_DATA key, TDB_DATA data,
 	struct vacuum_data *vdata = (struct vacuum_data *)private;
 
 	if (vdata->vacuum) {
-		uint32_t hash = (uint32_t)tdb_jenkins_hash(&key);
+		uint32_t hash = ctdb_hash(&key);
 		struct delete_record_data *kd;
 		/*
 		 * check if we can ignore this record because it's in the delete_list
@@ -1195,7 +1504,7 @@ static int vacuum_child_destructor(struct ctdb_vacuum_child_context *child_ctx)
 	DEBUG(DEBUG_INFO,("Vacuuming took %.3f seconds for database %s\n", l, ctdb_db->db_name));
 
 	if (child_ctx->child_pid != -1) {
-		kill(child_ctx->child_pid, SIGKILL);
+		ctdb_kill(ctdb, child_ctx->child_pid, SIGKILL);
 	} else {
 		/* Bump the number of successful fast-path runs. */
 		child_ctx->vacuum_handle->fast_path_count++;
@@ -1261,6 +1570,7 @@ ctdb_vacuum_event(struct event_context *ev, struct timed_event *te,
 	struct ctdb_db_context *ctdb_db = vacuum_handle->ctdb_db;
 	struct ctdb_context *ctdb = ctdb_db->ctdb;
 	struct ctdb_vacuum_child_context *child_ctx;
+	struct tevent_fd *fde;
 	int ret;
 
 	/* we dont vacuum if we are in recovery mode, or db frozen */
@@ -1298,7 +1608,7 @@ ctdb_vacuum_event(struct event_context *ev, struct timed_event *te,
 		vacuum_handle->fast_path_count = 0;
 	}
 
-	child_ctx->child_pid = fork();
+	child_ctx->child_pid = ctdb_fork(ctdb);
 	if (child_ctx->child_pid == (pid_t)-1) {
 		close(child_ctx->fd[0]);
 		close(child_ctx->fd[1]);
@@ -1317,8 +1627,8 @@ ctdb_vacuum_event(struct event_context *ev, struct timed_event *te,
 		close(child_ctx->fd[0]);
 
 		DEBUG(DEBUG_INFO,("Vacuuming child process %d for db %s started\n", getpid(), ctdb_db->db_name));
-	
-		if (switch_from_server_to_client(ctdb) != 0) {
+		ctdb_set_process_name("ctdb_vacuum");
+		if (switch_from_server_to_client(ctdb, "vacuum-%s", ctdb_db->db_name) != 0) {
 			DEBUG(DEBUG_CRIT, (__location__ "ERROR: failed to switch vacuum daemon into client mode. Shutting down.\n"));
 			_exit(1);
 		}
@@ -1364,10 +1674,9 @@ ctdb_vacuum_event(struct event_context *ev, struct timed_event *te,
 
 	DEBUG(DEBUG_DEBUG, (__location__ " Created PIPE FD:%d to child vacuum process\n", child_ctx->fd[0]));
 
-	event_add_fd(ctdb->ev, child_ctx, child_ctx->fd[0],
-		EVENT_FD_READ|EVENT_FD_AUTOCLOSE,
-		vacuum_child_handler,
-		child_ctx);
+	fde = event_add_fd(ctdb->ev, child_ctx, child_ctx->fd[0],
+			   EVENT_FD_READ, vacuum_child_handler, child_ctx);
+	tevent_fd_set_auto_close(fde);
 
 	vacuum_handle->child_ctx = child_ctx;
 	child_ctx->vacuum_handle = vacuum_handle;
@@ -1415,7 +1724,7 @@ static void remove_record_from_delete_queue(struct ctdb_db_context *ctdb_db,
 	struct delete_record_data *kd;
 	uint32_t hash;
 
-	hash = (uint32_t)tdb_jenkins_hash(discard_const(&key));
+	hash = (uint32_t)ctdb_hash(&key);
 
 	DEBUG(DEBUG_DEBUG, (__location__
 			    " remove_record_from_delete_queue: "
@@ -1471,7 +1780,7 @@ static int insert_record_into_delete_queue(struct ctdb_db_context *ctdb_db,
 	uint32_t hash;
 	int ret;
 
-	hash = (uint32_t)tdb_jenkins_hash(&key);
+	hash = (uint32_t)ctdb_hash(&key);
 
 	DEBUG(DEBUG_INFO, (__location__ " schedule for deletion: db[%s] "
 			   "db_id[0x%08x] "
@@ -1560,8 +1869,16 @@ int32_t ctdb_local_schedule_for_deletion(struct ctdb_db_context *ctdb_db,
 		return ret;
 	}
 
-	/* child process: send the main daemon a control */
+	/* if we dont have a connection to the daemon we can not send
+	   a control. For example sometimes from update_record control child
+	   process.
+	*/
+	if (!ctdb_db->ctdb->can_send_controls) {
+		return -1;
+	}
 
+
+	/* child process: send the main daemon a control */
 	indata.dsize = offsetof(struct ctdb_control_schedule_for_deletion, key) + key.dsize;
 	indata.dptr = talloc_zero_array(ctdb_db, uint8_t, indata.dsize);
 	if (indata.dptr == NULL) {

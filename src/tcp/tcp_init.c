@@ -18,8 +18,7 @@
 */
 
 #include "includes.h"
-#include "lib/tdb/include/tdb.h"
-#include "lib/events/events.h"
+#include "tdb.h"
 #include "system/network.h"
 #include "system/filesys.h"
 #include "../include/ctdb_private.h"
@@ -51,7 +50,7 @@ static int ctdb_tcp_add_node(struct ctdb_node *node)
 	talloc_set_destructor(tnode, tnode_destructor);
 
 	tnode->out_queue = ctdb_queue_setup(node->ctdb, node, tnode->fd, CTDB_TCP_ALIGNMENT,
-					ctdb_tcp_tnode_cb, node);
+					    ctdb_tcp_tnode_cb, node, "to-node-%s", node->name);
 	
 	return 0;
 }

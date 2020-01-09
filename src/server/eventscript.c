@@ -24,53 +24,49 @@
 #include "system/dir.h"
 #include "system/locale.h"
 #include "../include/ctdb_private.h"
-#include "lib/events/events.h"
 #include "../common/rb_tree.h"
-
-static struct {
-	struct timeval start;
-	const char *script_running;
-} child_state;
+#include "lib/util/dlinklist.h"
 
 static void ctdb_event_script_timeout(struct event_context *ev, struct timed_event *te, struct timeval t, void *p);
 
 /*
-  ctdbd sends us a SIGTERM when we should time out the current script
+  ctdbd sends us a SIGTERM when we should die.
  */
 static void sigterm(int sig)
 {
-	char tbuf[100], buf[200];
-	time_t t;
-
-	DEBUG(DEBUG_ERR,("Timed out running script '%s' after %.1f seconds pid :%d\n", 
-		 child_state.script_running, timeval_elapsed(&child_state.start), getpid()));
-
-	t = time(NULL);
-
-	strftime(tbuf, sizeof(tbuf)-1, "%Y%m%d%H%M%S", 	localtime(&t));
-	sprintf(buf, "{ pstree -p; cat /proc/locks; ls -li /var/ctdb/ /var/ctdb/persistent; }"
-		" >/tmp/ctdb.event.%s.%d", tbuf, getpid());
-	system(buf);
-
-	DEBUG(DEBUG_ERR,("Logged timedout eventscript : %s\n", buf));
+	pid_t pid;
 
 	/* all the child processes will be running in the same process group */
-	kill(-getpgrp(), SIGKILL);
+	pid = getpgrp();
+	if (pid == -1) {
+		kill(-getpid(), SIGKILL);
+	} else {
+		kill(-pid, SIGKILL);
+	}
 	_exit(1);
 }
 
+/* This is attached to the event script state. */
+struct event_script_callback {
+	struct event_script_callback *next, *prev;
+	struct ctdb_context *ctdb;
+
+	/* Warning: this can free us! */
+	void (*fn)(struct ctdb_context *, int, void *);
+	void *private_data;
+};
+	
+
 struct ctdb_event_script_state {
 	struct ctdb_context *ctdb;
+	struct event_script_callback *callback;
 	pid_t child;
-	/* Warning: this can free us! */
-	void (*callback)(struct ctdb_context *, int, void *);
 	int fd[2];
-	void *private_data;
 	bool from_user;
 	enum ctdb_eventscript_call call;
 	const char *options;
 	struct timeval timeout;
-
+	
 	unsigned int current;
 	struct ctdb_scripts_wire *scripts;
 };
@@ -222,6 +218,7 @@ static struct ctdb_scripts_wire *ctdb_get_script_list(struct ctdb_context *ctdb,
 		tree_item = talloc(tree, struct ctdb_script_tree_item);
 		if (tree_item == NULL) {
 			DEBUG(DEBUG_ERR, (__location__ " Failed to allocate new tree item\n"));
+			closedir(dir);
 			talloc_free(tmp_ctx);
 			return NULL;
 		}
@@ -234,6 +231,7 @@ static struct ctdb_scripts_wire *ctdb_get_script_list(struct ctdb_context *ctdb,
 		tree_item->name = talloc_strdup(tree_item, de->d_name);
 		if (tree_item->name == NULL) {
 			DEBUG(DEBUG_ERR,(__location__ " Failed to allocate script name.\n"));
+			closedir(dir);
 			talloc_free(tmp_ctx);
 			return NULL;
 		}
@@ -355,7 +353,6 @@ static int child_run_script(struct ctdb_context *ctdb,
 	int ret;
 	TALLOC_CTX *tmp_ctx = talloc_new(ctdb);
 
-	child_state.start = timeval_current();
 	ret = child_setup(ctdb);
 	if (ret != 0)
 		goto out;
@@ -363,7 +360,6 @@ static int child_run_script(struct ctdb_context *ctdb,
 	cmdstr = child_command_string(ctdb, tmp_ctx, from_user,
 				      current->name, call, options);
 	CTDB_NO_MEMORY(ctdb, cmdstr);
-	child_state.script_running = cmdstr;
 
 	DEBUG(DEBUG_DEBUG,("Executing event script %s\n",cmdstr));
 
@@ -385,6 +381,7 @@ static int fork_child_for_script(struct ctdb_context *ctdb,
 				 struct ctdb_event_script_state *state)
 {
 	int r;
+	struct tevent_fd *fde;
 	struct ctdb_script_wire *current = get_current_script(state);
 
 	current->start = timeval_current();
@@ -395,7 +392,7 @@ static int fork_child_for_script(struct ctdb_context *ctdb,
 		return -errno;
 	}
 
- 	if (!ctdb_fork_with_logging(state, ctdb, log_event_script_output,
+ 	if (!ctdb_fork_with_logging(state, ctdb, current->name, log_event_script_output,
 				    state, &state->child)) {
 		r = -errno;
 		close(state->fd[0]);
@@ -407,8 +404,12 @@ static int fork_child_for_script(struct ctdb_context *ctdb,
 	if (state->child == 0) {
 		int rt;
 
+		debug_extra = talloc_asprintf(NULL, "eventscript-%s-%s:",
+					      current->name,
+					      ctdb_eventscript_call_names[state->call]);
 		close(state->fd[0]);
 		set_close_on_exec(state->fd[1]);
+		ctdb_set_process_name("ctdb_eventscript");
 
 		rt = child_run_script(ctdb, state->from_user, state->call, state->options, current);
 		/* We must be able to write PIPEBUF bytes at least; if this
@@ -424,8 +425,10 @@ static int fork_child_for_script(struct ctdb_context *ctdb,
 	DEBUG(DEBUG_DEBUG, (__location__ " Created PIPE FD:%d to child eventscript process\n", state->fd[0]));
 
 	/* Set ourselves up to be called when that's done. */
-	event_add_fd(ctdb->ev, state, state->fd[0], EVENT_FD_READ|EVENT_FD_AUTOCLOSE,
-		     ctdb_event_script_handler, state);
+	fde = event_add_fd(ctdb->ev, state, state->fd[0], EVENT_FD_READ,
+			   ctdb_event_script_handler, state);
+	tevent_fd_set_auto_close(fde);
+
 	return 0;
 }
 
@@ -464,6 +467,11 @@ static void ctdb_event_script_handler(struct event_context *ev, struct fd_event 
 	struct ctdb_context *ctdb = state->ctdb;
 	int r, status;
 
+	if (ctdb == NULL) {
+		DEBUG(DEBUG_ERR,("Eventscript finished but ctdb is NULL\n"));
+		return;
+	}
+
 	r = read(state->fd[0], &current->status, sizeof(current->status));
 	if (r < 0) {
 		current->status = -errno;
@@ -475,7 +483,7 @@ static void ctdb_event_script_handler(struct event_context *ev, struct fd_event 
 	/* valgrind gets overloaded if we run next script as it's still doing
 	 * post-execution analysis, so kill finished child here. */
 	if (ctdb->valgrinding) {
-		kill(state->child, SIGKILL);
+		ctdb_kill(ctdb, state->child, SIGKILL);
 	}
 
 	state->child = 0;
@@ -505,6 +513,103 @@ static void ctdb_event_script_handler(struct event_context *ev, struct fd_event 
 	}
 }
 
+struct debug_hung_script_state {
+	struct ctdb_context *ctdb;
+	pid_t child;
+	enum ctdb_eventscript_call call;
+};
+
+static int debug_hung_script_state_destructor(struct debug_hung_script_state *state)
+{
+	if (state->child) {
+		ctdb_kill(state->ctdb, state->child, SIGKILL);
+	}
+	return 0;
+}
+
+static void debug_hung_script_timeout(struct tevent_context *ev, struct tevent_timer *te,
+				      struct timeval t, void *p)
+{
+	struct debug_hung_script_state *state =
+		talloc_get_type(p, struct debug_hung_script_state);
+
+	talloc_free(state);
+}
+
+static void debug_hung_script_done(struct tevent_context *ev, struct tevent_fd *fde,
+				   uint16_t flags, void *p)
+{
+	struct debug_hung_script_state *state =
+		talloc_get_type(p, struct debug_hung_script_state);
+
+	talloc_free(state);
+}
+
+static void ctdb_run_debug_hung_script(struct ctdb_context *ctdb, struct debug_hung_script_state *state)
+{
+	pid_t pid;
+	const char * debug_hung_script = ETCDIR "/ctdb/debug-hung-script.sh";
+	int fd[2];
+	struct tevent_timer *ttimer;
+	struct tevent_fd *tfd;
+
+	if (pipe(fd) < 0) {
+		DEBUG(DEBUG_ERR,("Failed to create pipe fd for debug hung script\n"));
+		return;
+	}
+
+	if (!ctdb_fork_with_logging(ctdb, ctdb, "Hung script", NULL, NULL, &pid)) {
+		DEBUG(DEBUG_ERR,("Failed to fork a child process with logging to track hung event script\n"));
+		close(fd[0]);
+		close(fd[1]);
+		return;
+	}
+	if (pid == -1) {
+		DEBUG(DEBUG_ERR,("Fork for debug script failed : %s\n",
+				 strerror(errno)));
+		close(fd[0]);
+		close(fd[1]);
+		return;
+	}
+	if (pid == 0) {
+		char *buf;
+
+		ctdb_set_process_name("ctdb_debug_hung_script");
+		if (getenv("CTDB_DEBUG_HUNG_SCRIPT") != NULL) {
+			debug_hung_script = getenv("CTDB_DEBUG_HUNG_SCRIPT");
+		}
+
+		close(fd[0]);
+
+		buf = talloc_asprintf(NULL, "%s %d %s",
+				      debug_hung_script, state->child,
+				      ctdb_eventscript_call_names[state->call]);
+		system(buf);
+		talloc_free(buf);
+
+		_exit(0);
+	}
+
+	close(fd[1]);
+
+	ttimer = tevent_add_timer(ctdb->ev, state,
+				  timeval_current_ofs(ctdb->tunable.script_timeout, 0),
+				  debug_hung_script_timeout, state);
+	if (ttimer == NULL) {
+		close(fd[0]);
+		return;
+	}
+
+	tfd = tevent_add_fd(ctdb->ev, state, fd[0], EVENT_FD_READ,
+			    debug_hung_script_done, state);
+	if (tfd == NULL) {
+		talloc_free(ttimer);
+		close(fd[0]);
+		return;
+	}
+	tevent_fd_set_auto_close(tfd);
+}
+
 /* called when child times out */
 static void ctdb_event_script_timeout(struct event_context *ev, struct timed_event *te, 
 				      struct timeval t, void *p)
@@ -512,18 +617,47 @@ static void ctdb_event_script_timeout(struct event_context *ev, struct timed_eve
 	struct ctdb_event_script_state *state = talloc_get_type(p, struct ctdb_event_script_state);
 	struct ctdb_context *ctdb = state->ctdb;
 	struct ctdb_script_wire *current = get_current_script(state);
+	struct debug_hung_script_state *debug_state;
 
-	DEBUG(DEBUG_ERR,("Event script timed out : %s %s %s count : %u  pid : %d\n",
-			 current->name, ctdb_eventscript_call_names[state->call], state->options, ctdb->event_script_timeouts, state->child));
+	DEBUG(DEBUG_ERR,("Event script '%s %s %s' timed out after %.1fs, count: %u, pid: %d\n",
+			 current->name, ctdb_eventscript_call_names[state->call], state->options,
+			 timeval_elapsed(&current->start),
+			 ctdb->event_script_timeouts, state->child));
 
-	state->scripts->scripts[state->current].status = -ETIME;
-
-	if (kill(state->child, 0) != 0) {
-		DEBUG(DEBUG_ERR,("Event script child process already dead, errno %s(%d)\n", strerror(errno), errno));
-		state->child = 0;
+	/* ignore timeouts for these events */
+	switch (state->call) {
+	case CTDB_EVENT_START_RECOVERY:
+	case CTDB_EVENT_RECOVERED:
+	case CTDB_EVENT_TAKE_IP:
+	case CTDB_EVENT_RELEASE_IP:
+	case CTDB_EVENT_STATUS:
+		state->scripts->scripts[state->current].status = 0;
+		DEBUG(DEBUG_ERR,("Ignoring hung script for %s call %d\n", state->options, state->call));
+		break;
+        default:
+		state->scripts->scripts[state->current].status = -ETIME;
 	}
 
+	debug_state = talloc_zero(ctdb, struct debug_hung_script_state);
+	if (debug_state == NULL) {
+		talloc_free(state);
+		return;
+	}
+
+	/* Save information useful for running debug hung script, so
+	 * eventscript state can be freed.
+	 */
+	debug_state->ctdb = ctdb;
+	debug_state->child = state->child;
+	debug_state->call = state->call;
+
+	/* This destructor will actually kill the hung event script */
+	talloc_set_destructor(debug_state, debug_hung_script_state_destructor);
+
+	state->child = 0;
 	talloc_free(state);
+
+	ctdb_run_debug_hung_script(ctdb, debug_state);
 }
 
 /*
@@ -532,11 +666,12 @@ static void ctdb_event_script_timeout(struct event_context *ev, struct timed_eve
 static int event_script_destructor(struct ctdb_event_script_state *state)
 {
 	int status;
+	struct event_script_callback *callback;
 
 	if (state->child) {
 		DEBUG(DEBUG_ERR,(__location__ " Sending SIGTERM to child pid:%d\n", state->child));
 
-		if (kill(state->child, SIGTERM) != 0) {
+		if (ctdb_kill(state->ctdb, state->child, SIGTERM) != 0) {
 			DEBUG(DEBUG_ERR,("Failed to kill child process for eventscript, errno %s(%d)\n", strerror(errno), errno));
 		}
 	}
@@ -564,9 +699,24 @@ static int event_script_destructor(struct ctdb_event_script_state *state)
 	}
 
 	/* This is allowed to free us; talloc will prevent double free anyway,
-	 * but beware if you call this outside the destructor! */
-	if (state->callback) {
-		state->callback(state->ctdb, status, state->private_data);
+	 * but beware if you call this outside the destructor!
+	 * the callback hangs off a different context so we walk the list
+	 * of "active" callbacks until we find the one state points to.
+	 * if we cant find it it means the callback has been removed.
+	 */
+	for (callback = state->ctdb->script_callbacks; callback != NULL; callback = callback->next) {
+		if (callback == state->callback) {
+			break;
+		}
+	}
+	
+	state->callback = NULL;
+
+	if (callback) {
+		/* Make sure destructor doesn't free itself! */
+		talloc_steal(NULL, callback);
+		callback->fn(state->ctdb, status, callback->private_data);
+		talloc_free(callback);
 	}
 
 	return 0;
@@ -594,11 +744,11 @@ static bool check_options(enum ctdb_eventscript_call call, const char *options)
 	case CTDB_EVENT_STARTUP:
 	case CTDB_EVENT_START_RECOVERY:
 	case CTDB_EVENT_RECOVERED:
-	case CTDB_EVENT_STOPPED:
 	case CTDB_EVENT_MONITOR:
 	case CTDB_EVENT_STATUS:
 	case CTDB_EVENT_SHUTDOWN:
 	case CTDB_EVENT_RELOAD:
+	case CTDB_EVENT_IPREALLOCATED:
 		return count_words(options) == 0;
 
 	case CTDB_EVENT_TAKE_IP: /* interface, IP address, netmask bits. */
@@ -614,11 +764,18 @@ static bool check_options(enum ctdb_eventscript_call call, const char *options)
 	}
 }
 
+static int remove_callback(struct event_script_callback *callback)
+{
+	DLIST_REMOVE(callback->ctdb->script_callbacks, callback);
+	return 0;
+}
+
 /*
   run the event script in the background, calling the callback when 
   finished
  */
-static int ctdb_event_script_callback_v(struct ctdb_context *ctdb, 
+static int ctdb_event_script_callback_v(struct ctdb_context *ctdb,
+					const void *mem_ctx,
 					void (*callback)(struct ctdb_context *, int, void *),
 					void *private_data,
 					bool from_user,
@@ -627,12 +784,59 @@ static int ctdb_event_script_callback_v(struct ctdb_context *ctdb,
 {
 	struct ctdb_event_script_state *state;
 
+	if (ctdb->recovery_mode != CTDB_RECOVERY_NORMAL) {
+		/* we guarantee that only some specifically allowed event scripts are run
+		   while in recovery */
+		const enum ctdb_eventscript_call allowed_calls[] = {
+			CTDB_EVENT_INIT,
+			CTDB_EVENT_SETUP,
+			CTDB_EVENT_START_RECOVERY,
+			CTDB_EVENT_SHUTDOWN,
+			CTDB_EVENT_RELEASE_IP,
+			CTDB_EVENT_IPREALLOCATED,
+		};
+		int i;
+		for (i=0;i<ARRAY_SIZE(allowed_calls);i++) {
+			if (call == allowed_calls[i]) break;
+		}
+		if (i == ARRAY_SIZE(allowed_calls)) {
+			DEBUG(DEBUG_ERR,("Refusing to run event scripts call '%s' while in recovery\n",
+				 ctdb_eventscript_call_names[call]));
+			return -1;
+		}
+	}
+
+	/* Kill off any running monitor events to run this event. */
+	if (ctdb->current_monitor) {
+		struct ctdb_event_script_state *ms = talloc_get_type(ctdb->current_monitor, struct ctdb_event_script_state);
+
+		/* Cancel current monitor callback state only if monitoring
+		 * context ctdb->monitor->monitor_context has not been freed */
+		if (ms->callback != NULL && !ctdb_stopped_monitoring(ctdb)) {
+			ms->callback->fn(ctdb, -ECANCELED, ms->callback->private_data);
+			talloc_free(ms->callback);
+		}
+
+		/* Discard script status so we don't save to last_status */
+		talloc_free(ctdb->current_monitor->scripts);
+		ctdb->current_monitor->scripts = NULL;
+		talloc_free(ctdb->current_monitor);
+		ctdb->current_monitor = NULL;
+	}
+
 	state = talloc(ctdb->event_script_ctx, struct ctdb_event_script_state);
 	CTDB_NO_MEMORY(ctdb, state);
 
+	/* The callback isn't done if the context is freed. */
+	state->callback = talloc(mem_ctx, struct event_script_callback);
+	CTDB_NO_MEMORY(ctdb, state->callback);
+	DLIST_ADD(ctdb->script_callbacks, state->callback);
+	talloc_set_destructor(state->callback, remove_callback);
+	state->callback->ctdb         = ctdb;
+	state->callback->fn           = callback;
+	state->callback->private_data = private_data;
+
 	state->ctdb = ctdb;
-	state->callback = callback;
-	state->private_data = private_data;
 	state->from_user = from_user;
 	state->call = call;
 	state->options = talloc_vasprintf(state, fmt, ap);
@@ -650,38 +854,6 @@ static int ctdb_event_script_callback_v(struct ctdb_context *ctdb,
 		return -1;
 	}
 
-	if (ctdb->recovery_mode != CTDB_RECOVERY_NORMAL) {
-		/* we guarantee that only some specifically allowed event scripts are run
-		   while in recovery */
-		const enum ctdb_eventscript_call allowed_calls[] = {
-			CTDB_EVENT_INIT,
-			CTDB_EVENT_SETUP,
-			CTDB_EVENT_START_RECOVERY,
-			CTDB_EVENT_SHUTDOWN,
-			CTDB_EVENT_RELEASE_IP,
-			CTDB_EVENT_STOPPED
-		};
-		int i;
-		for (i=0;i<ARRAY_SIZE(allowed_calls);i++) {
-			if (call == allowed_calls[i]) break;
-		}
-		if (i == ARRAY_SIZE(allowed_calls)) {
-			DEBUG(DEBUG_ERR,("Refusing to run event scripts call '%s' while in recovery\n",
-				 ctdb_eventscript_call_names[call]));
-			talloc_free(state);
-			return -1;
-		}
-	}
-
-	/* Kill off any running monitor events to run this event. */
-	if (ctdb->current_monitor) {
-		/* Discard script status so we don't save to last_status */
-		talloc_free(ctdb->current_monitor->scripts);
-		ctdb->current_monitor->scripts = NULL;
-		talloc_free(ctdb->current_monitor);
-		ctdb->current_monitor = NULL;
-	}
-
 	DEBUG(DEBUG_INFO,(__location__ " Starting eventscript %s %s\n",
 			  ctdb_eventscript_call_names[state->call],
 			  state->options));
@@ -693,6 +865,7 @@ static int ctdb_event_script_callback_v(struct ctdb_context *ctdb,
 		return -1;
 	}
 	state->current = 0;
+	state->child = 0;
 
 	if (!from_user && (call == CTDB_EVENT_MONITOR || call == CTDB_EVENT_STATUS)) {
 		ctdb->current_monitor = state;
@@ -727,7 +900,7 @@ static int ctdb_event_script_callback_v(struct ctdb_context *ctdb,
 
 /*
   run the event script in the background, calling the callback when 
-  finished
+  finished.  If mem_ctx is freed, callback will never be called.
  */
 int ctdb_event_script_callback(struct ctdb_context *ctdb, 
 			       TALLOC_CTX *mem_ctx,
@@ -741,7 +914,7 @@ int ctdb_event_script_callback(struct ctdb_context *ctdb,
 	int ret;
 
 	va_start(ap, fmt);
-	ret = ctdb_event_script_callback_v(ctdb, callback, private_data, from_user, call, fmt, ap);
+	ret = ctdb_event_script_callback_v(ctdb, mem_ctx, callback, private_data, from_user, call, fmt, ap);
 	va_end(ap);
 
 	return ret;
@@ -775,12 +948,12 @@ int ctdb_event_script_args(struct ctdb_context *ctdb, enum ctdb_eventscript_call
 	struct callback_status status;
 
 	va_start(ap, fmt);
-	ret = ctdb_event_script_callback_v(ctdb,
+	ret = ctdb_event_script_callback_v(ctdb, ctdb,
 			event_script_callback, &status, false, call, fmt, ap);
+	va_end(ap);
 	if (ret != 0) {
 		return ret;
 	}
-	va_end(ap);
 
 	status.status = -1;
 	status.done = false;
@@ -792,7 +965,11 @@ int ctdb_event_script_args(struct ctdb_context *ctdb, enum ctdb_eventscript_call
 				  " Immediately banning ourself for %d seconds\n",
 				  ctdb_eventscript_call_names[call],
 				  ctdb->tunable.recovery_ban_period));
-		ctdb_ban_self(ctdb);
+
+		/* Don't ban self if CTDB is starting up or shutting down */
+		if (call != CTDB_EVENT_INIT && call != CTDB_EVENT_SHUTDOWN) {
+			ctdb_ban_self(ctdb);
+		}
 	}
 
 	return status.status;
@@ -820,7 +997,7 @@ static void run_eventscripts_callback(struct ctdb_context *ctdb, int status,
 	ctdb_enable_monitoring(ctdb);
 
 	if (status != 0) {
-		DEBUG(DEBUG_ERR,(__location__ " Failed to forcibly run eventscripts\n"));
+		DEBUG(DEBUG_ERR,(__location__ " Failed to run eventscripts\n"));
 	}
 
 	ctdb_request_control_reply(ctdb, state->c, NULL, status, NULL);
@@ -866,7 +1043,7 @@ int32_t ctdb_run_eventscripts(struct ctdb_context *ctdb,
 	/* Figure out what call they want. */
 	options = get_call((const char *)indata.dptr, &call);
 	if (!options) {
-		DEBUG(DEBUG_ERR, (__location__ " Invalid forced \"%s\"\n", (const char *)indata.dptr));
+		DEBUG(DEBUG_ERR, (__location__ " Invalid event name \"%s\"\n", (const char *)indata.dptr));
 		return -1;
 	}
 
@@ -880,7 +1057,7 @@ int32_t ctdb_run_eventscripts(struct ctdb_context *ctdb,
 
 	state->c = talloc_steal(state, c);
 
-	DEBUG(DEBUG_NOTICE,("Forced running of eventscripts with arguments %s\n", indata.dptr));
+	DEBUG(DEBUG_NOTICE,("Running eventscripts with arguments %s\n", indata.dptr));
 
 	ctdb_disable_monitoring(ctdb);
 

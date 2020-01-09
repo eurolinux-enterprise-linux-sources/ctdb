@@ -1,37 +1,70 @@
 #!/bin/sh
 # script to manage nfs in a clustered environment
 
-start_nfs() {
-	/bin/mkdir -p $CTDB_BASE/state/nfs
-	/bin/mkdir -p $CTDB_BASE/state/statd/ip
-	/bin/mkdir -p $STATD_SHARED_DIRECTORY
-	startstop_nfs stop
-	startstop_nfs start
-}
-
-reconfigure_nfs() {
-	# always restart the lockmanager so that we start with a clusterwide
-	# graceperiod when ip addresses has changed
-	[ -x $CTDB_BASE/statd-callout ] && {
-		$CTDB_BASE/statd-callout notify &
-	} >/dev/null 2>&1
-
-}
+[ -n "$CTDB_BASE" ] || \
+    export CTDB_BASE=$(cd -P $(dirname "$0") ; dirname "$PWD")
 
 . $CTDB_BASE/functions
 
 service_name="nfs"
-service_start="start_nfs"
-service_stop="startstop_nfs stop"
-service_reconfigure="reconfigure_nfs"
+service_start ()
+{
+    startstop_nfs stop
+    startstop_nfs start
+    set_proc "sys/net/ipv4/tcp_tw_recycle" 1
+}
+service_stop ()
+{
+    startstop_nfs stop
+}
+service_reconfigure ()
+{
+    # if the ips have been reallocated, we must restart the lockmanager
+    # across all nodes and ping all statd listeners
+    [ -x $CTDB_BASE/statd-callout ] && {
+	$CTDB_BASE/statd-callout notify &
+    } >/dev/null 2>&1
+}
+
+nfs_check_thread_count ()
+{
+    [ "$CTDB_MONITOR_NFS_THREAD_COUNT" = "yes" ] || return 0
+
+    # If $RPCNFSDCOUNT/$USE_KERNEL_NFSD_NUMBER isn't set then we could
+    # guess the default from the initscript.  However, let's just
+    # assume that those using the default don't care about the number
+    # of threads and that they have switched on this feature in error.
+    _configured_threads="${RPCNFSDCOUNT:-${USE_KERNEL_NFSD_NUMBER}}"
+    [ -n "$_configured_threads" ] || return 0
+
+    # nfsd should be running the configured number of threads.  If
+    # there are a different number of threads then tell nfsd the
+    # correct number.  
+    _running_threads=$(get_proc "fs/nfsd/threads")
+    # Intentionally not arithmetic comparison - avoids extra errors
+    # when get_proc() fails...
+    if [ "$_running_threads" != "$_configured_threads" ] ; then
+	echo "Attempting to correct number of nfsd threads from ${_running_threads} to ${_configured_threads}"
+	set_proc "fs/nfsd/threads" "$_configured_threads"
+    fi
+}
 
 loadconfig
 
-[ -z "$STATD_SHARED_DIRECTORY" ] && exit 0
+[ "${CTDB_NFS_SERVER_MODE:-${NFS_SERVER_MODE}}" != "ganesha" ] || exit 0
+
+ctdb_setup_service_state_dir
 
 ctdb_start_stop_service
 
+is_ctdb_managed_service || exit 0
+
+ctdb_service_check_reconfigure
+
 case "$1" in 
+     init)
+	# read statd from persistent database
+	;;
      startup)
 	ctdb_service_start
 	;;
@@ -42,77 +75,26 @@ case "$1" in
 
      takeip)
 	ctdb_service_set_reconfigure
-	touch $CTDB_BASE/state/statd/ip/$3
 	;;
 
      releaseip)
 	ctdb_service_set_reconfigure
-	/bin/rm -f $CTDB_BASE/state/statd/ip/$3
-	;;
-
-     recovered)
-	# if we have taken or released any ips we must 
-	# restart the lock manager so that we enter a clusterwide grace period
-	if ctdb_service_needs_reconfigure ; then
-	    ctdb_service_reconfigure
-	fi
 	;;
 
       monitor)
-	if ctdb_service_needs_reconfigure ; then
-	    ctdb_service_reconfigure
-	    exit 0
-	fi
-
-	# check that statd responds to rpc requests
-	# if statd is not running we try to restart it
-	rpcinfo -u localhost 100024 1 > /dev/null || {
-		RPCSTATDOPTS=""
-		[ -n "$STATD_HOSTNAME" ] && RPCSTATDOPTS="$RPCSTATDOPTS -n $STATD_HOSTNAME"
-		[ -n "$STATD_PORT" ] && RPCSTATDOPTS="$RPCSTATDOPTS -p $STATD_PORT"
-		[ -n "$STATD_OUTGOING_PORT" ] && RPCSTATDOPTS="$RPCSTATDOPTS -o $STATD_OUTGOING_PORT"
-		rpc.statd $RPCSTATDOPTS 
-		echo "ERROR: STATD is not responding. Trying to restart it. [rpc.statd $RPCSTATDOPTS]"
-	}
-
-
-	# check that NFS responds to rpc requests
-	[ "$CTDB_NFS_SKIP_KNFSD_ALIVE_CHECK" = "yes" ] || {
-	    ctdb_check_rpc "NFS" 100003 3
-	}
-
-	# and that its directories are available
+	# Check that directories for shares actually exist.
 	[ "$CTDB_NFS_SKIP_SHARE_CHECK" = "yes" ] || {
-	    exportfs | grep -v '^#' | grep '^/' |
-	    sed -e 's/[[:space:]]\+[^[:space:]]*$//' |
-	    ctdb_check_directories
+	    exportfs -v | grep '^/' | 
+	    sed -r -e 's@[[:space:]]+[^[:space:]()]+\([^[:space:]()]+\)$@@' | 
+	    sort -u | 
+	    ctdb_check_directories 
 	} || exit $?
 
-	# check that lockd responds to rpc requests
-	ctdb_check_rpc "lockd" 100021 1
-	echo "$STATD_SHARED_DIRECTORY" | ctdb_check_directories "statd" || \
-	    exit $?
+	update_tickles 2049
 
-	# mount needs special handling since it is sometimes not started
-	# correctly on RHEL5
-	rpcinfo -u localhost 100005 1 > /dev/null || {
-		echo "ERROR: MOUNTD is not running. Trying to restart it."
-		RPCMOUNTDOPTS=""
-		[ -n "$MOUNTD_PORT" ] && RPCMOUNTDOPTS="$RPCMOUNTDOPTS -p $MOUNTD_PORT"
-		killall -q -9 rpc.mountd
-		rpc.mountd $RPCMOUNTDOPTS &
-		exit 1
-	}
-	# rquotad needs special handling since it is sometimes not started
-	# correctly on RHEL5
-	# this is not a critical service so we dont flag the node as unhealthy
-	rpcinfo -u localhost 100011 1 > /dev/null || {
-		echo "ERROR: RQUOTAD is not running. Trying to restart it."
-		RPCRQUOTADOPTS=""
-		[ -n "$RQUOTAD_PORT" ] && RPCRQUOTADOPTS="$RPCRQUOTADOPTS -p $RQUOTAD_PORT"
-		killall -q -9 rpc.rquotad
-		rpc.rquotad $RPCRQUOTADOPTS &
-	}
+	nfs_check_rpc_services
+
+	nfs_check_thread_count
        	;;
 
     *)
