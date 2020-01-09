@@ -28,6 +28,8 @@
 
 struct ctdb_persistent_state {
 	struct ctdb_context *ctdb;
+	struct ctdb_db_context *ctdb_db; /* used by trans3_commit */
+	struct ctdb_client *client; /* used by trans3_commit */
 	struct ctdb_req_control *c;
 	const char *errormsg;
 	uint32_t num_pending;
@@ -52,27 +54,48 @@ static void ctdb_persistent_callback(struct ctdb_context *ctdb,
 {
 	struct ctdb_persistent_state *state = talloc_get_type(private_data, 
 							      struct ctdb_persistent_state);
+	enum ctdb_trans2_commit_error etype;
+
+	if (ctdb->recovery_mode != CTDB_RECOVERY_NORMAL) {
+		DEBUG(DEBUG_INFO, ("ctdb_persistent_callback: ignoring reply "
+				   "during recovery\n"));
+		return;
+	}
 
 	if (status != 0) {
 		DEBUG(DEBUG_ERR,("ctdb_persistent_callback failed with status %d (%s)\n",
-			 status, errormsg));
+			 status, errormsg?errormsg:"no error message given"));
 		state->status = status;
 		state->errormsg = errormsg;
 		state->num_failed++;
+
+		/*
+		 * If a node failed to complete the update_record control,
+		 * then either a recovery is already running or something
+		 * bad is going on. So trigger a recovery and let the
+		 * recovery finish the transaction, sending back the reply
+		 * for the trans3_commit control to the client.
+		 */
+		ctdb->recovery_mode = CTDB_RECOVERY_ACTIVE;
+		return;
 	}
+
 	state->num_pending--;
-	if (state->num_pending == 0) {
-		enum ctdb_trans2_commit_error etype;
-		if (state->num_failed == state->num_sent) {
-			etype = CTDB_TRANS2_COMMIT_ALLFAIL;
-		} else if (state->num_failed != 0) {
-			etype = CTDB_TRANS2_COMMIT_SOMEFAIL;
-		} else {
-			etype = CTDB_TRANS2_COMMIT_SUCCESS;
-		}
-		ctdb_request_control_reply(state->ctdb, state->c, NULL, etype, state->errormsg);
-		talloc_free(state);
+
+	if (state->num_pending != 0) {
+		return;
 	}
+
+	if (state->num_failed == state->num_sent) {
+		etype = CTDB_TRANS2_COMMIT_ALLFAIL;
+	} else if (state->num_failed != 0) {
+		etype = CTDB_TRANS2_COMMIT_SOMEFAIL;
+	} else {
+		etype = CTDB_TRANS2_COMMIT_SUCCESS;
+	}
+
+	ctdb_request_control_reply(state->ctdb, state->c, NULL, etype, state->errormsg);
+	talloc_free(state);
 }
 
 /*
@@ -82,11 +105,51 @@ static void ctdb_persistent_store_timeout(struct event_context *ev, struct timed
 					 struct timeval t, void *private_data)
 {
 	struct ctdb_persistent_state *state = talloc_get_type(private_data, struct ctdb_persistent_state);
-	
+
+	if (state->ctdb->recovery_mode != CTDB_RECOVERY_NORMAL) {
+		DEBUG(DEBUG_INFO, ("ctdb_persistent_store_timeout: ignoring "
+				   "timeout during recovery\n"));
+		return;
+	}
+
 	ctdb_request_control_reply(state->ctdb, state->c, NULL, CTDB_TRANS2_COMMIT_TIMEOUT, 
 				   "timeout in ctdb_persistent_state");
 
 	talloc_free(state);
+}
+
+/**
+ * Finish pending trans3 commit controls, i.e. send
+ * reply to the client. This is called by the end-recovery
+ * control to fix the situation when a recovery interrupts
+ * the usual porgress of a transaction.
+ */
+void ctdb_persistent_finish_trans3_commits(struct ctdb_context *ctdb)
+{
+	struct ctdb_db_context *ctdb_db;
+
+	if (ctdb->recovery_mode != CTDB_RECOVERY_NORMAL) {
+		DEBUG(DEBUG_INFO, ("ctdb_persistent_store_timeout: ignoring "
+				   "timeout during recovery\n"));
+		return;
+	}
+
+	for (ctdb_db = ctdb->db_list; ctdb_db; ctdb_db = ctdb_db->next) {
+		struct ctdb_persistent_state *state;
+
+		if (ctdb_db->persistent_state == NULL) {
+			continue;
+		}
+
+		state = ctdb_db->persistent_state;
+
+		ctdb_request_control_reply(ctdb, state->c, NULL,
+					   CTDB_TRANS2_COMMIT_SOMEFAIL,
+					   "trans3 commit ended by recovery");
+
+		/* The destructor sets ctdb_db->persistent_state to NULL. */
+		talloc_free(state);
+	}
 }
 
 /*
@@ -247,6 +310,18 @@ int32_t ctdb_control_trans2_commit(struct ctdb_context *ctdb,
 	return 0;
 }
 
+static int ctdb_persistent_state_destructor(struct ctdb_persistent_state *state)
+{
+	if (state->client != NULL) {
+		state->client->db_id = 0;
+	}
+
+	if (state->ctdb_db != NULL) {
+		state->ctdb_db->persistent_state = NULL;
+	}
+
+	return 0;
+}
 
 /*
  * Store a set of persistent records.
@@ -267,13 +342,6 @@ int32_t ctdb_control_trans3_commit(struct ctdb_context *ctdb,
 		return -1;
 	}
 
-	ctdb_db = find_ctdb_db(ctdb, m->db_id);
-	if (ctdb_db == NULL) {
-		DEBUG(DEBUG_ERR,(__location__ " ctdb_control_trans3_commit: "
-				 "Unknown database db_id[0x%08x]\n", m->db_id));
-		return -1;
-	}
-
 	client = ctdb_reqid_find(ctdb, c->client_id, struct ctdb_client);
 	if (client == NULL) {
 		DEBUG(DEBUG_ERR,(__location__ " can not match persistent_store "
@@ -281,11 +349,42 @@ int32_t ctdb_control_trans3_commit(struct ctdb_context *ctdb,
 		return -1;
 	}
 
-	state = talloc_zero(ctdb, struct ctdb_persistent_state);
-	CTDB_NO_MEMORY(ctdb, state);
+	if (client->db_id != 0) {
+		DEBUG(DEBUG_ERR,(__location__ " ERROR: trans3_commit: "
+				 "client-db_id[0x%08x] != 0 "
+				 "(client_id[0x%08x]): trans3_commit active?\n",
+				 client->db_id, client->client_id));
+		return -1;
+	}
 
+	ctdb_db = find_ctdb_db(ctdb, m->db_id);
+	if (ctdb_db == NULL) {
+		DEBUG(DEBUG_ERR,(__location__ " ctdb_control_trans3_commit: "
+				 "Unknown database db_id[0x%08x]\n", m->db_id));
+		return -1;
+	}
+
+	if (ctdb_db->persistent_state != NULL) {
+		DEBUG(DEBUG_ERR, (__location__ " Error: "
+				  "ctdb_control_trans3_commit "
+				  "called while a transaction commit is "
+				  "active. db_id[0x%08x]\n", m->db_id));
+		return -1;
+	}
+
+	ctdb_db->persistent_state = talloc_zero(ctdb_db,
+						struct ctdb_persistent_state);
+	CTDB_NO_MEMORY(ctdb, ctdb_db->persistent_state);
+
+	client->db_id = m->db_id;
+
+	state = ctdb_db->persistent_state;
 	state->ctdb = ctdb;
+	state->ctdb_db = ctdb_db;
 	state->c    = c;
+	state->client = client;
+
+	talloc_set_destructor(state, ctdb_persistent_state_destructor);
 
 	for (i = 0; i < ctdb->vnn_map->size; i++) {
 		struct ctdb_node *node = ctdb->nodes[ctdb->vnn_map->map[i]];

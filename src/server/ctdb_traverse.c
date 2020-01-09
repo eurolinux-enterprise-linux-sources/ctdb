@@ -43,6 +43,7 @@ struct ctdb_traverse_local_handle {
 	ctdb_traverse_fn_t callback;
 	struct timeval start_time;
 	struct ctdb_queue *queue;
+	bool withemptyrecords;
 };
 
 /*
@@ -96,7 +97,9 @@ static int ctdb_traverse_local_fn(struct tdb_context *tdb, TDB_DATA key, TDB_DAT
 
 	if (h->ctdb_db->persistent == 0) {
 		/* filter out zero-length records */
-		if (data.dsize <= sizeof(struct ctdb_ltdb_header)) {
+		if (!h->withemptyrecords &&
+		    data.dsize <= sizeof(struct ctdb_ltdb_header))
+		{
 			return 0;
 		}
 
@@ -125,6 +128,7 @@ struct traverse_all_state {
 	uint32_t srcnode;
 	uint32_t client_reqid;
 	uint64_t srvid;
+	bool withemptyrecords;
 };
 
 /*
@@ -167,6 +171,7 @@ static struct ctdb_traverse_local_handle *ctdb_traverse_local(struct ctdb_db_con
 	h->ctdb_db = ctdb_db;
 	h->client_reqid = all_state->client_reqid;
 	h->srvid = all_state->srvid;
+	h->withemptyrecords = all_state->withemptyrecords;
 
 	if (h->child == 0) {
 		/* start the traverse in the child */
@@ -224,6 +229,7 @@ struct ctdb_traverse_all {
 	uint32_t pnn;
 	uint32_t client_reqid;
 	uint64_t srvid;
+	bool withemptyrecords;
 };
 
 /* called when a traverse times out */
@@ -246,6 +252,7 @@ struct traverse_start_state {
 	uint32_t reqid;
 	uint32_t db_id;
 	uint64_t srvid;
+	bool withemptyrecords;
 };
 
 
@@ -287,6 +294,7 @@ static struct ctdb_traverse_all_handle *ctdb_daemon_traverse_all(struct ctdb_db_
 	r.pnn   = ctdb->pnn;
 	r.client_reqid = start_state->reqid;
 	r.srvid = start_state->srvid;
+	r.withemptyrecords = start_state->withemptyrecords;
 
 	data.dptr = (uint8_t *)&r;
 	data.dsize = sizeof(r);
@@ -408,6 +416,7 @@ int32_t ctdb_control_traverse_all(struct ctdb_context *ctdb, TDB_DATA data, TDB_
 	state->ctdb = ctdb;
 	state->client_reqid = c->client_reqid;
 	state->srvid = c->srvid;
+	state->withemptyrecords = c->withemptyrecords;
 
 	state->h = ctdb_traverse_local(ctdb_db, traverse_all_callback, state);
 	if (state->h == NULL) {
@@ -545,13 +554,17 @@ static void traverse_start_callback(void *p, TDB_DATA key, TDB_DATA data)
 }
 
 
-/*
-  start a traverse_all - called as a control from a client
+/**
+ * start a traverse_all - called as a control from a client.
+ * extended version to take the "withemptyrecords" parameter.
  */
-int32_t ctdb_control_traverse_start(struct ctdb_context *ctdb, TDB_DATA data, 
-				    TDB_DATA *outdata, uint32_t srcnode, uint32_t client_id)
+int32_t ctdb_control_traverse_start_ext(struct ctdb_context *ctdb,
+					TDB_DATA data,
+					TDB_DATA *outdata,
+					uint32_t srcnode,
+					uint32_t client_id)
 {
-	struct ctdb_traverse_start *d = (struct ctdb_traverse_start *)data.dptr;
+	struct ctdb_traverse_start_ext *d = (struct ctdb_traverse_start_ext *)data.dptr;
 	struct traverse_start_state *state;
 	struct ctdb_db_context *ctdb_db;
 	struct ctdb_client *client = ctdb_reqid_find(ctdb, client_id, struct ctdb_client);
@@ -591,6 +604,7 @@ int32_t ctdb_control_traverse_start(struct ctdb_context *ctdb, TDB_DATA data,
 	state->srvid = d->srvid;
 	state->db_id = d->db_id;
 	state->ctdb = ctdb;
+	state->withemptyrecords = d->withemptyrecords;
 
 	state->h = ctdb_daemon_traverse_all(ctdb_db, traverse_start_callback, state);
 	if (state->h == NULL) {
@@ -601,4 +615,29 @@ int32_t ctdb_control_traverse_start(struct ctdb_context *ctdb, TDB_DATA data,
 	talloc_set_destructor(state, ctdb_traverse_start_destructor);
 
 	return 0;
+}
+
+/**
+ * start a traverse_all - called as a control from a client.
+ */
+int32_t ctdb_control_traverse_start(struct ctdb_context *ctdb,
+				    TDB_DATA data,
+				    TDB_DATA *outdata,
+				    uint32_t srcnode,
+				    uint32_t client_id)
+{
+	struct ctdb_traverse_start *d = (struct ctdb_traverse_start *)data.dptr;
+	struct ctdb_traverse_start_ext d2;
+	TDB_DATA data2;
+
+	ZERO_STRUCT(d2);
+	d2.db_id = d->db_id;
+	d2.reqid = d->reqid;
+	d2.srvid = d->srvid;
+	d2.withemptyrecords = false;
+
+	data2.dsize = sizeof(d2);
+	data2.dptr = (uint8_t *)&d2;
+
+	return ctdb_control_traverse_start_ext(ctdb, data2, outdata, srcnode, client_id);
 }

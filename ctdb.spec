@@ -2,8 +2,8 @@
 
 Summary: A Clustered Database based on Samba's Trivial Database (TDB)
 Name: ctdb
-Version: 1.0.114.3
-Release: 4%{?dist}
+Version: 1.0.114.5
+Release: 3%{?dist}
 License: GPLv3+
 Group: System Environment/Daemons
 URL: http://ctdb.samba.org/
@@ -19,6 +19,9 @@ Patch1: ctdb-no_default_runlevel.patch
 Patch2: 0001-Set-FD_CLOEXEC-for-epoll-file-descriptors.patch
 Patch3: 0001-Fixes-for-various-issues-found-by-Coverity.patch
 Patch4: 0001-IPv6-neighbor-solicit-cleanup.patch
+Patch5: 0001-Print-deleted-nodes-as-well.patch
+Patch6: 0001-Fix-memory-leak-in-ctdb_send_message.patch
+Patch7: 0001-Check-return-value-of-tdb_delete.patch
 
 Requires: chkconfig coreutils psmisc
 Requires: fileutils sed
@@ -58,6 +61,9 @@ and use CTDB instead.
 %patch2 -p1
 %patch3 -p1
 %patch4 -p1
+%patch5 -p1
+%patch6 -p1
+%patch7 -p1
 
 %build
 
@@ -148,6 +154,23 @@ fi
 %{_libdir}/pkgconfig/ctdb.pc
 
 %changelog
+* Mon Nov 19 2012 Sumit Bose <sbose@redhat.com> - 1.0.114.5-3
+ - Improve output of ctdb status by adding the number of deleted nodes
+ - Fix a memory and an unchecked return value found by coverity
+ - Resolves: rhbz#866670 - ctdb status reports more nodes then available
+ - Resolves: rhbz#874058 - One resource leak && unchecked return value
+
+* Tue Aug 22 2012 Sumit Bose <sbose@redhat.com> - 1.0.114.5-2
+ - Increased release number to be able to update RHS version of ctdb
+ - Related: rhbz#838885 - Rebase ctdb to version 1.0.114.5 in RHEL 6.4
+
+* Tue Aug 21 2012 Sumit Bose <sbose@redhat.com> - 1.0.114.5-1
+ - Updated to ctdb version 1.0.114.5
+ - Resolves: rhbz#821715 - ctdbd on a node crashes when another node in the
+   cluster is brought down
+ - Resolves: rhbz#758367 - ctdb w/ GFS2: A stable node gets banned
+ - Resolves: rhbz#838885 - Rebase ctdb to version 1.0.114.5 in RHEL 6.4
+
 * Thu Mar 01 2012 Sumit Bose <sbose@redhat.com> - 1.0.114.3-4
  - Resolves: rhbz#794888 - /var/ctdb gets created with incorrect selinux
    context

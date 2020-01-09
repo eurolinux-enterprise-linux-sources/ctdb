@@ -1149,13 +1149,14 @@ static void *add_ip_callback(void *parm, void *data)
 	return parm;
 }
 
-void getips_count_callback(void *param, void *data)
+static int getips_count_callback(void *param, void *data)
 {
 	struct ctdb_public_ip_list **ip_list = (struct ctdb_public_ip_list **)param;
 	struct ctdb_public_ip_list *new_ip = (struct ctdb_public_ip_list *)data;
 
 	new_ip->next = *ip_list;
 	*ip_list     = new_ip;
+	return 0;
 }
 
 struct ctdb_public_ip_list *
@@ -2243,14 +2244,15 @@ static void capture_tcp_handler(struct event_context *ev, struct fd_event *fde,
     by a RST)
    this callback is called for each connection we are currently trying to kill
 */
-static void tickle_connection_traverse(void *param, void *data)
+static int tickle_connection_traverse(void *param, void *data)
 {
 	struct ctdb_killtcp_con *con = talloc_get_type(data, struct ctdb_killtcp_con);
 
 	/* have tried too many times, just give up */
 	if (con->count >= 5) {
-		talloc_free(con);
-		return;
+		/* can't delete in traverse: reparent to delete_cons */
+		talloc_steal(param, con);
+		return 0;
 	}
 
 	/* othervise, try tickling it again */
@@ -2259,6 +2261,7 @@ static void tickle_connection_traverse(void *param, void *data)
 		(ctdb_sock_addr *)&con->dst_addr,
 		(ctdb_sock_addr *)&con->src_addr,
 		0, 0, 0);
+	return 0;
 }
 
 
@@ -2269,11 +2272,13 @@ static void ctdb_tickle_sentenced_connections(struct event_context *ev, struct t
 					      struct timeval t, void *private_data)
 {
 	struct ctdb_kill_tcp *killtcp = talloc_get_type(private_data, struct ctdb_kill_tcp);
-
+	void *delete_cons = talloc_new(NULL);
 
 	/* loop over all connections sending tickle ACKs */
-	trbt_traversearray32(killtcp->connections, KILLTCP_KEYLEN, tickle_connection_traverse, NULL);
+	trbt_traversearray32(killtcp->connections, KILLTCP_KEYLEN, tickle_connection_traverse, delete_cons);
 
+	/* now we've finished traverse, it's safe to do deletion. */
+	talloc_free(delete_cons);
 
 	/* If there are no more connections to kill we can remove the
 	   entire killtcp structure

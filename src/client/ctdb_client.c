@@ -47,14 +47,13 @@ struct ctdb_req_header *_ctdbd_allocate_pkt(struct ctdb_context *ctdb,
 	length = MAX(length, slength);
 	size = (length+(CTDB_DS_ALIGNMENT-1)) & ~(CTDB_DS_ALIGNMENT-1);
 
-	hdr = (struct ctdb_req_header *)talloc_size(mem_ctx, size);
+	hdr = (struct ctdb_req_header *)talloc_zero_size(mem_ctx, size);
 	if (hdr == NULL) {
 		DEBUG(DEBUG_ERR,("Unable to allocate packet for operation %u of length %u\n",
 			 operation, (unsigned)length));
 		return NULL;
 	}
 	talloc_set_name_const(hdr, type);
-	memset(hdr, 0, slength);
 	hdr->length       = length;
 	hdr->operation    = operation;
 	hdr->ctdb_magic   = CTDB_MAGIC;
@@ -1782,6 +1781,7 @@ struct traverse_state {
 	uint32_t count;
 	ctdb_traverse_func fn;
 	void *private_data;
+	bool listemptyrecords;
 };
 
 /*
@@ -1811,7 +1811,9 @@ static void traverse_handler(struct ctdb_context *ctdb, uint64_t srvid, TDB_DATA
 		return;
 	}
 
-	if (data.dsize == sizeof(struct ctdb_ltdb_header)) {
+	if (!state->listemptyrecords &&
+	    data.dsize == sizeof(struct ctdb_ltdb_header))
+	{
 		/* empty records are deleted records in ctdb */
 		return;
 	}
@@ -1823,15 +1825,20 @@ static void traverse_handler(struct ctdb_context *ctdb, uint64_t srvid, TDB_DATA
 	state->count++;
 }
 
-
-/*
-  start a cluster wide traverse, calling the supplied fn on each record
-  return the number of records traversed, or -1 on error
+/**
+ * start a cluster wide traverse, calling the supplied fn on each record
+ * return the number of records traversed, or -1 on error
+ *
+ * Extendet variant with a flag to signal whether empty records should
+ * be listed.
  */
-int ctdb_traverse(struct ctdb_db_context *ctdb_db, ctdb_traverse_func fn, void *private_data)
+static int ctdb_traverse_ext(struct ctdb_db_context *ctdb_db,
+			     ctdb_traverse_func fn,
+			     bool withemptyrecords,
+			     void *private_data)
 {
 	TDB_DATA data;
-	struct ctdb_traverse_start t;
+	struct ctdb_traverse_start_ext t;
 	int32_t status;
 	int ret;
 	uint64_t srvid = (getpid() | 0xFLL<<60);
@@ -1841,6 +1848,7 @@ int ctdb_traverse(struct ctdb_db_context *ctdb_db, ctdb_traverse_func fn, void *
 	state.count = 0;
 	state.private_data = private_data;
 	state.fn = fn;
+	state.listemptyrecords = withemptyrecords;
 
 	ret = ctdb_set_message_handler(ctdb_db->ctdb, srvid, traverse_handler, &state);
 	if (ret != 0) {
@@ -1851,11 +1859,12 @@ int ctdb_traverse(struct ctdb_db_context *ctdb_db, ctdb_traverse_func fn, void *
 	t.db_id = ctdb_db->db_id;
 	t.srvid = srvid;
 	t.reqid = 0;
+	t.withemptyrecords = withemptyrecords;
 
 	data.dptr = (uint8_t *)&t;
 	data.dsize = sizeof(t);
 
-	ret = ctdb_control(ctdb_db->ctdb, CTDB_CURRENT_NODE, 0, CTDB_CONTROL_TRAVERSE_START, 0,
+	ret = ctdb_control(ctdb_db->ctdb, CTDB_CURRENT_NODE, 0, CTDB_CONTROL_TRAVERSE_START_EXT, 0,
 			   data, NULL, NULL, &status, NULL, NULL);
 	if (ret != 0 || status != 0) {
 		DEBUG(DEBUG_ERR,("ctdb_traverse_all failed\n"));
@@ -1876,6 +1885,18 @@ int ctdb_traverse(struct ctdb_db_context *ctdb_db, ctdb_traverse_func fn, void *
 	return state.count;
 }
 
+/**
+ * start a cluster wide traverse, calling the supplied fn on each record
+ * return the number of records traversed, or -1 on error
+ *
+ * Standard version which does not list the empty records:
+ * These are considered deleted.
+ */
+int ctdb_traverse(struct ctdb_db_context *ctdb_db, ctdb_traverse_func fn, void *private_data)
+{
+	return ctdb_traverse_ext(ctdb_db, fn, false, private_data);
+}
+
 #define ISASCII(x) (isprint(x) && !strchr("\"\\", (x)))
 /*
   called on each key during a catdb
@@ -1883,7 +1904,8 @@ int ctdb_traverse(struct ctdb_db_context *ctdb_db, ctdb_traverse_func fn, void *
 int ctdb_dumpdb_record(struct ctdb_context *ctdb, TDB_DATA key, TDB_DATA data, void *p)
 {
 	int i;
-	FILE *f = (FILE *)p;
+	struct ctdb_dump_db_context *c = (struct ctdb_dump_db_context *)p;
+	FILE *f = c->f;
 	struct ctdb_ltdb_header *h = (struct ctdb_ltdb_header *)data.dptr;
 
 	fprintf(f, "key(%u) = \"", (unsigned)key.dsize);
@@ -1899,15 +1921,36 @@ int ctdb_dumpdb_record(struct ctdb_context *ctdb, TDB_DATA key, TDB_DATA data, v
 	fprintf(f, "dmaster: %u\n", h->dmaster);
 	fprintf(f, "rsn: %llu\n", (unsigned long long)h->rsn);
 
-	fprintf(f, "data(%u) = \"", (unsigned)data.dsize);
-	for (i=sizeof(*h);i<data.dsize;i++) {
-		if (ISASCII(data.dptr[i])) {
-			fprintf(f, "%c", data.dptr[i]);
-		} else {
-			fprintf(f, "\\%02X", data.dptr[i]);
-		}
+	if (c->printlmaster && ctdb->vnn_map != NULL) {
+		fprintf(f, "lmaster: %u\n", ctdb_lmaster(ctdb, &key));
 	}
-	fprintf(f, "\"\n");
+
+	if (c->printhash) {
+		fprintf(f, "hash: 0x%08x\n", ctdb_hash(&key));
+		fprintf(f, "jenkins hash: 0x%08x\n", (uint32_t)tdb_jenkins_hash(&key));
+	}
+
+	if (c->printrecordflags) {
+		fprintf(f, "flags: 0x%08x", h->flags);
+		if (h->flags & CTDB_REC_FLAG_MIGRATED_WITH_DATA) printf(" MIGRATED_WITH_DATA");
+		if (h->flags & CTDB_REC_FLAG_VACUUM_MIGRATED) printf(" VACUUM_MIGRATED");
+		if (h->flags & CTDB_REC_FLAG_AUTOMATIC) printf(" AUTOMATIC");
+		fprintf(f, "\n");
+	}
+
+	if (c->printdatasize) {
+		fprintf(f, "data size: %u\n", (unsigned)data.dsize);
+	} else {
+		fprintf(f, "data(%u) = \"", (unsigned)(data.dsize - sizeof(*h)));
+		for (i=sizeof(*h);i<data.dsize;i++) {
+			if (ISASCII(data.dptr[i])) {
+				fprintf(f, "%c", data.dptr[i]);
+			} else {
+				fprintf(f, "\\%02X", data.dptr[i]);
+			}
+		}
+		fprintf(f, "\"\n");
+	}
 
 	fprintf(f, "\n");
 
@@ -1917,9 +1960,11 @@ int ctdb_dumpdb_record(struct ctdb_context *ctdb, TDB_DATA key, TDB_DATA data, v
 /*
   convenience function to list all keys to stdout
  */
-int ctdb_dump_db(struct ctdb_db_context *ctdb_db, FILE *f)
+int ctdb_dump_db(struct ctdb_db_context *ctdb_db,
+		 struct ctdb_dump_db_context *ctx)
 {
-	return ctdb_traverse(ctdb_db, ctdb_dumpdb_record, f);
+	return ctdb_traverse_ext(ctdb_db, ctdb_dumpdb_record,
+				 ctx->printemptyrecords, ctx);
 }
 
 /*

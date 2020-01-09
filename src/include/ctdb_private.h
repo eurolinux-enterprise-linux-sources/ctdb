@@ -120,6 +120,7 @@ struct ctdb_tunable {
 	uint32_t reclock_latency_ms;
 	uint32_t recovery_drop_all_ips;
 	uint32_t verify_recovery_lock;
+	uint32_t vacuum_interval;
 	uint32_t vacuum_default_interval;
 	uint32_t vacuum_max_run_time;
 	uint32_t repack_limit;
@@ -467,6 +468,8 @@ struct ctdb_context {
 
 	TALLOC_CTX *banning_ctx;
 
+	struct ctdb_vacuum_child_context *vacuumers;
+
 	/* mapping from pid to ctdb_client * */
 	struct ctdb_client_pid_list *client_pids;
 };
@@ -487,6 +490,7 @@ struct ctdb_db_context {
 	bool transaction_active;
 	struct ctdb_vacuum_handle *vacuum_handle;
 	char *unhealthy_reason;
+	struct ctdb_persistent_state *persistent_state;
 	struct _trbt_tree_t *delete_queue;
 	int (*ctdb_ltdb_store_fn)(struct ctdb_db_context *ctdb_db,
 				  TDB_DATA key,
@@ -653,7 +657,9 @@ enum ctdb_controls {CTDB_CONTROL_PROCESS_EXISTS          = 0,
 		    CTDB_CONTROL_SET_IFACE_LINK_STATE	 = 125,
 		    /* 126 & 127: skipped (master...) */
 		    CTDB_CONTROL_SCHEDULE_FOR_DELETION   = 128,
-};	
+		    /* 129 & 130: skipped (master) */
+		    CTDB_CONTROL_TRAVERSE_START_EXT	 = 131,
+};
 
 /*
   structure passed in set_call control
@@ -1117,6 +1123,13 @@ struct ctdb_traverse_start {
 	uint64_t srvid;
 };
 
+struct ctdb_traverse_start_ext {
+	uint32_t db_id;
+	uint32_t reqid;
+	uint64_t srvid;
+	bool withemptyrecords;
+};
+
 /*
   structure used to pass record data between the child and parent
  */
@@ -1220,6 +1233,11 @@ struct ctdb_client_call_state {
 };
 
 
+int32_t ctdb_control_traverse_start_ext(struct ctdb_context *ctdb,
+					TDB_DATA indata,
+					TDB_DATA *outdata,
+					uint32_t srcnode,
+					uint32_t client_id);
 int32_t ctdb_control_traverse_start(struct ctdb_context *ctdb, TDB_DATA indata, 
 				    TDB_DATA *outdata, uint32_t srcnode, uint32_t client_id);
 int32_t ctdb_control_traverse_all(struct ctdb_context *ctdb, TDB_DATA data, TDB_DATA *outdata);
@@ -1524,6 +1542,8 @@ int32_t ctdb_control_trans3_commit(struct ctdb_context *ctdb,
 				   struct ctdb_req_control *c,
 				   TDB_DATA recdata, bool *async_reply);
 
+void ctdb_persistent_finish_trans3_commits(struct ctdb_context *ctdb);
+
 int32_t ctdb_control_transaction_start(struct ctdb_context *ctdb, uint32_t id);
 int32_t ctdb_control_transaction_commit(struct ctdb_context *ctdb, uint32_t id);
 int32_t ctdb_control_transaction_cancel(struct ctdb_context *ctdb);
@@ -1601,6 +1621,7 @@ int ctdb_ctrl_report_recd_lock_latency(struct ctdb_context *ctdb, struct timeval
 int32_t ctdb_control_stop_node(struct ctdb_context *ctdb, struct ctdb_req_control *c, bool *async_reply);
 int32_t ctdb_control_continue_node(struct ctdb_context *ctdb);
 
+void ctdb_stop_vacuuming(struct ctdb_context *ctdb);
 int ctdb_vacuum_init(struct ctdb_db_context *ctdb_db);
 
 int32_t ctdb_control_enable_script(struct ctdb_context *ctdb, TDB_DATA indata);
@@ -1673,6 +1694,10 @@ int32_t ctdb_control_schedule_for_deletion(struct ctdb_context *ctdb,
 int32_t ctdb_local_schedule_for_deletion(struct ctdb_db_context *ctdb_db,
 					 const struct ctdb_ltdb_header *hdr,
 					 TDB_DATA key);
+
+void ctdb_local_remove_from_delete_queue(struct ctdb_db_context *ctdb_db,
+					 const struct ctdb_ltdb_header *hdr,
+					 const TDB_DATA key);
 
 struct ctdb_ltdb_header *ctdb_header_from_record_handle(struct ctdb_record_handle *h);
 

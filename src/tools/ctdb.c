@@ -41,7 +41,13 @@ static struct {
 	int timelimit;
 	uint32_t pnn;
 	int machinereadable;
+	int verbose;
 	int maxruntime;
+	int printemptyrecords;
+	int printdatasize;
+	int printlmaster;
+	int printhash;
+	int printrecordflags;
 } options;
 
 #define TIMELIMIT() timeval_current_ofs(options.timelimit, 0)
@@ -102,7 +108,7 @@ static void verify_node(struct ctdb_context *ctdb)
 /*
  check if a database exists
 */
-static int db_exists(struct ctdb_context *ctdb, const char *db_name)
+static int db_exists(struct ctdb_context *ctdb, const char *db_name, bool *persistent)
 {
 	int i, ret;
 	struct ctdb_dbid_map *dbmap=NULL;
@@ -118,6 +124,9 @@ static int db_exists(struct ctdb_context *ctdb, const char *db_name)
 
 		ctdb_ctrl_getdbname(ctdb, TIMELIMIT(), options.pnn, dbmap->dbs[i].dbid, ctdb, &name);
 		if (!strcmp(name, db_name)) {
+			if (persistent) {
+				*persistent = dbmap->dbs[i].persistent;
+			}
 			return 0;
 		}
 	}
@@ -1108,7 +1117,7 @@ static int control_moveip(struct ctdb_context *ctdb, int argc, const char **argv
 	return 0;
 }
 
-void getips_store_callback(void *param, void *data)
+static int getips_store_callback(void *param, void *data)
 {
 	struct ctdb_public_ip *node_ip = (struct ctdb_public_ip *)data;
 	struct ctdb_all_public_ips *ips = param;
@@ -1117,13 +1126,15 @@ void getips_store_callback(void *param, void *data)
 	i = ips->num++;
 	ips->ips[i].pnn  = node_ip->pnn;
 	ips->ips[i].addr = node_ip->addr;
+	return 0;
 }
 
-void getips_count_callback(void *param, void *data)
+static int getips_count_callback(void *param, void *data)
 {
 	uint32_t *count = param;
 
 	(*count)++;
+	return 0;
 }
 
 #define IP_KEYLEN	4
@@ -2688,6 +2699,8 @@ static int control_catdb(struct ctdb_context *ctdb, int argc, const char **argv)
 	const char *db_name;
 	struct ctdb_db_context *ctdb_db;
 	int ret;
+	bool persistent;
+	struct ctdb_dump_db_context c;
 
 	if (argc < 1) {
 		usage();
@@ -2696,20 +2709,38 @@ static int control_catdb(struct ctdb_context *ctdb, int argc, const char **argv)
 	db_name = argv[0];
 
 
-	if (db_exists(ctdb, db_name)) {
+	if (db_exists(ctdb, db_name, &persistent)) {
 		DEBUG(DEBUG_ERR,("Database '%s' does not exist\n", db_name));
 		return -1;
 	}
 
-	ctdb_db = ctdb_attach(ctdb, db_name, false, 0);
+	ctdb_db = ctdb_attach(ctdb, db_name, persistent, 0);
 
 	if (ctdb_db == NULL) {
 		DEBUG(DEBUG_ERR,("Unable to attach to database '%s'\n", db_name));
 		return -1;
 	}
 
+	if (options.printlmaster) {
+		ret = ctdb_ctrl_getvnnmap(ctdb, TIMELIMIT(), options.pnn,
+					  ctdb, &ctdb->vnn_map);
+		if (ret != 0) {
+			DEBUG(DEBUG_ERR, ("Unable to get vnnmap from node %u\n",
+					  options.pnn));
+			return ret;
+		}
+	}
+
+	ZERO_STRUCT(c);
+	c.f = stdout;
+	c.printemptyrecords = (bool)options.printemptyrecords;
+	c.printdatasize = (bool)options.printdatasize;
+	c.printlmaster = (bool)options.printlmaster;
+	c.printhash = (bool)options.printhash;
+	c.printrecordflags = (bool)options.printrecordflags;
+
 	/* traverse and dump the cluster tdb */
-	ret = ctdb_dump_db(ctdb_db, stdout);
+	ret = ctdb_dump_db(ctdb_db, &c);
 	if (ret == -1) {
 		DEBUG(DEBUG_ERR, ("Unable to dump database\n"));
 		DEBUG(DEBUG_ERR, ("Maybe try 'ctdb getdbstatus %s'"
@@ -2990,7 +3021,7 @@ static int control_getvar(struct ctdb_context *ctdb, int argc, const char **argv
 		return -1;
 	}
 
-	printf("%-19s = %u\n", name, value);
+	printf("%-23s = %u\n", name, value);
 	return 0;
 }
 
@@ -3300,13 +3331,23 @@ static int control_attach(struct ctdb_context *ctdb, int argc, const char **argv
 {
 	const char *db_name;
 	struct ctdb_db_context *ctdb_db;
+	bool persistent = false;
 
 	if (argc < 1) {
 		usage();
 	}
 	db_name = argv[0];
+	if (argc > 2) {
+		usage();
+	}
+	if (argc == 2) {
+		if (strcmp(argv[1], "persistent") != 0) {
+			usage();
+		}
+		persistent = true;
+	}
 
-	ctdb_db = ctdb_attach(ctdb, db_name, false, 0);
+	ctdb_db = ctdb_attach(ctdb, db_name, persistent, 0);
 	if (ctdb_db == NULL) {
 		DEBUG(DEBUG_ERR,("Unable to attach to database '%s'\n", db_name));
 		return -1;
@@ -3802,6 +3843,7 @@ static int control_dumpdbbackup(struct ctdb_context *ctdb, int argc, const char 
 	char tbuf[100];
 	struct ctdb_rec_data *rec = NULL;
 	struct ctdb_marshall_buffer *m;
+	struct ctdb_dump_db_context c;
 
 	if (argc != 1) {
 		DEBUG(DEBUG_ERR,("Invalid arguments\n"));
@@ -3839,6 +3881,14 @@ static int control_dumpdbbackup(struct ctdb_context *ctdb, int argc, const char 
 	printf("Backup of database name:'%s' dbid:0x%x08x from @ %s\n",
 		dbhdr.name, m->db_id, tbuf);
 
+	ZERO_STRUCT(c);
+	c.f = stdout;
+	c.printemptyrecords = (bool)options.printemptyrecords;
+	c.printdatasize = (bool)options.printdatasize;
+	c.printlmaster = false;
+	c.printhash = (bool)options.printhash;
+	c.printrecordflags = (bool)options.printrecordflags;
+
 	for (i=0; i < m->count; i++) {
 		uint32_t reqid = 0;
 		TDB_DATA key, data;
@@ -3847,7 +3897,7 @@ static int control_dumpdbbackup(struct ctdb_context *ctdb, int argc, const char 
 		rec = ctdb_marshall_loop_next(m, rec, &reqid,
 					      NULL, &key, &data);
 
-		ctdb_dumpdb_record(ctdb, key, data, stdout);
+		ctdb_dumpdb_record(ctdb, key, data, &c);
 	}
 
 	printf("Dumped %d records\n", i);
@@ -4357,7 +4407,7 @@ static const struct {
 	{ "getdebug",        control_getdebug,          true,	false,  "get debug level" },
 	{ "getlog",          control_getlog,            true,	false,  "get the log data from the in memory ringbuffer", "<level>" },
 	{ "clearlog",          control_clearlog,        true,	false,  "clear the log data from the in memory ringbuffer" },
-	{ "attach",          control_attach,            true,	false,  "attach to a database",                 "<dbname>" },
+	{ "attach",          control_attach,            true,	false,  "attach to a database",                 "<dbname> [persistent]" },
 	{ "dumpmemory",      control_dumpmemory,        true,	false,  "dump memory map to stdout" },
 	{ "rddumpmemory",    control_rddumpmemory,      true,	false,  "dump memory map from the recovery daemon to stdout" },
 	{ "getpid",          control_getpid,            true,	false,  "get ctdbd process ID" },
@@ -4383,7 +4433,7 @@ static const struct {
 	{ "unregsrvid",      unregsrvid,		false,	false, "unregister a server id", "<pnn> <type> <id>" },
 	{ "chksrvid",        chksrvid,			false,	false, "check if a server id exists", "<pnn> <type> <id>" },
 	{ "getsrvids",       getsrvids,			false,	false, "get a list of all server ids"},
-	{ "vacuum",          ctdb_vacuum,		false,	false, "vacuum the databases of empty records", "[max_records]"},
+	{ "vacuum",          ctdb_vacuum,		false,	true, "vacuum the databases of empty records", "[max_records]"},
 	{ "repack",          ctdb_repack,		false,	false, "repack all databases", "[max_freelist]"},
 	{ "listnodes",       control_listnodes,		false,	true, "list all nodes in the cluster"},
 	{ "reloadnodes",     control_reload_nodes_file,	false,	false, "reload the nodes file and restart the transport on all nodes"},
@@ -4424,6 +4474,7 @@ static void usage(void)
 "Options:\n" \
 "   -n <node>          choose node number, or 'all' (defaults to local node)\n"
 "   -Y                 generate machinereadable output\n"
+"   -v                 generate verbose output\n"
 "   -t <timelimit>     set timelimit for control in seconds (default %u)\n", options.timelimit);
 	printf("Controls:\n");
 	for (i=0;i<ARRAY_SIZE(ctdb_commands);i++) {
@@ -4455,7 +4506,13 @@ int main(int argc, const char *argv[])
 		{ "timelimit", 't', POPT_ARG_INT, &options.timelimit, 0, "timelimit", "integer" },
 		{ "node",      'n', POPT_ARG_STRING, &nodestring, 0, "node", "integer|all" },
 		{ "machinereadable", 'Y', POPT_ARG_NONE, &options.machinereadable, 0, "enable machinereadable output", NULL },
+		{ "verbose",    'v', POPT_ARG_NONE, &options.verbose, 0, "enable verbose output", NULL },
 		{ "maxruntime", 'T', POPT_ARG_INT, &options.maxruntime, 0, "die if runtime exceeds this limit (in seconds)", "integer" },
+		{ "print-emptyrecords", 0, POPT_ARG_NONE, &options.printemptyrecords, 0, "print the empty records when dumping databases (catdb, cattdb, dumpdbbackup)", NULL },
+		{ "print-datasize", 0, POPT_ARG_NONE, &options.printdatasize, 0, "do not print record data when dumping databases, only the data size", NULL },
+		{ "print-lmaster", 0, POPT_ARG_NONE, &options.printlmaster, 0, "print the record's lmaster in catdb", NULL },
+		{ "print-hash", 0, POPT_ARG_NONE, &options.printhash, 0, "print the record's hash when dumping databases", NULL },
+		{ "print-recordflags", 0, POPT_ARG_NONE, &options.printrecordflags, 0, "print the record flags in catdb and dumpdbbackup", NULL },
 		POPT_TABLEEND
 	};
 	int opt;

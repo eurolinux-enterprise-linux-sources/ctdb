@@ -69,6 +69,7 @@ static int ctdb_ltdb_store_server(struct ctdb_db_context *ctdb_db,
 	bool seqnum_suppressed = false;
 	bool keep = false;
 	bool schedule_for_deletion = false;
+	bool remove_from_delete_queue = false;
 	uint32_t lmaster;
 
 	if (ctdb->flags & CTDB_FLAG_TORTURE) {
@@ -140,12 +141,14 @@ static int ctdb_ltdb_store_server(struct ctdb_db_context *ctdb_db,
 		keep = true;
 	}
 
-	if (keep &&
-	    (data.dsize == 0) &&
-	    !ctdb_db->persistent &&
-	    (ctdb_db->ctdb->pnn == header->dmaster))
-	{
-		schedule_for_deletion = true;
+	if (keep) {
+		if ((data.dsize == 0) &&
+		    !ctdb_db->persistent &&
+		    (ctdb_db->ctdb->pnn == header->dmaster))
+		{
+			schedule_for_deletion = true;
+		}
+		remove_from_delete_queue = !schedule_for_deletion;
 	}
 
 store:
@@ -199,10 +202,11 @@ store:
 		if (old.dptr) free(old.dptr);
 	}
 
-	DEBUG(DEBUG_DEBUG, (__location__ " db[%s]: %s record: hash[0x%08x]\n",
+	DEBUG(DEBUG_DEBUG, (__location__ " db[%s]: %s record: hash[0x%08x] "
+			    "jenkins hash[0x%08x]\n",
 			    ctdb_db->db_name,
 			    keep?"storing":"deleting",
-			    ctdb_hash(&key)));
+			    ctdb_hash(&key), (uint32_t)tdb_jenkins_hash(&key)));
 
 	if (keep) {
 		ret = tdb_store(ctdb_db->ltdb->tdb, key, rec, TDB_REPLACE);
@@ -226,6 +230,7 @@ store:
 			    tdb_errorstr(ctdb_db->ltdb->tdb)));
 
 		schedule_for_deletion = false;
+		remove_from_delete_queue = false;
 	}
 	if (seqnum_suppressed) {
 		tdb_add_flags(ctdb_db->ltdb->tdb, TDB_SEQNUM);
@@ -239,6 +244,10 @@ store:
 		if (ret != 0) {
 			DEBUG(DEBUG_ERR, (__location__ " ctdb_local_schedule_for_deletion failed.\n"));
 		}
+	}
+
+	if (remove_from_delete_queue) {
+		ctdb_local_remove_from_delete_queue(ctdb_db, header, key);
 	}
 
 	return ret;

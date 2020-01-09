@@ -30,6 +30,11 @@
 		<arg choice="opt">--usage</arg>
 		<arg choice="opt">-d --debug=&lt;INTEGER&gt;</arg>
 		<arg choice="opt">--socket=&lt;filename&gt;</arg>
+		<arg choice="opt">--print-emptyrecords</arg>
+		<arg choice="opt">--print-datasize</arg>
+		<arg choice="opt">--print-lmaster</arg>
+		<arg choice="opt">--print-hash</arg>
+		<arg choice="opt">--print-recordflags</arg>
 	</cmdsynopsis>
 	
 </refsynopsisdiv>
@@ -119,6 +124,54 @@
             You only need to specify this parameter if you run multiple ctdb 
             daemons on the same physical host and thus can not use the default
             name for the domain socket.
+          </para>
+        </listitem>
+      </varlistentry>
+
+      <varlistentry><term>--print-emptyrecords</term>
+        <listitem>
+          <para>
+            This enables printing of empty records when dumping databases
+            with the catdb, cattbd and dumpdbbackup commands. Records with
+            empty data segment are considered deleted by ctdb and cleaned
+            by the vacuuming mechanism, so this switch can come in handy for
+            debugging the vacuuming behaviour.
+          </para>
+        </listitem>
+      </varlistentry>
+
+      <varlistentry><term>--print-datasize</term>
+        <listitem>
+          <para>
+            This lets database dumps (catdb, cattdb, dumpdbbackup) print the
+            size of the record data instead of dumping the data contents.
+          </para>
+        </listitem>
+      </varlistentry>
+
+      <varlistentry><term>--print-lmaster</term>
+        <listitem>
+          <para>
+            This lets catdb print the lmaster for each record.
+          </para>
+        </listitem>
+      </varlistentry>
+
+      <varlistentry><term>--print-hash</term>
+        <listitem>
+          <para>
+            This lets database dumps (catdb, cattdb, dumpdbbackup) print the
+            hash for each record.
+          </para>
+        </listitem>
+      </varlistentry>
+
+      <varlistentry><term>--print-recordflags</term>
+        <listitem>
+          <para>
+            This lets catdb and dumpdbbackup print the
+            record flags for each record. Note that cattdb always
+            prints the flags.
           </para>
         </listitem>
       </varlistentry>
@@ -501,7 +554,9 @@ MaxRedirectCount    = 3
 
     <refsect2><title>listvars</title>
       <para>
-        List all tuneable variables.
+      List all tuneable variables, except the values of the obsolete tunables
+      like VacuumMinInterval. The obsolete tunables can be retrieved only
+      explicitly with the "ctdb getvar" command.
       </para>
       <para>
 	Example: ctdb listvars
@@ -510,48 +565,44 @@ MaxRedirectCount    = 3
 	Example output:
       </para>
       <screen format="linespecific">
-MaxRedirectCount    = 3
-SeqnumInterval      = 1000
-ControlTimeout      = 60
-TraverseTimeout     = 20
-KeepaliveInterval   = 5
-KeepaliveLimit      = 5
-MaxLACount          = 7
-RecoverTimeout      = 20
-RecoverInterval     = 1
-ElectionTimeout     = 3
-TakeoverTimeout     = 5
-MonitorInterval     = 15
-TickleUpdateInterval = 20
-EventScriptTimeout  = 30
-EventScriptBanCount = 10
-EventScriptUnhealthyOnTimeout = 0
-RecoveryGracePeriod = 120
-RecoveryBanPeriod   = 300
-DatabaseHashSize    = 10000
-DatabaseMaxDead     = 5
-RerecoveryTimeout   = 10
-EnableBans          = 1
-DeterministicIPs    = 1
-DisableWhenUnhealthy = 0
-ReclockPingPeriod   = 60
-NoIPFailback        = 0
-VerboseMemoryNames  = 0
-RecdPingTimeout     = 60
-RecdFailCount       = 10
-LogLatencyMs        = 0
-RecLockLatencyMs    = 1000
-RecoveryDropAllIPs  = 60
-VerifyRecoveryLock  = 1
-VacuumDefaultInterval = 300
-VacuumMaxRunTime    = 30
-RepackLimit         = 10000
-VacuumLimit         = 5000
-VacuumMinInterval   = 60
-VacuumMaxInterval   = 600
-MaxQueueDropMsg     = 1000
-UseStatusEvents     = 0
-AllowUnhealthyDBRead = 0
+MaxRedirectCount        = 3
+SeqnumInterval          = 1000
+ControlTimeout          = 60
+TraverseTimeout         = 20
+KeepaliveInterval       = 5
+KeepaliveLimit          = 5
+RecoverTimeout          = 20
+RecoverInterval         = 1
+ElectionTimeout         = 3
+TakeoverTimeout         = 5
+MonitorInterval         = 15
+TickleUpdateInterval    = 20
+EventScriptTimeout      = 30
+EventScriptTimeoutCount = 1
+RecoveryGracePeriod     = 120
+RecoveryBanPeriod       = 300
+DatabaseHashSize        = 10000
+DatabaseMaxDead         = 5
+RerecoveryTimeout       = 10
+EnableBans              = 1
+DeterministicIPs        = 1
+ReclockPingPeriod       = 60
+NoIPFailback            = 0
+VerboseMemoryNames      = 0
+RecdPingTimeout         = 60
+RecdFailCount           = 10
+LogLatencyMs            = 0
+RecLockLatencyMs        = 1000
+RecoveryDropAllIPs      = 60
+VerifyRecoveryLock      = 1
+VacuumInterval          = 10
+VacuumMaxRunTime        = 30
+RepackLimit             = 10000
+VacuumLimit             = 5000
+VacuumFastPathCount     = 60
+MaxQueueDropMsg         = 1000000
+UseStatusEvents         = 0
+AllowUnhealthyDBRead    = 0
       </screen>
     </refsect2>
 
@@ -1047,7 +1098,7 @@ This is mainly useful for backing up persistent databases such as secrets.tdb an
 	CTDBD also keeps a in-memory ringbuffer containing the most recent
 	log entries for all log levels (except DEBUG).
       </para><para>
-	This is useful since it allows for keeping continous logs to a file
+	This is useful since it allows for keeping continuous logs to a file
 	at a reasonable non-verbose level, but shortly after an incident has
 	occured, a much more detailed log can be pulled from memory. This
 	can allow you to avoid having to reproduce an issue due to the
@@ -1178,7 +1229,7 @@ HEALTH: NO-HEALTHY-NODES - ERROR - Backup of corrupted TDB in '/var/ctdb/persist
 
     <refsect2><title>getmonmode</title>
       <para>
-        This command returns the monutoring mode of a node. The monitoring mode is either ACTIVE or DISABLED. Normally a node will continously monitor that all other nodes that are expected are in fact connected and that they respond to commands.
+        This command returns the monutoring mode of a node. The monitoring mode is either ACTIVE or DISABLED. Normally a node will continuously monitor that all other nodes that are expected are in fact connected and that they respond to commands.
       </para>
       <para>
         ACTIVE - This is the normal mode. The node is actively monitoring all other nodes, both that the transport is connected and also that the node responds to commands. If a node becomes unavailable, it will be marked as DISCONNECTED and a recovery is initiated to restore the cluster.
