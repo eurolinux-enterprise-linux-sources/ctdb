@@ -22,10 +22,9 @@
    along with this program; if not, see <http://www.gnu.org/licenses/>.
 */
 
-#include <stdlib.h>
-#include <time.h>
 #include "includes.h"
 #include "system/filesys.h"
+#include "system/time.h"
 #include "popt.h"
 #include "cmdline.h"
 #include "ctdb_private.h"
@@ -126,6 +125,9 @@ int main(int argc, const char *argv[])
 	ev = event_context_init(NULL);
 
 	ctdb = ctdb_cmdline_client(ev, timeval_current_ofs(5, 0));
+	if (ctdb == NULL) {
+		exit(1);
+	}
 
 	trackdb_test(ctdb);
 

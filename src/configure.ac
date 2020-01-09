@@ -26,6 +26,7 @@ case `uname` in
   AIX*)
     CTDB_SYSTEM_OBJ=common/system_aix.o
     CTDB_SCSI_IO=
+    CPPFLAGS="$CPPFLAGS -D_AIX_=1"
     CTDB_PCAP_LDFLAGS=-lpcap
     ;;
   GNU/kFreeBSD)
@@ -71,9 +72,9 @@ if test ! -z "$LOGDIR"; then
 fi
 AC_SUBST(LOGDIR)
 
-SOCKPATH='/tmp/ctdb.socket'
+SOCKPATH='${localstatedir}/run/ctdb/ctdbd.socket'
 AC_ARG_WITH([socketpath],
-	[  --with-socketpath=FILE       path to CTDB daemon socket [[/tmp/ctdb.socket]]],
+	[  --with-socketpath=FILE       path to CTDB daemon socket [[LOCALSTATEDIR/run/ctdb/ctdbd.socket]]],
 	SOCKPATH=$withval)
 if test ! -z "$SOCKPATH"; then
   if test "$SOCKPATH" = "yes" -o "$SOCKPATH" = "no"; then
@@ -94,22 +95,17 @@ m4_include(ib/config.m4)
 m4_include(lib/util/signal.m4)
 m4_include(lib/util/fault.m4)
 m4_include(lib/socket_wrapper/config.m4)
+m4_include(utils/pmda/config.m4)
 
 AC_CHECK_HEADERS(sched.h)
-AC_CHECK_HEADERS(pcp/pmapi.h pcp/impl.h pcp/pmda.h, [], [],
-[[#ifdef HAVE_PCP_PMAPI_H
-# include <pcp/pmapi.h>
-#endif
-#ifdef HAVE_PCP_IMPL_H
-# include <pcp/impl.h>
-#endif
-]])
+AC_CHECK_HEADERS(procinfo.h)
 
 AC_CHECK_DECL([ETIME], [],[AC_DEFINE([ETIME], ETIMEDOUT, [ETIME on non-supporting platforms])], [
 #include <errno.h>
 ])
 
 AC_CHECK_FUNCS(sched_setscheduler)
+AC_CHECK_FUNCS(thread_setsched)
 AC_CHECK_FUNCS(mlockall)
 
 AC_CACHE_CHECK([for sin_len in sock],ctdb_cv_HAVE_SOCK_SIN_LEN,[
@@ -122,20 +118,9 @@ if test x"$ctdb_cv_HAVE_SOCK_SIN_LEN" = x"yes"; then
     AC_DEFINE(HAVE_SOCK_SIN_LEN,1,[Whether the sockaddr_in struct has a sin_len property])
 fi
 
-if test x"$ac_cv_header_pcp_pmda_h" = x"yes"; then
-    CTDB_PMDA=bin/pmdactdb
-    CTDB_PMDA_INSTALL=install_pmda
-else
-    CTDB_PMDA=
-    CTDB_PMDA_INSTALL=
-fi
-
-
 AC_SUBST(EXTRA_OBJ)
 AC_SUBST(CTDB_SYSTEM_OBJ)
 AC_SUBST(CTDB_SCSI_IO)
 AC_SUBST(CTDB_PCAP_LDFLAGS)
-AC_SUBST(CTDB_PMDA)
-AC_SUBST(CTDB_PMDA_INSTALL)
 
 AC_OUTPUT(Makefile ctdb.pc)

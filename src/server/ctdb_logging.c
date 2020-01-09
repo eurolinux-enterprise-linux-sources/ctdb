@@ -38,7 +38,6 @@ struct ctdb_syslog_state {
 
 static int syslogd_is_started = 0;
 
-
 /* called when child is finished
  * this is for the syslog daemon, we can not use DEBUG here
  */
@@ -60,12 +59,16 @@ static void ctdb_syslog_handler(struct event_context *ev, struct fd_event *fde,
 		return;
 	}
 	msg = (struct syslog_message *)str;
+	if (msg->len >= (sizeof(str) - offsetof(struct syslog_message, message))) {
+		msg->len = (sizeof(str)-1) - offsetof(struct syslog_message, message);
+	}
+	msg->message[msg->len] = '\0';
 
 	syslog(msg->level, "%s", msg->message);
 }
 
 
-/* called when the pipd from the main daemon has closed
+/* called when the pipe from the main daemon has closed
  * this is for the syslog daemon, we can not use DEBUG here
  */
 static void ctdb_syslog_terminate_handler(struct event_context *ev, struct fd_event *fde, 
@@ -85,6 +88,8 @@ int start_syslog_daemon(struct ctdb_context *ctdb)
 	struct sockaddr_in syslog_sin;
 	struct ctdb_syslog_state *state;
 	struct tevent_fd *fde;
+	int startup_fd[2];
+	int ret = -1;
 
 	state = talloc(ctdb, struct ctdb_syslog_state);
 	CTDB_NO_MEMORY(ctdb, state);
@@ -95,23 +100,42 @@ int start_syslog_daemon(struct ctdb_context *ctdb)
 		return -1;
 	}
 	
-	ctdb->syslogd_pid = ctdb_fork(ctdb);
-	if (ctdb->syslogd_pid == (pid_t)-1) {
-		printf("Failed to create syslog child process\n");
+	if (pipe(startup_fd) != 0) {
+		printf("Failed to create syslog startup pipe\n");
 		close(state->fd[0]);
 		close(state->fd[1]);
 		talloc_free(state);
 		return -1;
 	}
-
-	syslogd_is_started = 1;
+	
+	ctdb->syslogd_pid = ctdb_fork(ctdb);
+	if (ctdb->syslogd_pid == (pid_t)-1) {
+		printf("Failed to create syslog child process\n");
+		close(state->fd[0]);
+		close(state->fd[1]);
+		close(startup_fd[0]);
+		close(startup_fd[1]);
+		talloc_free(state);
+		return -1;
+	}
 
 	if (ctdb->syslogd_pid != 0) {
+		ssize_t n;
+		int dummy;
+
 		DEBUG(DEBUG_ERR,("Starting SYSLOG child process with pid:%d\n", (int)ctdb->syslogd_pid));
 
 		close(state->fd[1]);
 		set_close_on_exec(state->fd[0]);
 
+		close(startup_fd[1]);
+		n = read(startup_fd[0], &dummy, sizeof(dummy));
+		close(startup_fd[0]);
+		if (n < sizeof(dummy)) {
+			return -1;
+		}
+
+		syslogd_is_started = 1;
 		return 0;
 	}
 
@@ -120,9 +144,12 @@ int start_syslog_daemon(struct ctdb_context *ctdb)
 	ctdb->ev = event_context_init(NULL);
 
 	syslog(LOG_ERR, "Starting SYSLOG daemon with pid:%d", (int)getpid());
+	ctdb_set_process_name("ctdb_syslogd");
 
 	close(state->fd[0]);
+	close(startup_fd[0]);
 	set_close_on_exec(state->fd[1]);
+	set_close_on_exec(startup_fd[1]);
 	fde = event_add_fd(ctdb->ev, state, state->fd[1], EVENT_FD_READ,
 		     ctdb_syslog_terminate_handler, state);
 	tevent_fd_set_auto_close(fde);
@@ -130,7 +157,8 @@ int start_syslog_daemon(struct ctdb_context *ctdb)
 	state->syslog_fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
 	if (state->syslog_fd == -1) {
 		printf("Failed to create syslog socket\n");
-		return -1;
+		close(startup_fd[1]);
+		return ret;
 	}
 
 	set_close_on_exec(state->syslog_fd);
@@ -142,11 +170,8 @@ int start_syslog_daemon(struct ctdb_context *ctdb)
 	if (bind(state->syslog_fd, (struct sockaddr *)&syslog_sin,
 		 sizeof(syslog_sin)) == -1)
 	{
-		if (errno == EADDRINUSE) {
-			/* this is ok, we already have a syslog daemon */
-			_exit(0);
-		}
 		printf("syslog daemon failed to bind to socket. errno:%d(%s)\n", errno, strerror(errno));
+		close(startup_fd[1]);
 		_exit(10);
 	}
 
@@ -154,6 +179,11 @@ int start_syslog_daemon(struct ctdb_context *ctdb)
 	fde = event_add_fd(ctdb->ev, state, state->syslog_fd, EVENT_FD_READ,
 		     ctdb_syslog_handler, state);
 	tevent_fd_set_auto_close(fde);
+
+	/* Tell parent that we're up */
+	ret = 0;
+	write(startup_fd[1], &ret, sizeof(ret));
+	close(startup_fd[1]);
 
 	event_loop_wait(ctdb->ev);
 
@@ -374,8 +404,9 @@ static void write_to_log(struct ctdb_log_state *log,
 			do_debug("%*.*s\n", len, len, buf);
 		}
 		/* log it in the eventsystem as well */
-		if (log->logfn)
+		if (log && log->logfn) {
 			log->logfn(log->buf, len, log->logfn_private);
+		}
 	}
 }
 
@@ -520,6 +551,10 @@ int ctdb_set_child_logging(struct ctdb_context *ctdb)
 	/* We'll fail if stderr/stdout not already open; it's simpler. */
 	old_stdout = dup(STDOUT_FILENO);
 	old_stderr = dup(STDERR_FILENO);
+	if (old_stdout < 0 || old_stderr < 0) {
+		DEBUG(DEBUG_ERR, ("Failed to dup stdout/stderr for child logging\n"));
+		return -1;
+	}
 	if (dup2(p[1], STDOUT_FILENO) < 0 || dup2(p[1], STDERR_FILENO) < 0) {
 		int saved_errno = errno;
 		dup2(old_stdout, STDOUT_FILENO);
@@ -537,11 +572,6 @@ int ctdb_set_child_logging(struct ctdb_context *ctdb)
 	close(p[1]);
 	close(old_stdout);
 	close(old_stderr);
-
-	/* Is this correct for STDOUT and STDERR ? */
-	set_close_on_exec(STDOUT_FILENO);
-	set_close_on_exec(STDERR_FILENO);
-	set_close_on_exec(p[0]);
 
 	fde = event_add_fd(ctdb->ev, ctdb->log, p[0],
 			   EVENT_FD_READ, ctdb_log_handler, ctdb->log);

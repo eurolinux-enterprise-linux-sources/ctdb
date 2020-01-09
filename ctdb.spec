@@ -5,31 +5,13 @@
 
 Summary: A Clustered Database based on Samba's Trivial Database (TDB)
 Name: ctdb
-Version: 2.1
-Release: 3%{?dist}
+Version: 2.5.1
+Release: 2%{?dist}
 License: GPLv3+
 Group: System Environment/Daemons
 URL: http://ctdb.samba.org/
 
 Source0: https://ftp.samba.org/pub/ctdb/%{name}-%{version}.tar.gz
-
-# Fedora specific patch, ctdb should not be enabled by default in the runlevels
-Patch1: ctdb-no_default_runlevel.patch
-
-Patch4: 0001-Fixes-for-various-issues-found-by-Coverity.patch
-
-# Submitted to upstream for review https://lists.samba.org/archive/samba-technical/2011-September/079198.html
-Patch5: 0001-IPv6-neighbor-solicit-cleanup.patch
-
-# Submitted to upstream for review https://lists.samba.org/archive/samba-technical/2012-January/081155.html
-Patch6: 0001-Extract-some-init-functions-into-a-separate-file.patch
-Patch7: 0002-Add-systemd-support.patch
-
-Patch8: clean-up-systemd-integration.patch
-
-# Submitted to upstream for review https://lists.samba.org/archive/samba-technical/2013-March/091165.html
-Patch9: 0001-Fix-for-tevent-autoconf-check.patch
-
 
 Requires: chkconfig coreutils psmisc
 Requires: fileutils sed
@@ -56,9 +38,9 @@ BuildRequires: procps iproute
 
 # If the above options are changed then mandate minimum system
 # versions.
-%define libtalloc_version 2.0.6
-%define libtdb_version 1.2.9
-%define libtevent_version 0.9.13
+%define libtalloc_version 2.0.8
+%define libtdb_version 1.2.11
+%define libtevent_version 0.9.18
 
 %if ! %with_included_talloc
 BuildRequires: libtalloc-devel >= %{libtalloc_version}
@@ -108,13 +90,6 @@ and use CTDB instead.
 %setup -q
 # setup the init script and sysconfig file
 %setup -T -D -n ctdb-%{version} -q
-%patch1 -p1
-%patch4 -p1
-%patch5 -p1
-%patch6 -p1
-%patch7 -p1
-%patch8 -p1
-%patch9 -p1
 
 %build
 
@@ -134,7 +109,6 @@ CFLAGS="$(echo '%{optflags}') $EXTRA -D_GNU_SOURCE -DCTDB_VERS=\"%{version}-%{re
         --with-included-tevent
 %endif
 
-
 make showflags
 make %{_smp_mflags}
 
@@ -148,6 +122,7 @@ rm -rf %{buildroot}
 
 # Create the target build directory hierarchy
 mkdir -p %{buildroot}%{_sysconfdir}/sysconfig
+mkdir -p %{buildroot}%{_sysconfdir}/sudoers.d
 mkdir -p %{buildroot}%{initdir}
 
 make DESTDIR=%{buildroot} install
@@ -157,11 +132,6 @@ make DESTDIR=%{buildroot} docdir=%{_docdir} install install_tests
 install -m644 config/ctdb.sysconfig %{buildroot}%{_sysconfdir}/sysconfig/ctdb
 
 %if %{with_systemd}
-mkdir -p %{buildroot}%{_sysconfdir}/ctdb/systemd
-install -m 755 config/systemd/ctdb_check_persistent_databases.pre %{buildroot}%{_sysconfdir}/ctdb/systemd
-install -m 755 config/systemd/ctdb_set_ctdb_variables.post %{buildroot}%{_sysconfdir}/ctdb/systemd
-install -m 755 config/systemd/ctdb_drop_all_public_ips %{buildroot}%{_sysconfdir}/ctdb/systemd
-install -m 755 config/systemd/ctdb.systemd %{buildroot}%{_sysconfdir}/ctdb/systemd
 mkdir -p %{buildroot}%{_unitdir}
 install -m 755 config/ctdb.service %{buildroot}%{_unitdir}
 %else
@@ -169,6 +139,14 @@ mkdir -p %{buildroot}%{initdir}
 install -m755 config/ctdb.init %{buildroot}%{initdir}/ctdb
 %endif
 
+# create /run/ctdbd
+mkdir -p %{buildroot}%{_tmpfilesdir}
+echo "d /run/ctdb  755 root root" >> %{buildroot}%{_tmpfilesdir}/%{name}.conf
+
+mkdir -p %{buildroot}/run
+install -d -m 0755 %{buildroot}/run/ctdb/
+
+install -d -m 0755 %{buildroot}%{_localstatedir}/lib/ctdb/
 
 mkdir -p %{buildroot}%{_docdir}/ctdb/tests/bin
 install -m755 tests/bin/ctdb_transaction %{buildroot}%{_docdir}/ctdb/tests/bin
@@ -177,9 +155,7 @@ install -m755 tests/bin/ctdb_transaction %{buildroot}%{_docdir}/ctdb/tests/bin
 # Remove "*.old" files
 find %{buildroot} -name "*.old" -exec rm -f {} \;
 
-# fix doc path
-mv %{buildroot}%{_docdir}/ctdb %{buildroot}%{_docdir}/ctdb-%{version}
-cp -r COPYING web %{buildroot}%{_docdir}/ctdb-%{version}
+cp -r COPYING web %{buildroot}%{_docdir}/ctdb
 
 %clean
 rm -rf %{buildroot}
@@ -220,28 +196,38 @@ fi
 %config(noreplace) %{_sysconfdir}/ctdb/ctdb-crash-cleanup.sh
 %config(noreplace) %{_sysconfdir}/ctdb/gcore_trace.sh
 %config(noreplace) %{_sysconfdir}/ctdb/functions
+%config(noreplace) %{_sysconfdir}/ctdb/debug_locks.sh
+%dir /run/ctdb/
+%dir %{_localstatedir}/lib/ctdb/
+%{_tmpfilesdir}/%{name}.conf
+
 %if %{with_systemd}
-%{_sysconfdir}/ctdb/systemd/ctdb_check_persistent_databases.pre
-%{_sysconfdir}/ctdb/systemd/ctdb_set_ctdb_variables.post
-%{_sysconfdir}/ctdb/systemd/ctdb_drop_all_public_ips
-%{_sysconfdir}/ctdb/systemd/ctdb.systemd
 %{_unitdir}/ctdb.service
 %else
 %attr(755,root,root) %{initdir}/ctdb
 %endif
 
-%{_docdir}/ctdb-%{version}
+%{_docdir}/ctdb
 %dir %{_sysconfdir}/ctdb
 %{_sysconfdir}/ctdb/statd-callout
-%{_sysconfdir}/ctdb/init_functions
+%dir %{_sysconfdir}/ctdb/nfs-rpc-checks.d
+%{_sysconfdir}/ctdb/nfs-rpc-checks.d/10.statd.check
+%{_sysconfdir}/ctdb/nfs-rpc-checks.d/20.nfsd.check
+%{_sysconfdir}/ctdb/nfs-rpc-checks.d/30.lockd.check
+%{_sysconfdir}/ctdb/nfs-rpc-checks.d/40.mountd.check
+%{_sysconfdir}/ctdb/nfs-rpc-checks.d/50.rquotad.check
+%{_sysconfdir}/sudoers.d/ctdb
 %{_sysconfdir}/ctdb/events.d/
 %{_sbindir}/ctdbd
+%{_sbindir}/ctdbd_wrapper
 %{_bindir}/ctdb
 %{_bindir}/smnotify
 %{_bindir}/ping_pong
 %{_bindir}/ltdbtool
 %{_bindir}/ctdb_diagnostics
 %{_bindir}/onnode
+%{_bindir}/ctdb_lock_helper
+
 %{_mandir}/man1/ctdb.1.gz
 %{_mandir}/man1/ctdbd.1.gz
 %{_mandir}/man1/onnode.1.gz
@@ -255,7 +241,6 @@ fi
 %{_includedir}/ctdb_protocol.h
 %{_includedir}/ctdb_private.h
 %{_includedir}/ctdb_typesafe_cb.h
-%{_libdir}/libctdb.a
 %{_libdir}/pkgconfig/ctdb.pc
 
 %files tests
@@ -269,6 +254,16 @@ fi
 %doc tests/README
 
 %changelog
+* Fri Jan 24 2014 Daniel Mach <dmach@redhat.com> - 2.5.1-2
+- Mass rebuild 2014-01-24
+
+* Mon Jan 13 2014 Sumit Bose <sbose@redhat.com> - 2.5.1-1
+- Update to ctdb version 2.5.1
+- Resolves: rhbz#1040426
+
+* Fri Dec 27 2013 Daniel Mach <dmach@redhat.com> - 2.1-4
+- Mass rebuild 2013-12-27
+
 * Fri May 17 2013 Sumit Bose <sbose@redhat.com> - 2.1-3
 - added _hardened_build to spec file
   Resolves: rhbz#955324

@@ -33,7 +33,6 @@ static struct {
 	const char *public_address_list;
 	const char *event_script_dir;
 	const char *notification_script;
-	const char *debug_hung_script;
 	const char *logfile;
 	const char *recovery_lock_file;
 	const char *db_dir;
@@ -53,15 +52,15 @@ static struct {
 	int         no_publicipcheck;
 	int         max_persistent_check_errors;
 } options = {
-	.nlist = ETCDIR "/ctdb/nodes",
+	.nlist = NULL,
+	.public_address_list = NULL,
 	.transport = "tcp",
-	.event_script_dir = ETCDIR "/ctdb/events.d",
+	.event_script_dir = NULL,
 	.logfile = LOGDIR "/log.ctdb",
-	.db_dir = VARDIR "/ctdb",
-	.db_dir_persistent = VARDIR "/ctdb/persistent",
-	.db_dir_state = VARDIR "/ctdb/state",
+	.db_dir = CTDB_VARDIR,
+	.db_dir_persistent = CTDB_VARDIR "/persistent",
+	.db_dir_state = CTDB_VARDIR "/state",
 	.script_log_level = DEBUG_ERR,
-	.debug_hung_script = ETCDIR "/ctdb/debug-hung-script.sh",
 };
 
 int script_log_level;
@@ -86,17 +85,6 @@ static void ctdb_recv_pkt(struct ctdb_context *ctdb, uint8_t *data, uint32_t len
 	}
 
 	ctdb_input_pkt(ctdb, hdr);
-}
-
-void ctdb_load_nodes_file(struct ctdb_context *ctdb)
-{
-	int ret;
-
-	ret = ctdb_set_nlist(ctdb, options.nlist);
-	if (ret == -1) {
-		DEBUG(DEBUG_ALERT,("ctdb_set_nlist failed - %s\n", ctdb_errstr(ctdb)));
-		exit(1);
-	}
 }
 
 static const struct ctdb_upcalls ctdb_upcalls = {
@@ -126,13 +114,13 @@ int main(int argc, const char *argv[])
 		{ "logfile", 0, POPT_ARG_STRING, &options.logfile, 0, "log file location", "filename" },
 		{ "nlist", 0, POPT_ARG_STRING, &options.nlist, 0, "node list file", "filename" },
 		{ "notification-script", 0, POPT_ARG_STRING, &options.notification_script, 0, "notification script", "filename" },
-		{ "debug-hung-script", 0, POPT_ARG_STRING, &options.debug_hung_script, 0, "debug script for hung eventscripts", "filename" },
 		{ "listen", 0, POPT_ARG_STRING, &options.myaddress, 0, "address to listen on", "address" },
 		{ "transport", 0, POPT_ARG_STRING, &options.transport, 0, "protocol transport", NULL },
 		{ "dbdir", 0, POPT_ARG_STRING, &options.db_dir, 0, "directory for the tdb files", NULL },
 		{ "dbdir-persistent", 0, POPT_ARG_STRING, &options.db_dir_persistent, 0, "directory for persistent tdb files", NULL },
 		{ "dbdir-state", 0, POPT_ARG_STRING, &options.db_dir_state, 0, "directory for internal state tdb files", NULL },
 		{ "reclock", 0, POPT_ARG_STRING, &options.recovery_lock_file, 0, "location of recovery lock file", "filename" },
+		{ "pidfile", 0, POPT_ARG_STRING, &ctdbd_pidfile, 0, "location of PID file", "filename" },
 		{ "valgrinding", 0, POPT_ARG_NONE, &options.valgrinding, 0, "disable setscheduler SCHED_FIFO call, use mmap for tdbs", NULL },
 		{ "nosetsched", 0, POPT_ARG_NONE, &options.nosetsched, 0, "disable setscheduler SCHED_FIFO call, use mmap for tdbs", NULL },
 		{ "syslog", 0, POPT_ARG_NONE, &options.use_syslog, 0, "log messages to syslog", NULL },
@@ -141,12 +129,12 @@ int main(int argc, const char *argv[])
 		{ "no-lmaster", 0, POPT_ARG_NONE, &options.no_lmaster, 0, "disable lmaster role on this node", NULL },
 		{ "no-recmaster", 0, POPT_ARG_NONE, &options.no_recmaster, 0, "disable recmaster role on this node", NULL },
 		{ "lvs", 0, POPT_ARG_NONE, &options.lvs, 0, "lvs is enabled on this node", NULL },
-		{ "script-log-level", 0, POPT_ARG_INT, &options.script_log_level, DEBUG_ERR, "log level of event script output", NULL },
+		{ "script-log-level", 0, POPT_ARG_INT, &options.script_log_level, 0, "log level of event script output", NULL },
 		{ "nopublicipcheck", 0, POPT_ARG_NONE, &options.no_publicipcheck, 0, "don't check we have/don't have the correct public ip addresses", NULL },
 		{ "max-persistent-check-errors", 0, POPT_ARG_INT,
 		  &options.max_persistent_check_errors, 0,
 		  "max allowed persistent check errors (default 0)", NULL },
-		{ "log-ringbuf-size", 0, POPT_ARG_INT, &log_ringbuf_size, DEBUG_ERR, "Number of log messages we can store in the memory ringbuffer", NULL },
+		{ "log-ringbuf-size", 0, POPT_ARG_INT, &log_ringbuf_size, 0, "Number of log messages we can store in the memory ringbuffer", NULL },
 		{ "sloppy-start", 0, POPT_ARG_NONE, &fast_start, 0, "Do not perform full recovery on start", NULL },
 		POPT_TABLEEND
 	};
@@ -252,30 +240,30 @@ int main(int argc, const char *argv[])
 	 */
 	ctdb->pnn = -1;
 
+	/* Default value for CTDB_BASE - don't override */
+	setenv("CTDB_BASE", ETCDIR "/ctdb", 0);
+
 	/* tell ctdb what nodes are available */
+	if (options.nlist != NULL) {
+		ctdb->nodes_file = options.nlist;
+	} else {
+		ctdb->nodes_file =
+			talloc_asprintf(ctdb, "%s/nodes", getenv("CTDB_BASE"));
+		if (ctdb->nodes_file == NULL) {
+			DEBUG(DEBUG_ALERT,(__location__ " Out of memory\n"));
+			exit(1);
+		}
+	}
 	ctdb_load_nodes_file(ctdb);
 
-	if (options.db_dir) {
-		ret = ctdb_set_tdb_dir(ctdb, options.db_dir);
-		if (ret == -1) {
-			DEBUG(DEBUG_ALERT,("ctdb_set_tdb_dir failed - %s\n", ctdb_errstr(ctdb)));
-			exit(1);
-		}
-	}
-	if (options.db_dir_persistent) {
-		ret = ctdb_set_tdb_dir_persistent(ctdb, options.db_dir_persistent);
-		if (ret == -1) {
-			DEBUG(DEBUG_ALERT,("ctdb_set_tdb_dir_persistent failed - %s\n", ctdb_errstr(ctdb)));
-			exit(1);
-		}
-	}
-	if (options.db_dir_state) {
-		ret = ctdb_set_tdb_dir_state(ctdb, options.db_dir_state);
-		if (ret == -1) {
-			DEBUG(DEBUG_ALERT,("ctdb_set_tdb_dir_state failed - %s\n", ctdb_errstr(ctdb)));
-			exit(1);
-		}
-	}
+	ctdb->db_directory = options.db_dir;
+	ctdb_mkdir_p_or_die(ctdb, ctdb->db_directory, 0700);
+
+	ctdb->db_directory_persistent = options.db_dir_persistent;
+	ctdb_mkdir_p_or_die(ctdb, ctdb->db_directory_persistent, 0700);
+
+	ctdb->db_directory_state = options.db_dir_state;
+	ctdb_mkdir_p_or_die(ctdb, ctdb->db_directory_state, 0700);
 
 	if (options.public_interface) {
 		ctdb->default_public_interface = talloc_strdup(ctdb, options.public_interface);
@@ -296,10 +284,15 @@ int main(int argc, const char *argv[])
 		}
 	}
 
-	ret = ctdb_set_event_script_dir(ctdb, options.event_script_dir);
-	if (ret == -1) {
-		DEBUG(DEBUG_ALERT,("Unable to setup event script directory\n"));
-		exit(1);
+	if (options.event_script_dir != NULL) {
+		ctdb->event_script_dir = options.event_script_dir;
+	} else {
+		ctdb->event_script_dir = talloc_asprintf(ctdb, "%s/events.d",
+							 getenv("CTDB_BASE"));
+		if (ctdb->event_script_dir == NULL) {
+			DEBUG(DEBUG_ALERT,(__location__ " Out of memory\n"));
+			exit(1);
+		}
 	}
 
 	if (options.notification_script != NULL) {
@@ -310,14 +303,6 @@ int main(int argc, const char *argv[])
 		}
 	}
 
-	if (options.debug_hung_script != NULL) {
-		ret = ctdb_set_debug_hung_script(ctdb, options.debug_hung_script);
-	}
-	if (ret == -1) {
-		DEBUG(DEBUG_ALERT,("Unable to setup script to debug hung eventscripts\n"));
-		exit(1);
-	}
-
 	ctdb->valgrinding = options.valgrinding;
 	if (options.valgrinding || options.nosetsched) {
 		ctdb->do_setsched = 0;
@@ -325,6 +310,7 @@ int main(int argc, const char *argv[])
 		ctdb->do_setsched = 1;
 	}
 
+	ctdb->public_addresses_file = options.public_address_list;
 	ctdb->do_checkpublicip = !options.no_publicipcheck;
 
 	if (options.max_persistent_check_errors < 0) {
@@ -333,12 +319,6 @@ int main(int argc, const char *argv[])
 		ctdb->max_persistent_check_errors = (uint64_t)options.max_persistent_check_errors;
 	}
 
-	if (getenv("CTDB_BASE") == NULL) {
-		/* setup a environment variable for the event scripts to use
-		   to find the installation directory */
-		setenv("CTDB_BASE", ETCDIR "/ctdb", 1);
-	}
-
 	/* start the protocol running (as a child) */
-	return ctdb_start_daemon(ctdb, interactive?false:true, options.use_syslog, options.public_address_list);
+	return ctdb_start_daemon(ctdb, interactive?false:true, options.use_syslog);
 }

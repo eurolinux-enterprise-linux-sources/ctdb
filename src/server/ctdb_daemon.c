@@ -19,11 +19,12 @@
 
 #include "includes.h"
 #include "db_wrap.h"
-#include "lib/tdb/include/tdb.h"
+#include "tdb.h"
 #include "lib/util/dlinklist.h"
 #include "system/network.h"
 #include "system/filesys.h"
 #include "system/wait.h"
+#include "../include/ctdb_version.h"
 #include "../include/ctdb_client.h"
 #include "../include/ctdb_private.h"
 #include "../common/rb_tree.h"
@@ -36,11 +37,20 @@ struct ctdb_client_pid_list {
 	struct ctdb_client *client;
 };
 
+const char *ctdbd_pidfile = NULL;
+
 static void daemon_incoming_packet(void *, struct ctdb_req_header *);
 
 static void print_exit_message(void)
 {
-	DEBUG(DEBUG_NOTICE,("CTDB daemon shutting down\n"));
+	if (debug_extra != NULL && debug_extra[0] != '\0') {
+		DEBUG(DEBUG_NOTICE,("CTDB %s shutting down\n", debug_extra));
+	} else {
+		DEBUG(DEBUG_NOTICE,("CTDB daemon shutting down\n"));
+
+		/* Wait a second to allow pending log messages to be flushed */
+		sleep(1);
+	}
 }
 
 
@@ -69,25 +79,8 @@ static void ctdb_start_time_tickd(struct ctdb_context *ctdb)
 			ctdb_time_tick, ctdb);
 }
 
-
-/* called when CTDB is ready to process requests */
-static void ctdb_start_transport(struct ctdb_context *ctdb)
+static void ctdb_start_periodic_events(struct ctdb_context *ctdb)
 {
-	/* start the transport running */
-	if (ctdb->methods->start(ctdb) != 0) {
-		DEBUG(DEBUG_ALERT,("transport failed to start!\n"));
-		ctdb_fatal(ctdb, "transport failed to start");
-	}
-
-	/* start the recovery daemon process */
-	if (ctdb_start_recoverd(ctdb) != 0) {
-		DEBUG(DEBUG_ALERT,("Failed to start recovery daemon\n"));
-		exit(11);
-	}
-
-	/* Make sure we log something when the daemon terminates */
-	atexit(print_exit_message);
-
 	/* start monitoring for connected/disconnected nodes */
 	ctdb_start_keepalive(ctdb);
 
@@ -221,13 +214,7 @@ int daemon_check_srvids(struct ctdb_context *ctdb, TDB_DATA indata,
 		return -1;
 	}
 	for (i=0; i<num_ids; i++) {
-		struct ctdb_message_list *ml;
-		for (ml=ctdb->message_list; ml; ml=ml->next) {
-			if (ml->srvid == ids[i]) {
-				break;
-			}
-		}
-		if (ml != NULL) {
+		if (ctdb_check_message_handler(ctdb, ids[i])) {
 			results[i/8] |= (1 << (i%8));
 		}
 	}
@@ -245,7 +232,7 @@ static int ctdb_client_destructor(struct ctdb_client *client)
 
 	ctdb_takeover_client_destructor_hook(client);
 	ctdb_reqid_remove(client->ctdb, client->client_id);
-	CTDB_DECREMENT_STAT(client->ctdb, num_clients);
+	client->ctdb->num_clients--;
 
 	if (client->num_persistent_updates != 0) {
 		DEBUG(DEBUG_ERR,(__location__ " Client disconnecting with %u persistent updates in flight. Starting recovery\n", client->num_persistent_updates));
@@ -256,9 +243,6 @@ static int ctdb_client_destructor(struct ctdb_client *client)
 		DEBUG(DEBUG_ERR, (__location__ " client exit while transaction "
 				  "commit active. Forcing recovery.\n"));
 		client->ctdb->recovery_mode = CTDB_RECOVERY_ACTIVE;
-
-		/* legacy trans2 transaction state: */
-		ctdb_db->transaction_active = false;
 
 		/*
 		 * trans3 transaction state:
@@ -688,7 +672,7 @@ static void daemon_request_call_from_client(struct ctdb_client *client,
 	}
 
 	if (header.flags & CTDB_REC_RO_REVOKE_COMPLETE) {
-		header.flags &= ~(CTDB_REC_RO_HAVE_DELEGATIONS|CTDB_REC_RO_HAVE_READONLY|CTDB_REC_RO_REVOKING_READONLY|CTDB_REC_RO_REVOKE_COMPLETE);
+		header.flags &= ~CTDB_REC_RO_FLAGS;
 		CTDB_INCREMENT_STAT(ctdb, total_ro_revokes);
 		CTDB_INCREMENT_DB_STAT(ctdb_db, db_ro_revokes);
 		if (ctdb_ltdb_store(ctdb_db, key, &header, data) != 0) {
@@ -974,7 +958,7 @@ static void ctdb_accept_client(struct event_context *ev, struct fd_event *fde,
 
 	talloc_set_destructor(client, ctdb_client_destructor);
 	talloc_set_destructor(client_pid, ctdb_clientpid_destructor);
-	CTDB_INCREMENT_STAT(ctdb, num_clients);
+	ctdb->num_clients++;
 }
 
 
@@ -992,23 +976,35 @@ static int ux_socket_bind(struct ctdb_context *ctdb)
 		return -1;
 	}
 
-	set_close_on_exec(ctdb->daemon.sd);
-	set_nonblocking(ctdb->daemon.sd);
-
 	memset(&addr, 0, sizeof(addr));
 	addr.sun_family = AF_UNIX;
-	strncpy(addr.sun_path, ctdb->daemon.name, sizeof(addr.sun_path));
+	strncpy(addr.sun_path, ctdb->daemon.name, sizeof(addr.sun_path)-1);
+
+	/* First check if an old ctdbd might be running */
+	if (connect(ctdb->daemon.sd,
+		    (struct sockaddr *)&addr, sizeof(addr)) == 0) {
+		DEBUG(DEBUG_CRIT,
+		      ("Something is already listening on ctdb socket '%s'\n",
+		       ctdb->daemon.name));
+		goto failed;
+	}
+
+	/* Remove any old socket */
+	unlink(ctdb->daemon.name);
+
+	set_close_on_exec(ctdb->daemon.sd);
+	set_nonblocking(ctdb->daemon.sd);
 
 	if (bind(ctdb->daemon.sd, (struct sockaddr *)&addr, sizeof(addr)) == -1) {
 		DEBUG(DEBUG_CRIT,("Unable to bind on ctdb socket '%s'\n", ctdb->daemon.name));
 		goto failed;
-	}	
+	}
 
 	if (chown(ctdb->daemon.name, geteuid(), getegid()) != 0 ||
 	    chmod(ctdb->daemon.name, 0700) != 0) {
 		DEBUG(DEBUG_CRIT,("Unable to secure ctdb socket '%s', ctdb->daemon.name\n", ctdb->daemon.name));
 		goto failed;
-	} 
+	}
 
 
 	if (listen(ctdb->daemon.sd, 100) != 0) {
@@ -1048,16 +1044,25 @@ static void ctdb_setup_event_callback(struct ctdb_context *ctdb, int status,
 				      void *private_data)
 {
 	if (status != 0) {
-		ctdb_fatal(ctdb, "Failed to run setup event\n");
-		return;
+		ctdb_die(ctdb, "Failed to run setup event");
 	}
 	ctdb_run_notification_script(ctdb, "setup");
+
+	ctdb_set_runstate(ctdb, CTDB_RUNSTATE_FIRST_RECOVERY);
 
 	/* tell all other nodes we've just started up */
 	ctdb_daemon_send_control(ctdb, CTDB_BROADCAST_ALL,
 				 0, CTDB_CONTROL_STARTUP, 0,
 				 CTDB_CTRL_FLAG_NOREPLY,
 				 tdb_null, NULL, NULL);
+
+	/* Start the recovery daemon */
+	if (ctdb_start_recoverd(ctdb) != 0) {
+		DEBUG(DEBUG_ALERT,("Failed to start recovery daemon\n"));
+		exit(11);
+	}
+
+	ctdb_start_periodic_events(ctdb);
 }
 
 static struct timeval tevent_before_wait_ts;
@@ -1105,22 +1110,51 @@ static void ctdb_tevent_trace(enum tevent_trace_point tp,
 	}
 }
 
+static void ctdb_remove_pidfile(void)
+{
+	if (ctdbd_pidfile != NULL && !ctdb_is_child_process()) {
+		if (unlink(ctdbd_pidfile) == 0) {
+			DEBUG(DEBUG_NOTICE, ("Removed PID file %s\n",
+					     ctdbd_pidfile));
+		} else {
+			DEBUG(DEBUG_WARNING, ("Failed to Remove PID file %s\n",
+					      ctdbd_pidfile));
+		}
+	}
+}
+
+static void ctdb_create_pidfile(pid_t pid)
+{
+	if (ctdbd_pidfile != NULL) {
+		FILE *fp;
+
+		fp = fopen(ctdbd_pidfile, "w");
+		if (fp == NULL) {
+			DEBUG(DEBUG_ALERT,
+			      ("Failed to open PID file %s\n", ctdbd_pidfile));
+			exit(11);
+		}
+
+		fprintf(fp, "%d\n", pid);
+		fclose(fp);
+		DEBUG(DEBUG_NOTICE, ("Created PID file %s\n", ctdbd_pidfile));
+		atexit(ctdb_remove_pidfile);
+	}
+}
+
 /*
   start the protocol going as a daemon
 */
-int ctdb_start_daemon(struct ctdb_context *ctdb, bool do_fork, bool use_syslog, const char *public_address_list)
+int ctdb_start_daemon(struct ctdb_context *ctdb, bool do_fork, bool use_syslog)
 {
 	int res, ret = -1;
 	struct fd_event *fde;
 	const char *domain_socket_name;
 
-	/* get rid of any old sockets */
-	unlink(ctdb->daemon.name);
-
 	/* create a unix domain stream socket to listen to */
 	res = ux_socket_bind(ctdb);
 	if (res!=0) {
-		DEBUG(DEBUG_ALERT,(__location__ " Failed to open CTDB unix domain socket\n"));
+		DEBUG(DEBUG_ALERT,("Cannot continue.  Exiting!\n"));
 		exit(10);
 	}
 
@@ -1142,8 +1176,15 @@ int ctdb_start_daemon(struct ctdb_context *ctdb, bool do_fork, bool use_syslog, 
 
 	ctdbd_pid = getpid();
 	ctdb->ctdbd_pid = ctdbd_pid;
+	DEBUG(DEBUG_ERR, ("Starting CTDBD (Version %s) as PID: %u\n",
+			  CTDB_VERSION_STRING, ctdbd_pid));
+	ctdb_create_pidfile(ctdb->ctdbd_pid);
 
-	DEBUG(DEBUG_ERR, ("Starting CTDBD as pid : %u\n", ctdbd_pid));
+	/* Make sure we log something when the daemon terminates.
+	 * This must be the first exit handler to run (so the last to
+	 * be registered.
+	 */
+	atexit(print_exit_message);
 
 	if (ctdb->do_setsched) {
 		/* try to set us up as realtime */
@@ -1173,12 +1214,25 @@ int ctdb_start_daemon(struct ctdb_context *ctdb, bool do_fork, bool use_syslog, 
 	}
 
 	ctdb_set_child_logging(ctdb);
+	if (use_syslog) {
+		if (start_syslog_daemon(ctdb)) {
+			DEBUG(DEBUG_CRIT, ("Failed to start syslog daemon\n"));
+			exit(10);
+		}
+	}
 
 	/* initialize statistics collection */
 	ctdb_statistics_init(ctdb);
 
 	/* force initial recovery for election */
 	ctdb->recovery_mode = CTDB_RECOVERY_ACTIVE;
+
+	ctdb_set_runstate(ctdb, CTDB_RUNSTATE_INIT);
+	ret = ctdb_event_script(ctdb, CTDB_EVENT_INIT);
+	if (ret != 0) {
+		ctdb_die(ctdb, "Failed to run init event\n");
+	}
+	ctdb_run_notification_script(ctdb, "init");
 
 	if (strcmp(ctdb->transport, "tcp") == 0) {
 		int ctdb_tcp_init(struct ctdb_context *);
@@ -1207,8 +1261,7 @@ int ctdb_start_daemon(struct ctdb_context *ctdb, bool do_fork, bool use_syslog, 
 
 	initialise_node_flags(ctdb);
 
-	if (public_address_list) {
-		ctdb->public_addresses_file = public_address_list;
+	if (ctdb->public_addresses_file) {
 		ret = ctdb_set_public_addresses(ctdb, true);
 		if (ret == -1) {
 			DEBUG(DEBUG_ALERT,("Unable to setup public address list\n"));
@@ -1225,12 +1278,6 @@ int ctdb_start_daemon(struct ctdb_context *ctdb, bool do_fork, bool use_syslog, 
 		ctdb_fatal(ctdb, "Failed to attach to databases\n");
 	}
 
-	ret = ctdb_event_script(ctdb, CTDB_EVENT_INIT);
-	if (ret != 0) {
-		ctdb_fatal(ctdb, "Failed to run init event\n");
-	}
-	ctdb_run_notification_script(ctdb, "init");
-
 	/* start frozen, then let the first election sort things out */
 	if (!ctdb_blocking_freeze(ctdb)) {
 		ctdb_fatal(ctdb, "Failed to get initial freeze\n");
@@ -1240,6 +1287,9 @@ int ctdb_start_daemon(struct ctdb_context *ctdb, bool do_fork, bool use_syslog, 
 	fde = event_add_fd(ctdb->ev, ctdb, ctdb->daemon.sd, 
 			   EVENT_FD_READ,
 			   ctdb_accept_client, ctdb);
+	if (fde == NULL) {
+		ctdb_fatal(ctdb, "Failed to add daemon socket to event loop");
+	}
 	tevent_fd_set_auto_close(fde);
 
 	/* release any IPs we hold from previous runs of the daemon */
@@ -1247,9 +1297,17 @@ int ctdb_start_daemon(struct ctdb_context *ctdb, bool do_fork, bool use_syslog, 
 		ctdb_release_all_ips(ctdb);
 	}
 
-	/* start the transport going */
-	ctdb_start_transport(ctdb);
+	/* Start the transport */
+	if (ctdb->methods->start(ctdb) != 0) {
+		DEBUG(DEBUG_ALERT,("transport failed to start!\n"));
+		ctdb_fatal(ctdb, "transport failed to start");
+	}
 
+	/* Recovery daemon and timed events are started from the
+	 * callback, only after the setup event completes
+	 * successfully.
+	 */
+	ctdb_set_runstate(ctdb, CTDB_RUNSTATE_SETUP);
 	ret = ctdb_event_script_callback(ctdb,
 					 ctdb,
 					 ctdb_setup_event_callback,
@@ -1261,13 +1319,6 @@ int ctdb_start_daemon(struct ctdb_context *ctdb, bool do_fork, bool use_syslog, 
 	if (ret != 0) {
 		DEBUG(DEBUG_CRIT,("Failed to set up 'setup' event\n"));
 		exit(1);
-	}
-
-	if (use_syslog) {
-		if (start_syslog_daemon(ctdb)) {
-			DEBUG(DEBUG_CRIT, ("Failed to start syslog daemon\n"));
-			exit(10);
-		}
 	}
 
 	ctdb_lockdown_memory(ctdb);
@@ -1685,4 +1736,26 @@ int32_t ctdb_control_process_exists(struct ctdb_context *ctdb, pid_t pid)
 	}
 
 	return kill(pid, 0);
+}
+
+void ctdb_shutdown_sequence(struct ctdb_context *ctdb, int exit_code)
+{
+	if (ctdb->runstate == CTDB_RUNSTATE_SHUTDOWN) {
+		DEBUG(DEBUG_NOTICE,("Already shutting down so will not proceed.\n"));
+		return;
+	}
+
+	DEBUG(DEBUG_NOTICE,("Shutdown sequence commencing.\n"));
+	ctdb_set_runstate(ctdb, CTDB_RUNSTATE_SHUTDOWN);
+	ctdb_stop_recoverd(ctdb);
+	ctdb_stop_keepalive(ctdb);
+	ctdb_stop_monitoring(ctdb);
+	ctdb_release_all_ips(ctdb);
+	ctdb_event_script(ctdb, CTDB_EVENT_SHUTDOWN);
+	if (ctdb->methods != NULL) {
+		ctdb->methods->shutdown(ctdb);
+	}
+
+	DEBUG(DEBUG_NOTICE,("Shutdown sequence complete, exiting.\n"));
+	exit(exit_code);
 }

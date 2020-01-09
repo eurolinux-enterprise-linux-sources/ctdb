@@ -18,7 +18,7 @@
 */
 
 #include "includes.h"
-#include "lib/tdb/include/tdb.h"
+#include "tdb.h"
 #include "system/network.h"
 #include "system/filesys.h"
 #include "system/wait.h"
@@ -57,6 +57,15 @@ void ctdb_fatal(struct ctdb_context *ctdb, const char *msg)
 {
 	DEBUG(DEBUG_ALERT,("ctdb fatal error: %s\n", msg));
 	abort();
+}
+
+/*
+  like ctdb_fatal() but a core/backtrace would not be useful
+*/
+void ctdb_die(struct ctdb_context *ctdb, const char *msg)
+{
+	DEBUG(DEBUG_ALERT,("ctdb exiting with error: %s\n", msg));
+	exit(1);
 }
 
 /* Invoke an external program to do some sort of tracing on the CTDB
@@ -313,17 +322,45 @@ struct ctdb_rec_data *ctdb_marshall_loop_next(struct ctdb_marshall_buffer *m, st
 #include <sched.h>
 #endif
 
+#if HAVE_PROCINFO_H
+#include <procinfo.h>
+#endif
+
 /*
   if possible, make this task real time
  */
 void ctdb_set_scheduler(struct ctdb_context *ctdb)
 {
-#if HAVE_SCHED_SETSCHEDULER	
+#ifdef _AIX_
+#if HAVE_THREAD_SETSCHED
+	struct thrdentry64 te;
+	tid64_t ti;
+
+	ti = 0ULL;
+	if (getthrds64(getpid(), &te, sizeof(te), &ti, 1) != 1) {
+		DEBUG(DEBUG_ERR, ("Unable to get thread information\n"));
+		return;
+	}
+
+	if (ctdb->saved_scheduler_param == NULL) {
+		ctdb->saved_scheduler_param = talloc_size(ctdb, sizeof(te));
+	}
+	*(struct thrdentry64 *)ctdb->saved_scheduler_param = te;
+
+	if (thread_setsched(te.ti_tid, 0, SCHED_RR) == -1) {
+		DEBUG(DEBUG_ERR, ("Unable to set scheduler to SCHED_RR (%s)\n",
+				  strerror(errno)));
+	} else {
+		DEBUG(DEBUG_NOTICE, ("Set scheduler to SCHED_RR\n"));
+	}
+#endif
+#else /* no AIX */
+#if HAVE_SCHED_SETSCHEDULER
 	struct sched_param p;
 	if (ctdb->saved_scheduler_param == NULL) {
 		ctdb->saved_scheduler_param = talloc_size(ctdb, sizeof(p));
 	}
-	
+
 	if (sched_getparam(0, (struct sched_param *)ctdb->saved_scheduler_param) == -1) {
 		DEBUG(DEBUG_ERR,("Unable to get old scheduler params\n"));
 		return;
@@ -339,6 +376,7 @@ void ctdb_set_scheduler(struct ctdb_context *ctdb)
 		DEBUG(DEBUG_NOTICE,("Set scheduler to SCHED_FIFO\n"));
 	}
 #endif
+#endif
 }
 
 /*
@@ -346,7 +384,25 @@ void ctdb_set_scheduler(struct ctdb_context *ctdb)
  */
 void ctdb_restore_scheduler(struct ctdb_context *ctdb)
 {
-#if HAVE_SCHED_SETSCHEDULER	
+#ifdef _AIX_
+#if HAVE_THREAD_SETSCHED
+	struct thrdentry64 te, *saved;
+	tid64_t ti;
+
+	ti = 0ULL;
+	if (getthrds64(getpid(), &te, sizeof(te), &ti, 1) != 1) {
+		ctdb_fatal(ctdb, "Unable to get thread information\n");
+	}
+	if (ctdb->saved_scheduler_param == NULL) {
+		ctdb_fatal(ctdb, "No saved scheduler parameters\n");
+	}
+	saved = (struct thrdentry64 *)ctdb->saved_scheduler_param;
+	if (thread_setsched(te.ti_tid, saved->ti_pri, saved->ti_policy) == -1) {
+		ctdb_fatal(ctdb, "Unable to restore old scheduler parameters\n");
+	}
+#endif
+#else /* no AIX */
+#if HAVE_SCHED_SETSCHEDULER
 	if (ctdb->saved_scheduler_param == NULL) {
 		ctdb_fatal(ctdb, "No saved scheduler parameters\n");
 	}
@@ -354,20 +410,39 @@ void ctdb_restore_scheduler(struct ctdb_context *ctdb)
 		ctdb_fatal(ctdb, "Unable to restore old scheduler parameters\n");
 	}
 #endif
+#endif
 }
 
 void set_nonblocking(int fd)
 {
-	unsigned v;
+	int v;
+
 	v = fcntl(fd, F_GETFL, 0);
-        fcntl(fd, F_SETFL, v | O_NONBLOCK);
+	if (v == -1) {
+		DEBUG(DEBUG_WARNING, ("Failed to get file status flags - %s\n",
+				      strerror(errno)));
+		return;
+	}
+        if (fcntl(fd, F_SETFL, v | O_NONBLOCK) == -1) {
+		DEBUG(DEBUG_WARNING, ("Failed to set non_blocking on fd - %s\n",
+				      strerror(errno)));
+	}
 }
 
 void set_close_on_exec(int fd)
 {
-	unsigned v;
+	int v;
+
 	v = fcntl(fd, F_GETFD, 0);
-        fcntl(fd, F_SETFD, v | FD_CLOEXEC);
+	if (v == -1) {
+		DEBUG(DEBUG_WARNING, ("Failed to get file descriptor flags - %s\n",
+				      strerror(errno)));
+		return;
+	}
+	if (fcntl(fd, F_SETFD, v | FD_CLOEXEC) != 0) {
+		DEBUG(DEBUG_WARNING, ("Failed to set close_on_exec on fd - %s\n",
+				      strerror(errno)));
+	}
 }
 
 
@@ -457,6 +532,8 @@ bool parse_ip(const char *addr, const char *ifaces, unsigned port, ctdb_sock_add
 {
 	char *p;
 	bool ret;
+
+	ZERO_STRUCTP(saddr); /* valgrind :-) */
 
 	/* now is this a ipv4 or ipv6 address ?*/
 	p = index(addr, ':');
@@ -646,7 +723,7 @@ int32_t get_debug_by_desc(const char *desc)
 	int i;
 
 	for (i=0; debug_levels[i].description != NULL; i++) {
-		if (!strcmp(debug_levels[i].description, desc)) {
+		if (!strcasecmp(debug_levels[i].description, desc)) {
 			return debug_levels[i].level;
 		}
 	}
@@ -702,3 +779,67 @@ const char *ctdb_eventscript_call_names[] = {
 	"updateip",
 	"ipreallocated"
 };
+
+/* Runstate handling */
+static struct {
+	enum ctdb_runstate runstate;
+	const char * label;
+} runstate_map[] = {
+	{ CTDB_RUNSTATE_UNKNOWN, "UNKNOWN" },
+	{ CTDB_RUNSTATE_INIT, "INIT" },
+	{ CTDB_RUNSTATE_SETUP, "SETUP" },
+	{ CTDB_RUNSTATE_FIRST_RECOVERY, "FIRST_RECOVERY" },
+	{ CTDB_RUNSTATE_STARTUP, "STARTUP" },
+	{ CTDB_RUNSTATE_RUNNING, "RUNNING" },
+	{ CTDB_RUNSTATE_SHUTDOWN, "SHUTDOWN" },
+	{ -1, NULL },
+};
+
+const char *runstate_to_string(enum ctdb_runstate runstate)
+{
+	int i;
+	for (i=0; runstate_map[i].label != NULL ; i++) {
+		if (runstate_map[i].runstate == runstate) {
+			return runstate_map[i].label;
+		}
+	}
+
+	return runstate_map[0].label;
+}
+
+enum ctdb_runstate runstate_from_string(const char *label)
+{
+	int i;
+	for (i=0; runstate_map[i].label != NULL; i++) {
+		if (strcasecmp(runstate_map[i].label, label) == 0) {
+			return runstate_map[i].runstate;
+		}
+	}
+
+	return CTDB_RUNSTATE_UNKNOWN;
+}
+
+void ctdb_set_runstate(struct ctdb_context *ctdb, enum ctdb_runstate runstate)
+{
+	if (runstate <= ctdb->runstate) {
+		ctdb_fatal(ctdb, "runstate must always increase");
+	}
+
+	DEBUG(DEBUG_NOTICE,("Set runstate to %s (%d)\n",
+			    runstate_to_string(runstate), runstate));
+	ctdb->runstate = runstate;
+}
+
+void ctdb_mkdir_p_or_die(struct ctdb_context *ctdb, const char *dir, int mode)
+{
+	int ret;
+
+	ret = mkdir_p(dir, mode);
+	if (ret != 0) {
+		DEBUG(DEBUG_ALERT,
+		      ("ctdb exiting with error: "
+		       "failed to create directory \"%s\" (%s)\n",
+		       dir, strerror(errno)));
+		exit(1);
+	}
+}

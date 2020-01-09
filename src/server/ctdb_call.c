@@ -21,7 +21,7 @@
   protocol design and packet details
 */
 #include "includes.h"
-#include "lib/tdb/include/tdb.h"
+#include "tdb.h"
 #include "lib/util/dlinklist.h"
 #include "system/network.h"
 #include "system/filesys.h"
@@ -113,20 +113,9 @@ static void ctdb_send_error(struct ctdb_context *ctdb,
  * to its local ctdb (ctdb_request_call). If the node is not itself
  * the record's DMASTER, it first redirects the packet to  the
  * record's LMASTER. The LMASTER then redirects the call packet to
- * the current DMASTER. But there is a race: The record may have
- * been migrated off the DMASTER while the redirected packet is
- * on the wire (or in the local queue). So in case the record has
- * migrated off the new destinaton of the call packet, instead of
- * going back to the LMASTER to get the new DMASTER, we try to
- * reduce round-trips by first chasing the record a couple of times
- * before giving up the direct chase and finally going back to the
- * LMASTER (again). Note that this works because of this: When
+ * the current DMASTER. Note that this works because of this: When
  * a record is migrated off a node, then the new DMASTER is stored
  * in the record's copy on the former DMASTER.
- *
- * The maximum number of attempts for direct chase to make before
- * going back to the LMASTER is configurable by the tunable
- * "MaxRedirectCount".
  */
 static void ctdb_call_send_redirect(struct ctdb_context *ctdb,
 				    struct ctdb_db_context *ctdb_db,
@@ -134,7 +123,6 @@ static void ctdb_call_send_redirect(struct ctdb_context *ctdb,
 				    struct ctdb_req_call *c, 
 				    struct ctdb_ltdb_header *header)
 {
-	
 	uint32_t lmaster = ctdb_lmaster(ctdb, &key);
 
 	c->hdr.destnode = lmaster;
@@ -143,12 +131,12 @@ static void ctdb_call_send_redirect(struct ctdb_context *ctdb,
 	}
 	c->hopcount++;
 
-	if (c->hopcount%100 == 99) {
-		DEBUG(DEBUG_WARNING,("High hopcount %d dbid:0x%08x "
-			"key:0x%08x pnn:%d src:%d lmaster:%d "
+	if (c->hopcount%100 > 95) {
+		DEBUG(DEBUG_WARNING,("High hopcount %d dbid:%s "
+			"key:0x%08x reqid=%08x pnn:%d src:%d lmaster:%d "
 			"header->dmaster:%d dst:%d\n",
-			c->hopcount, ctdb_db->db_id, ctdb_hash(&key),
-			ctdb->pnn, c->hdr.srcnode, lmaster,
+			c->hopcount, ctdb_db->db_name, ctdb_hash(&key),
+			c->hdr.reqid, ctdb->pnn, c->hdr.srcnode, lmaster,
 			header->dmaster, c->hdr.destnode));
 	}
 
@@ -343,7 +331,7 @@ static void ctdb_become_dmaster(struct ctdb_db_context *ctdb_db,
 	DEBUG(DEBUG_DEBUG,("pnn %u dmaster response %08x\n", ctdb->pnn, ctdb_hash(&key)));
 
 	ZERO_STRUCT(header);
-	header.rsn = rsn + 1;
+	header.rsn = rsn;
 	header.dmaster = ctdb->pnn;
 	header.flags = record_flags;
 
@@ -411,7 +399,7 @@ static void ctdb_become_dmaster(struct ctdb_db_context *ctdb_db,
 		return;
 	}
 
-	ctdb_call_local(ctdb_db, state->call, &header, state, &data, true, ctdb->pnn);
+	ctdb_call_local(ctdb_db, state->call, &header, state, &data, true);
 
 	ret = ctdb_ltdb_unlock(ctdb_db, state->call->key);
 	if (ret != 0) {
@@ -576,7 +564,9 @@ ctdb_make_record_sticky(struct ctdb_context *ctdb, struct ctdb_db_context *ctdb_
 	sr->ctdb_db = ctdb_db;
 	sr->pindown = NULL;
 
-	DEBUG(DEBUG_ERR,("Make record sticky in db %s\n", ctdb_db->db_name));
+	DEBUG(DEBUG_ERR,("Make record sticky for %d seconds in db %s key:0x%08x.\n",
+			 ctdb->tunable.sticky_duration,
+			 ctdb_db->db_name, ctdb_hash(&key)));
 
 	trbt_insertarray32_callback(ctdb_db->sticky_records, k[0], &k[0], ctdb_make_sticky_record_callback, sr);
 
@@ -670,7 +660,7 @@ ctdb_defer_pinned_down_request(struct ctdb_context *ctdb, struct ctdb_db_context
 static void
 ctdb_update_db_stat_hot_keys(struct ctdb_db_context *ctdb_db, TDB_DATA key, int hopcount)
 {
-	int i;
+	int i, id;
 
 	/* smallest value is always at index 0 */
 	if (hopcount <= ctdb_db->statistics.hot_keys[0].count) {
@@ -693,16 +683,27 @@ ctdb_update_db_stat_hot_keys(struct ctdb_db_context *ctdb_db, TDB_DATA key, int 
 		goto sort_keys;
 	}
 
-	if (ctdb_db->statistics.hot_keys[0].key.dptr != NULL) {
-		talloc_free(ctdb_db->statistics.hot_keys[0].key.dptr);
+	if (ctdb_db->statistics.num_hot_keys < MAX_HOT_KEYS) {
+		id = ctdb_db->statistics.num_hot_keys;
+		ctdb_db->statistics.num_hot_keys++;
+	} else {
+		id = 0;
 	}
-	ctdb_db->statistics.hot_keys[0].key.dsize = key.dsize;
-	ctdb_db->statistics.hot_keys[0].key.dptr  = talloc_memdup(ctdb_db, key.dptr, key.dsize);
-	ctdb_db->statistics.hot_keys[0].count = hopcount;
 
+	if (ctdb_db->statistics.hot_keys[id].key.dptr != NULL) {
+		talloc_free(ctdb_db->statistics.hot_keys[id].key.dptr);
+	}
+	ctdb_db->statistics.hot_keys[id].key.dsize = key.dsize;
+	ctdb_db->statistics.hot_keys[id].key.dptr  = talloc_memdup(ctdb_db, key.dptr, key.dsize);
+	ctdb_db->statistics.hot_keys[id].count = hopcount;
+	DEBUG(DEBUG_NOTICE,("Updated hot key database=%s key=0x%08x id=%d hop_count=%d\n",
+			    ctdb_db->db_name, ctdb_hash(&key), id, hopcount));
 
 sort_keys:
-	for (i = 2; i < MAX_HOT_KEYS; i++) {
+	for (i = 1; i < MAX_HOT_KEYS; i++) {
+		if (ctdb_db->statistics.hot_keys[i].count == 0) {
+			continue;
+		}
 		if (ctdb_db->statistics.hot_keys[i].count < ctdb_db->statistics.hot_keys[0].count) {
 			hopcount = ctdb_db->statistics.hot_keys[i].count;
 			ctdb_db->statistics.hot_keys[i].count = ctdb_db->statistics.hot_keys[0].count;
@@ -760,7 +761,9 @@ void ctdb_request_call(struct ctdb_context *ctdb, struct ctdb_req_header *hdr)
 	*/
 	if (ctdb_db->sticky) {
 		if (ctdb_defer_pinned_down_request(ctdb, ctdb_db, call->key, hdr) == 0) {
-		  DEBUG(DEBUG_WARNING,("Defer request for pinned down record in %s\n", ctdb_db->db_name));
+			DEBUG(DEBUG_WARNING,
+			      ("Defer request for pinned down record in %s\n", ctdb_db->db_name));
+			talloc_free(call);
 			return;
 		}
 	}
@@ -774,10 +777,12 @@ void ctdb_request_call(struct ctdb_context *ctdb, struct ctdb_req_header *hdr)
 					   ctdb_call_input_pkt, ctdb, false);
 	if (ret == -1) {
 		ctdb_send_error(ctdb, hdr, ret, "ltdb fetch failed in ctdb_request_call");
+		talloc_free(call);
 		return;
 	}
 	if (ret == -2) {
 		DEBUG(DEBUG_INFO,(__location__ " deferred ctdb_request_call\n"));
+		talloc_free(call);
 		return;
 	}
 
@@ -787,7 +792,7 @@ void ctdb_request_call(struct ctdb_context *ctdb, struct ctdb_req_header *hdr)
 	}
 
 	if (header.flags & CTDB_REC_RO_REVOKE_COMPLETE) {
-		header.flags &= ~(CTDB_REC_RO_HAVE_DELEGATIONS|CTDB_REC_RO_HAVE_READONLY|CTDB_REC_RO_REVOKING_READONLY|CTDB_REC_RO_REVOKE_COMPLETE);
+		header.flags &= ~CTDB_REC_RO_FLAGS;
 		CTDB_INCREMENT_STAT(ctdb, total_ro_revokes);
 		CTDB_INCREMENT_DB_STAT(ctdb_db, db_ro_revokes);
 		if (ctdb_ltdb_store(ctdb_db, call->key, &header, data) != 0) {
@@ -813,8 +818,11 @@ void ctdb_request_call(struct ctdb_context *ctdb, struct ctdb_req_header *hdr)
 		return;
 	}
 
-	/* if we are not the dmaster and are not hosting any delegations,
-	   then send a redirect to the requesting node */
+	/*
+	 * If we are not the dmaster and are not hosting any delegations,
+	 * then we redirect the request to the node than can answer it
+	 * (the lmaster or the dmaster).
+	 */
 	if ((header.dmaster != ctdb->pnn) 
 	    && (!(header.flags & CTDB_REC_RO_HAVE_DELEGATIONS)) ) {
 		talloc_free(data.dptr);
@@ -824,6 +832,7 @@ void ctdb_request_call(struct ctdb_context *ctdb, struct ctdb_req_header *hdr)
 		if (ret != 0) {
 			DEBUG(DEBUG_ERR,(__location__ " ctdb_ltdb_unlock() failed with error %d\n", ret));
 		}
+		talloc_free(call);
 		return;
 	}
 
@@ -900,6 +909,7 @@ void ctdb_request_call(struct ctdb_context *ctdb, struct ctdb_req_header *hdr)
 		CTDB_INCREMENT_DB_STAT(ctdb_db, db_ro_delegations);
 
 		talloc_free(r);
+		talloc_free(call);
 		return;
 	}
 
@@ -922,21 +932,16 @@ void ctdb_request_call(struct ctdb_context *ctdb, struct ctdb_req_header *hdr)
 	   should make it sticky.
 	*/
 	if (ctdb_db->sticky && c->hopcount >= ctdb->tunable.hopcount_make_sticky) {
-		DEBUG(DEBUG_ERR, ("Hot record in database %s. Hopcount is %d. Make record sticky for %d seconds\n", ctdb_db->db_name, c->hopcount, ctdb->tunable.sticky_duration));
 		ctdb_make_record_sticky(ctdb, ctdb_db, call->key);
 	}
 
 
-	/* if this nodes has done enough consecutive calls on the same record
-	   then give them the record
-	   or if the node requested an immediate migration
-	*/
-	if ( c->hdr.srcnode != ctdb->pnn &&
-	     ((header.laccessor == c->hdr.srcnode
-	       && header.lacount >= ctdb->tunable.max_lacount
-	       && ctdb->tunable.max_lacount != 0)
-	      || (c->flags & CTDB_IMMEDIATE_MIGRATION)) ) {
-		if (ctdb_db->transaction_active) {
+	/* Try if possible to migrate the record off to the caller node.
+	 * From the clients perspective a fetch of the data is just as 
+	 * expensive as a migration.
+	 */
+	if (c->hdr.srcnode != ctdb->pnn) {
+		if (ctdb_db->persistent_state) {
 			DEBUG(DEBUG_INFO, (__location__ " refusing migration"
 			      " of key %s while transaction is active\n",
 			      (char *)call->key.dptr));
@@ -950,11 +955,12 @@ void ctdb_request_call(struct ctdb_context *ctdb, struct ctdb_req_header *hdr)
 			if (ret != 0) {
 				DEBUG(DEBUG_ERR,(__location__ " ctdb_ltdb_unlock() failed with error %d\n", ret));
 			}
-			return;
 		}
+		talloc_free(call);
+		return;
 	}
 
-	ret = ctdb_call_local(ctdb_db, call, &header, hdr, &data, true, c->hdr.srcnode);
+	ret = ctdb_call_local(ctdb_db, call, &header, hdr, &data, true);
 	if (ret != 0) {
 		DEBUG(DEBUG_ERR,(__location__ " ctdb_call_local failed\n"));
 		call->status = -1;
@@ -980,14 +986,15 @@ void ctdb_request_call(struct ctdb_context *ctdb, struct ctdb_req_header *hdr)
 	ctdb_queue_packet(ctdb, &r->hdr);
 
 	talloc_free(r);
+	talloc_free(call);
 }
 
-/*
-  called when a CTDB_REPLY_CALL packet comes in
-
-  This packet comes in response to a CTDB_REQ_CALL request packet. It
-  contains any reply data from the call
-*/
+/**
+ * called when a CTDB_REPLY_CALL packet comes in
+ *
+ * This packet comes in response to a CTDB_REQ_CALL request packet. It
+ * contains any reply data from the call
+ */
 void ctdb_reply_call(struct ctdb_context *ctdb, struct ctdb_req_header *hdr)
 {
 	struct ctdb_reply_call *c = (struct ctdb_reply_call *)hdr;
@@ -1078,13 +1085,13 @@ finished_ro:
 }
 
 
-/*
-  called when a CTDB_REPLY_DMASTER packet comes in
-
-  This packet comes in from the lmaster response to a CTDB_REQ_CALL
-  request packet. It means that the current dmaster wants to give us
-  the dmaster role
-*/
+/**
+ * called when a CTDB_REPLY_DMASTER packet comes in
+ *
+ * This packet comes in from the lmaster in response to a CTDB_REQ_CALL
+ * request packet. It means that the current dmaster wants to give us
+ * the dmaster role.
+ */
 void ctdb_reply_dmaster(struct ctdb_context *ctdb, struct ctdb_req_header *hdr)
 {
 	struct ctdb_reply_dmaster *c = (struct ctdb_reply_dmaster *)hdr;
@@ -1241,7 +1248,7 @@ struct ctdb_call_state *ctdb_call_local_send(struct ctdb_db_context *ctdb_db,
 	*(state->call) = *call;
 	state->ctdb_db = ctdb_db;
 
-	ret = ctdb_call_local(ctdb_db, state->call, header, state, data, true, ctdb->pnn);
+	ret = ctdb_call_local(ctdb_db, state->call, header, state, data, true);
 	if (ret != 0) {
 		DEBUG(DEBUG_DEBUG,("ctdb_call_local() failed, ignoring return code %d\n", ret));
 	}
@@ -1654,6 +1661,7 @@ int ctdb_start_revoke_ro_record(struct ctdb_context *ctdb, struct ctdb_db_contex
 		close(rc->fd[0]);
 		debug_extra = talloc_asprintf(NULL, "revokechild-%s:", ctdb_db->db_name);
 
+		ctdb_set_process_name("ctdb_revokechild");
 		if (switch_from_server_to_client(ctdb, "revokechild-%s", ctdb_db->db_name) != 0) {
 			DEBUG(DEBUG_ERR,("Failed to switch from server to client for revokechild process\n"));
 			c = 1;

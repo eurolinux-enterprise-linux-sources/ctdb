@@ -30,18 +30,92 @@
 #include "dlinklist.h"
 
 
-/* most recent reload all ips request we need to perform during the 
-   next monitoring loop
-*/
-struct reloadips_all_reply *reload_all_ips_request = NULL;
-
-/* list of "ctdb ipreallocate" processes to call back when we have
-   finished the takeover run.
-*/
-struct ip_reallocate_list {
-	struct ip_reallocate_list *next;
-	struct rd_memdump_reply *rd;
+/* List of SRVID requests that need to be processed */
+struct srvid_list {
+	struct srvid_list *next, *prev;
+	struct srvid_request *request;
 };
+
+struct srvid_requests {
+	struct srvid_list *requests;
+};
+
+static void srvid_request_reply(struct ctdb_context *ctdb,
+				struct srvid_request *request,
+				TDB_DATA result)
+{
+	/* Someone that sent srvid==0 does not want a reply */
+	if (request->srvid == 0) {
+		talloc_free(request);
+		return;
+	}
+
+	if (ctdb_client_send_message(ctdb, request->pnn, request->srvid,
+				     result) == 0) {
+		DEBUG(DEBUG_INFO,("Sent SRVID reply to %u:%llu\n",
+				  (unsigned)request->pnn,
+				  (unsigned long long)request->srvid));
+	} else {
+		DEBUG(DEBUG_ERR,("Failed to send SRVID reply to %u:%llu\n",
+				 (unsigned)request->pnn,
+				 (unsigned long long)request->srvid));
+	}
+
+	talloc_free(request);
+}
+
+static void srvid_requests_reply(struct ctdb_context *ctdb,
+				 struct srvid_requests **requests,
+				 TDB_DATA result)
+{
+	struct srvid_list *r;
+
+	for (r = (*requests)->requests; r != NULL; r = r->next) {
+		srvid_request_reply(ctdb, r->request, result);
+	}
+
+	/* Free the list structure... */
+	TALLOC_FREE(*requests);
+}
+
+static void srvid_request_add(struct ctdb_context *ctdb,
+			      struct srvid_requests **requests,
+			      struct srvid_request *request)
+{
+	struct srvid_list *t;
+	int32_t ret;
+	TDB_DATA result;
+
+	if (*requests == NULL) {
+		*requests = talloc_zero(ctdb, struct srvid_requests);
+		if (*requests == NULL) {
+			goto nomem;
+		}
+	}
+
+	t = talloc_zero(*requests, struct srvid_list);
+	if (t == NULL) {
+		/* If *requests was just allocated above then free it */
+		if ((*requests)->requests == NULL) {
+			TALLOC_FREE(*requests);
+		}
+		goto nomem;
+	}
+
+	t->request = (struct srvid_request *)talloc_steal(t, request);
+	DLIST_ADD((*requests)->requests, t);
+
+	return;
+
+nomem:
+	/* Failed to add the request to the list.  Send a fail. */
+	DEBUG(DEBUG_ERR, (__location__
+			  " Out of memory, failed to queue SRVID request\n"));
+	ret = -ENOMEM;
+	result.dsize = sizeof(ret);
+	result.dptr = (uint8_t *)&ret;
+	srvid_request_reply(ctdb, request, result);
+}
 
 struct ctdb_banning_state {
 	uint32_t count;
@@ -55,6 +129,7 @@ struct ctdb_recoverd {
 	struct ctdb_context *ctdb;
 	uint32_t recmaster;
 	uint32_t num_active;
+	uint32_t num_lmasters;
 	uint32_t num_connected;
 	uint32_t last_culprit_node;
 	struct ctdb_node_map *nodemap;
@@ -65,11 +140,11 @@ struct ctdb_recoverd {
 	struct timed_event *send_election_te;
 	struct timed_event *election_timeout;
 	struct vacuum_info *vacuum_info;
-	TALLOC_CTX *ip_reallocate_ctx;
-	struct ip_reallocate_list *reallocate_callers;
-	TALLOC_CTX *ip_check_disable_ctx;
+	struct srvid_requests *reallocate_requests;
+	bool takeover_run_in_progress;
+	TALLOC_CTX *takeover_runs_disable_ctx;
 	struct ctdb_control_get_ifaces *ifaces;
-	TALLOC_CTX *deferred_rebalance_ctx;
+	uint32_t *force_rebalance_nodes;
 };
 
 #define CONTROL_TIMEOUT() timeval_current_ofs(ctdb->tunable.recover_timeout, 0)
@@ -86,12 +161,12 @@ static void ctdb_ban_node(struct ctdb_recoverd *rec, uint32_t pnn, uint32_t ban_
 	struct ctdb_context *ctdb = rec->ctdb;
 	struct ctdb_ban_time bantime;
        
-	DEBUG(DEBUG_NOTICE,("Banning node %u for %u seconds\n", pnn, ban_time));
-
 	if (!ctdb_validate_pnn(ctdb, pnn)) {
 		DEBUG(DEBUG_ERR,("Bad pnn %u in ctdb_ban_node\n", pnn));
 		return;
 	}
+
+	DEBUG(DEBUG_NOTICE,("Banning node %u for %u seconds\n", pnn, ban_time));
 
 	bantime.pnn  = pnn;
 	bantime.time = ban_time;
@@ -117,6 +192,12 @@ static void ctdb_set_culprit_count(struct ctdb_recoverd *rec, uint32_t culprit, 
 
 	if (culprit > ctdb->num_nodes) {
 		DEBUG(DEBUG_ERR,("Trying to set culprit %d but num_nodes is %d\n", culprit, ctdb->num_nodes));
+		return;
+	}
+
+	/* If we are banned or stopped, do not set other nodes as culprits */
+	if (rec->node_flags & NODE_FLAGS_INACTIVE) {
+		DEBUG(DEBUG_NOTICE, ("This node is INACTIVE, cannot set culprit node %d\n", culprit));
 		return;
 	}
 
@@ -254,7 +335,7 @@ static int update_capabilities(struct ctdb_context *ctdb, struct ctdb_node_map *
 	tmp_ctx = talloc_new(ctdb);
 	CTDB_NO_MEMORY(ctdb, tmp_ctx);
 
-	nodes = list_of_active_nodes(ctdb, nodemap, tmp_ctx, true);
+	nodes = list_of_connected_nodes(ctdb, nodemap, tmp_ctx, true);
 	if (ctdb_client_async_control(ctdb, CTDB_CONTROL_GET_CAPABILITIES,
 					nodes, 0,
 					CONTROL_TIMEOUT(),
@@ -454,15 +535,17 @@ static int create_missing_remote_databases(struct ctdb_context *ctdb, struct ctd
 				continue;
 			}
 			/* ok so we need to create this database */
-			ctdb_ctrl_getdbname(ctdb, CONTROL_TIMEOUT(), pnn, dbmap->dbs[db].dbid, 
-					    mem_ctx, &name);
+			ret = ctdb_ctrl_getdbname(ctdb, CONTROL_TIMEOUT(), pnn,
+						  dbmap->dbs[db].dbid, mem_ctx,
+						  &name);
 			if (ret != 0) {
 				DEBUG(DEBUG_ERR, (__location__ " Unable to get dbname from node %u\n", pnn));
 				return -1;
 			}
-			ctdb_ctrl_createdb(ctdb, CONTROL_TIMEOUT(), nodemap->nodes[j].pnn, 
-					   mem_ctx, name,
-					   dbmap->dbs[db].flags & CTDB_DB_FLAGS_PERSISTENT);
+			ret = ctdb_ctrl_createdb(ctdb, CONTROL_TIMEOUT(),
+						 nodemap->nodes[j].pnn,
+						 mem_ctx, name,
+						 dbmap->dbs[db].flags & CTDB_DB_FLAGS_PERSISTENT);
 			if (ret != 0) {
 				DEBUG(DEBUG_ERR, (__location__ " Unable to create remote db:%s\n", name));
 				return -1;
@@ -656,7 +739,8 @@ static void pull_seqnum_cb(struct ctdb_context *ctdb, uint32_t node_pnn, int32_t
 
 	seqnum = *((uint64_t *)outdata.dptr);
 
-	if (seqnum > cb_data->seqnum) {
+	if (seqnum > cb_data->seqnum ||
+	    (cb_data->pnn == -1 && seqnum == 0)) {
 		cb_data->seqnum = seqnum;
 		cb_data->pnn = node_pnn;
 	}
@@ -719,7 +803,7 @@ static int pull_highest_seqnum_pdb(struct ctdb_context *ctdb,
 		return -1;
 	}
 
-	if (cb_data->seqnum == 0 || cb_data->pnn == -1) {
+	if (cb_data->pnn == -1) {
 		DEBUG(DEBUG_NOTICE, ("Failed to find a node with highest sequence numbers for DB 0x%08x\n", dbid));
 		talloc_free(tmp_ctx);
 		return -1;
@@ -1108,7 +1192,7 @@ static int update_local_flags(struct ctdb_recoverd *rec, struct ctdb_node_map *n
 			   Since we are the recovery master we can just as
 			   well update the flags on all nodes.
 			*/
-			ret = ctdb_ctrl_modflags(ctdb, CONTROL_TIMEOUT(), nodemap->nodes[j].pnn, nodemap->nodes[j].flags, ~nodemap->nodes[j].flags);
+			ret = ctdb_ctrl_modflags(ctdb, CONTROL_TIMEOUT(), nodemap->nodes[j].pnn, remote_nodemap->nodes[j].flags, ~remote_nodemap->nodes[j].flags);
 			if (ret != 0) {
 				DEBUG(DEBUG_ERR, (__location__ " Unable to update nodeflags on remote nodes\n"));
 				return -1;
@@ -1170,7 +1254,7 @@ static struct tdb_wrap *create_recdb(struct ctdb_context *ctdb, TALLOC_CTX *mem_
 	if (ctdb->valgrinding) {
 		tdb_flags |= TDB_NOMMAP;
 	}
-	tdb_flags |= TDB_DISALLOW_NESTING;
+	tdb_flags |= (TDB_INCOMPATIBLE_HASH | TDB_DISALLOW_NESTING);
 
 	recdb = tdb_wrap_open(mem_ctx, name, ctdb->tunable.database_hash_size, 
 			      tdb_flags, O_RDWR|O_CREAT|O_EXCL, 0600);
@@ -1254,8 +1338,8 @@ static int traverse_recdb(struct tdb_context *tdb, TDB_DATA key, TDB_DATA data, 
 		params->recdata = talloc_realloc_size(NULL, params->recdata, params->allocated_len);
 	}
 	if (params->recdata == NULL) {
-		DEBUG(DEBUG_CRIT,(__location__ " Failed to expand recdata to %u (%u records)\n", 
-			 rec->length + params->len, params->recdata->count));
+		DEBUG(DEBUG_CRIT,(__location__ " Failed to expand recdata to %u\n",
+			 rec->length + params->len));
 		params->failed = true;
 		return -1;
 	}
@@ -1400,15 +1484,6 @@ static int recover_database(struct ctdb_recoverd *rec,
 	return 0;
 }
 
-/*
-  reload the nodes file 
-*/
-static void reload_nodes_file(struct ctdb_context *ctdb)
-{
-	ctdb->nodes = NULL;
-	ctdb_load_nodes_file(ctdb);
-}
-
 static int ctdb_reload_remote_public_ips(struct ctdb_context *ctdb,
 					 struct ctdb_recoverd *rec,
 					 struct ctdb_node_map *nodemap,
@@ -1427,57 +1502,62 @@ static int ctdb_reload_remote_public_ips(struct ctdb_context *ctdb,
 	}
 
 	for (j=0; j<nodemap->num; j++) {
+		/* For readability */
+		struct ctdb_node *node = ctdb->nodes[j];
+
 		/* release any existing data */
-		if (ctdb->nodes[j]->known_public_ips) {
-			talloc_free(ctdb->nodes[j]->known_public_ips);
-			ctdb->nodes[j]->known_public_ips = NULL;
+		if (node->known_public_ips) {
+			talloc_free(node->known_public_ips);
+			node->known_public_ips = NULL;
 		}
-		if (ctdb->nodes[j]->available_public_ips) {
-			talloc_free(ctdb->nodes[j]->available_public_ips);
-			ctdb->nodes[j]->available_public_ips = NULL;
+		if (node->available_public_ips) {
+			talloc_free(node->available_public_ips);
+			node->available_public_ips = NULL;
 		}
 
 		if (nodemap->nodes[j].flags & NODE_FLAGS_INACTIVE) {
 			continue;
 		}
 
-		/* grab a new shiny list of public ips from the node */
+		/* Retrieve the list of known public IPs from the node */
 		ret = ctdb_ctrl_get_public_ips_flags(ctdb,
 					CONTROL_TIMEOUT(),
-					ctdb->nodes[j]->pnn,
+					node->pnn,
 					ctdb->nodes,
 					0,
-					&ctdb->nodes[j]->known_public_ips);
+					&node->known_public_ips);
 		if (ret != 0) {
-			DEBUG(DEBUG_ERR,("Failed to read known public ips from node : %u\n",
-				ctdb->nodes[j]->pnn));
+			DEBUG(DEBUG_ERR,
+			      ("Failed to read known public IPs from node: %u\n",
+			       node->pnn));
 			if (culprit) {
-				*culprit = ctdb->nodes[j]->pnn;
+				*culprit = node->pnn;
 			}
 			return -1;
 		}
 
-		if (ctdb->do_checkpublicip) {
-			if (rec->ip_check_disable_ctx == NULL) {
-				if (verify_remote_ip_allocation(ctdb, ctdb->nodes[j]->known_public_ips)) {
-					DEBUG(DEBUG_ERR,("Node %d has inconsistent public ip allocation and needs update.\n", ctdb->nodes[j]->pnn));
-					rec->need_takeover_run = true;
-				}
-			}
+		if (ctdb->do_checkpublicip &&
+		    rec->takeover_runs_disable_ctx == NULL &&
+		    verify_remote_ip_allocation(ctdb,
+						 node->known_public_ips,
+						 node->pnn)) {
+			DEBUG(DEBUG_ERR,("Trigger IP reallocation\n"));
+			rec->need_takeover_run = true;
 		}
 
-		/* grab a new shiny list of public ips from the node */
+		/* Retrieve the list of available public IPs from the node */
 		ret = ctdb_ctrl_get_public_ips_flags(ctdb,
 					CONTROL_TIMEOUT(),
-					ctdb->nodes[j]->pnn,
+					node->pnn,
 					ctdb->nodes,
 					CTDB_PUBLIC_IP_FLAGS_ONLY_AVAILABLE,
-					&ctdb->nodes[j]->available_public_ips);
+					&node->available_public_ips);
 		if (ret != 0) {
-			DEBUG(DEBUG_ERR,("Failed to read available public ips from node : %u\n",
-				ctdb->nodes[j]->pnn));
+			DEBUG(DEBUG_ERR,
+			      ("Failed to read available public IPs from node: %u\n",
+			       node->pnn));
 			if (culprit) {
-				*culprit = ctdb->nodes[j]->pnn;
+				*culprit = node->pnn;
 			}
 			return -1;
 		}
@@ -1527,12 +1607,141 @@ static int sync_recovery_lock_file_across_cluster(struct ctdb_recoverd *rec)
  */
 static void takeover_fail_callback(struct ctdb_context *ctdb, uint32_t node_pnn, int32_t res, TDB_DATA outdata, void *callback_data)
 {
-	struct ctdb_recoverd *rec = talloc_get_type(callback_data, struct ctdb_recoverd);
+	DEBUG(DEBUG_ERR, ("Node %u failed the takeover run\n", node_pnn));
 
-	DEBUG(DEBUG_ERR, (__location__ " Node %u failed the takeover run. Setting it as recovery fail culprit\n", node_pnn));
+	if (callback_data != NULL) {
+		struct ctdb_recoverd *rec = talloc_get_type(callback_data, struct ctdb_recoverd);
 
-	ctdb_set_culprit(rec, node_pnn);
-	rec->need_takeover_run = true;
+		DEBUG(DEBUG_ERR, ("Setting node %u as recovery fail culprit\n", node_pnn));
+
+		ctdb_set_culprit(rec, node_pnn);
+	}
+}
+
+
+static void ban_misbehaving_nodes(struct ctdb_recoverd *rec, bool *self_ban)
+{
+	struct ctdb_context *ctdb = rec->ctdb;
+	int i;
+	struct ctdb_banning_state *ban_state;
+
+	*self_ban = false;
+	for (i=0; i<ctdb->num_nodes; i++) {
+		if (ctdb->nodes[i]->ban_state == NULL) {
+			continue;
+		}
+		ban_state = (struct ctdb_banning_state *)ctdb->nodes[i]->ban_state;
+		if (ban_state->count < 2*ctdb->num_nodes) {
+			continue;
+		}
+
+		DEBUG(DEBUG_NOTICE,("Node %u reached %u banning credits - banning it for %u seconds\n",
+			ctdb->nodes[i]->pnn, ban_state->count,
+			ctdb->tunable.recovery_ban_period));
+		ctdb_ban_node(rec, ctdb->nodes[i]->pnn, ctdb->tunable.recovery_ban_period);
+		ban_state->count = 0;
+
+		/* Banning ourself? */
+		if (ctdb->nodes[i]->pnn == rec->ctdb->pnn) {
+			*self_ban = true;
+		}
+	}
+}
+
+static bool do_takeover_run(struct ctdb_recoverd *rec,
+			    struct ctdb_node_map *nodemap,
+			    bool banning_credits_on_fail)
+{
+	uint32_t *nodes = NULL;
+	struct srvid_request_data dtr;
+	TDB_DATA data;
+	int i;
+	uint32_t *rebalance_nodes = rec->force_rebalance_nodes;
+	int ret;
+	bool ok;
+
+	DEBUG(DEBUG_NOTICE, ("Takeover run starting\n"));
+
+	if (rec->takeover_run_in_progress) {
+		DEBUG(DEBUG_ERR, (__location__
+				  " takeover run already in progress \n"));
+		ok = false;
+		goto done;
+	}
+
+	rec->takeover_run_in_progress = true;
+
+	/* If takeover runs are in disabled then fail... */
+	if (rec->takeover_runs_disable_ctx != NULL) {
+		DEBUG(DEBUG_ERR,
+		      ("Takeover runs are disabled so refusing to run one\n"));
+		ok = false;
+		goto done;
+	}
+
+	/* Disable IP checks (takeover runs, really) on other nodes
+	 * while doing this takeover run.  This will stop those other
+	 * nodes from triggering takeover runs when think they should
+	 * be hosting an IP but it isn't yet on an interface.  Don't
+	 * wait for replies since a failure here might cause some
+	 * noise in the logs but will not actually cause a problem.
+	 */
+	dtr.srvid = 0; /* No reply */
+	dtr.pnn = -1;
+
+	data.dptr  = (uint8_t*)&dtr;
+	data.dsize = sizeof(dtr);
+
+	nodes = list_of_connected_nodes(rec->ctdb, nodemap, rec, false);
+
+	/* Disable for 60 seconds.  This can be a tunable later if
+	 * necessary.
+	 */
+	dtr.data = 60;
+	for (i = 0; i < talloc_array_length(nodes); i++) {
+		if (ctdb_client_send_message(rec->ctdb, nodes[i],
+					     CTDB_SRVID_DISABLE_TAKEOVER_RUNS,
+					     data) != 0) {
+			DEBUG(DEBUG_INFO,("Failed to disable takeover runs\n"));
+		}
+	}
+
+	ret = ctdb_takeover_run(rec->ctdb, nodemap,
+				rec->force_rebalance_nodes,
+				takeover_fail_callback,
+				banning_credits_on_fail ? rec : NULL);
+
+	/* Reenable takeover runs and IP checks on other nodes */
+	dtr.data = 0;
+	for (i = 0; i < talloc_array_length(nodes); i++) {
+		if (ctdb_client_send_message(rec->ctdb, nodes[i],
+					     CTDB_SRVID_DISABLE_TAKEOVER_RUNS,
+					     data) != 0) {
+			DEBUG(DEBUG_INFO,("Failed to reenable takeover runs\n"));
+		}
+	}
+
+	if (ret != 0) {
+		DEBUG(DEBUG_ERR, ("ctdb_takeover_run() failed\n"));
+		ok = false;
+		goto done;
+	}
+
+	ok = true;
+	/* Takeover run was successful so clear force rebalance targets */
+	if (rebalance_nodes == rec->force_rebalance_nodes) {
+		TALLOC_FREE(rec->force_rebalance_nodes);
+	} else {
+		DEBUG(DEBUG_WARNING,
+		      ("Rebalance target nodes changed during takeover run - not clearing\n"));
+	}
+done:
+	rec->need_takeover_run = !ok;
+	talloc_free(nodes);
+	rec->takeover_run_in_progress = false;
+
+	DEBUG(DEBUG_NOTICE, ("Takeover run %s\n", ok ? "completed successfully" : "unsuccessful"));
+	return ok;
 }
 
 
@@ -1551,29 +1760,18 @@ static int do_recovery(struct ctdb_recoverd *rec,
 	uint32_t *nodes;
 	struct timeval start_time;
 	uint32_t culprit = (uint32_t)-1;
+	bool self_ban;
 
 	DEBUG(DEBUG_NOTICE, (__location__ " Starting do_recovery\n"));
 
 	/* if recovery fails, force it again */
 	rec->need_recovery = true;
 
-	for (i=0; i<ctdb->num_nodes; i++) {
-		struct ctdb_banning_state *ban_state;
-
-		if (ctdb->nodes[i]->ban_state == NULL) {
-			continue;
-		}
-		ban_state = (struct ctdb_banning_state *)ctdb->nodes[i]->ban_state;
-		if (ban_state->count < 2*ctdb->num_nodes) {
-			continue;
-		}
-		DEBUG(DEBUG_NOTICE,("Node %u has caused %u recoveries recently - banning it for %u seconds\n",
-			ctdb->nodes[i]->pnn, ban_state->count,
-			ctdb->tunable.recovery_ban_period));
-		ctdb_ban_node(rec, ctdb->nodes[i]->pnn, ctdb->tunable.recovery_ban_period);
-		ban_state->count = 0;
+	ban_misbehaving_nodes(rec, &self_ban);
+	if (self_ban) {
+		DEBUG(DEBUG_NOTICE, ("This node was banned, aborting recovery\n"));
+		return -1;
 	}
-
 
         if (ctdb->tunable.verify_recovery_lock != 0) {
 		DEBUG(DEBUG_ERR,("Taking out recovery lock from recovery daemon\n"));
@@ -1653,8 +1851,12 @@ static int do_recovery(struct ctdb_recoverd *rec,
 
 		ret = update_flags_on_all_nodes(ctdb, nodemap, i, nodemap->nodes[i].flags);
 		if (ret != 0) {
-			DEBUG(DEBUG_ERR, (__location__ " Unable to update flags on all nodes for node %d\n", i));
-			return -1;
+			if (nodemap->nodes[i].flags & NODE_FLAGS_INACTIVE) {
+				DEBUG(DEBUG_WARNING, (__location__ "Unable to update flags on inactive node %d\n", i));
+			} else {
+				DEBUG(DEBUG_ERR, (__location__ " Unable to update flags on all nodes for node %d\n", i));
+				return -1;
+			}
 		}
 	}
 
@@ -1788,23 +1990,6 @@ static int do_recovery(struct ctdb_recoverd *rec,
 
 	DEBUG(DEBUG_NOTICE, (__location__ " Recovery - updated recmaster\n"));
 
-	/*
-	  update all nodes to have the same flags that we have
-	 */
-	for (i=0;i<nodemap->num;i++) {
-		if (nodemap->nodes[i].flags & NODE_FLAGS_DISCONNECTED) {
-			continue;
-		}
-
-		ret = update_flags_on_all_nodes(ctdb, nodemap, i, nodemap->nodes[i].flags);
-		if (ret != 0) {
-			DEBUG(DEBUG_ERR, (__location__ " Unable to update flags on all nodes for node %d\n", i));
-			return -1;
-		}
-	}
-
-	DEBUG(DEBUG_NOTICE, (__location__ " Recovery - updated flags\n"));
-
 	/* disable recovery mode */
 	ret = set_recovery_mode(ctdb, rec, nodemap, CTDB_RECOVERY_NORMAL);
 	if (ret != 0) {
@@ -1814,9 +1999,7 @@ static int do_recovery(struct ctdb_recoverd *rec,
 
 	DEBUG(DEBUG_NOTICE, (__location__ " Recovery - disabled recovery mode\n"));
 
-	/*
-	  tell nodes to takeover their public IPs
-	 */
+	/* Fetch known/available public IPs from each active node */
 	ret = ctdb_reload_remote_public_ips(ctdb, rec, nodemap, &culprit);
 	if (ret != 0) {
 		DEBUG(DEBUG_ERR,("Failed to read public ips from remote node %d\n",
@@ -1824,12 +2007,8 @@ static int do_recovery(struct ctdb_recoverd *rec,
 		rec->need_takeover_run = true;
 		return -1;
 	}
-	rec->need_takeover_run = false;
-	ret = ctdb_takeover_run(ctdb, nodemap, NULL, NULL);
-	if (ret != 0) {
-		DEBUG(DEBUG_ERR, (__location__ " Unable to setup public takeover addresses. ctdb_takeover_run() failed.\n"));
-		rec->need_takeover_run = true;
-	}
+
+	do_takeover_run(rec, nodemap, false);
 
 	/* execute the "recovered" event script on all nodes */
 	ret = run_recovered_eventscript(rec, nodemap, "do_recovery");
@@ -1842,7 +2021,12 @@ static int do_recovery(struct ctdb_recoverd *rec,
 
 	/* send a message to all clients telling them that the cluster 
 	   has been reconfigured */
-	ctdb_client_send_message(ctdb, CTDB_BROADCAST_CONNECTED, CTDB_SRVID_RECONFIGURE, tdb_null);
+	ret = ctdb_client_send_message(ctdb, CTDB_BROADCAST_CONNECTED,
+				       CTDB_SRVID_RECONFIGURE, tdb_null);
+	if (ret != 0) {
+		DEBUG(DEBUG_ERR, (__location__ " Failed to send reconfigure message\n"));
+		return -1;
+	}
 
 	DEBUG(DEBUG_NOTICE, (__location__ " Recovery complete\n"));
 
@@ -1908,7 +2092,7 @@ static void ctdb_election_data(struct ctdb_recoverd *rec, struct election_messag
 
 	ret = ctdb_ctrl_getnodemap(ctdb, CONTROL_TIMEOUT(), CTDB_CURRENT_NODE, rec, &nodemap);
 	if (ret != 0) {
-		DEBUG(DEBUG_ERR,(__location__ " unable to get election data\n"));
+		DEBUG(DEBUG_ERR,(__location__ " unable to get node map\n"));
 		return;
 	}
 
@@ -1948,12 +2132,12 @@ static bool ctdb_election_win(struct ctdb_recoverd *rec, struct election_message
 	/* we cant win if we are banned */
 	if (rec->node_flags & NODE_FLAGS_BANNED) {
 		return false;
-	}	
+	}
 
 	/* we cant win if we are stopped */
 	if (rec->node_flags & NODE_FLAGS_STOPPED) {
 		return false;
-	}	
+	}
 
 	/* we will automatically win if the other node is banned */
 	if (em->node_flags & NODE_FLAGS_BANNED) {
@@ -1985,7 +2169,7 @@ static bool ctdb_election_win(struct ctdb_recoverd *rec, struct election_message
 /*
   send out an election request
  */
-static int send_election_request(struct ctdb_recoverd *rec, uint32_t pnn, bool update_recmaster)
+static int send_election_request(struct ctdb_recoverd *rec, uint32_t pnn)
 {
 	int ret;
 	TDB_DATA election_data;
@@ -2001,28 +2185,19 @@ static int send_election_request(struct ctdb_recoverd *rec, uint32_t pnn, bool u
 	election_data.dptr  = (unsigned char *)&emsg;
 
 
-	/* send an election message to all active nodes */
-	DEBUG(DEBUG_INFO,(__location__ " Send election request to all active nodes\n"));
-	ctdb_client_send_message(ctdb, CTDB_BROADCAST_ALL, srvid, election_data);
-
-
-	/* A new node that is already frozen has entered the cluster.
-	   The existing nodes are not frozen and dont need to be frozen
-	   until the election has ended and we start the actual recovery
-	*/
-	if (update_recmaster == true) {
-		/* first we assume we will win the election and set 
-		   recoverymaster to be ourself on the current node
-		 */
-		ret = ctdb_ctrl_setrecmaster(ctdb, CONTROL_TIMEOUT(), pnn, pnn);
-		if (ret != 0) {
-			DEBUG(DEBUG_ERR, (__location__ " failed to send recmaster election request\n"));
-			return -1;
-		}
+	/* first we assume we will win the election and set 
+	   recoverymaster to be ourself on the current node
+	 */
+	ret = ctdb_ctrl_setrecmaster(ctdb, CONTROL_TIMEOUT(), pnn, pnn);
+	if (ret != 0) {
+		DEBUG(DEBUG_ERR, (__location__ " failed to send recmaster election request\n"));
+		return -1;
 	}
 
 
-	return 0;
+	/* send an election message to all active nodes */
+	DEBUG(DEBUG_INFO,(__location__ " Send election request to all active nodes\n"));
+	return ctdb_client_send_message(ctdb, CTDB_BROADCAST_ALL, srvid, election_data);
 }
 
 /*
@@ -2043,7 +2218,12 @@ static void unban_all_nodes(struct ctdb_context *ctdb)
 	for (i=0;i<nodemap->num;i++) {
 		if ( (!(nodemap->nodes[i].flags & NODE_FLAGS_DISCONNECTED))
 		  && (nodemap->nodes[i].flags & NODE_FLAGS_BANNED) ) {
-			ctdb_ctrl_modflags(ctdb, CONTROL_TIMEOUT(), nodemap->nodes[i].pnn, 0, NODE_FLAGS_BANNED);
+			ret = ctdb_ctrl_modflags(ctdb, CONTROL_TIMEOUT(),
+						 nodemap->nodes[i].pnn, 0,
+						 NODE_FLAGS_BANNED);
+			if (ret != 0) {
+				DEBUG(DEBUG_ERR, (__location__ " failed to reset ban state\n"));
+			}
 		}
 	}
 
@@ -2059,7 +2239,7 @@ static void election_send_request(struct event_context *ev, struct timed_event *
 	struct ctdb_recoverd *rec = talloc_get_type(p, struct ctdb_recoverd);
 	int ret;
 
-	ret = send_election_request(rec, ctdb_get_pnn(rec->ctdb), false);
+	ret = send_election_request(rec, ctdb_get_pnn(rec->ctdb));
 	if (ret != 0) {
 		DEBUG(DEBUG_ERR,("Failed to send election request!\n"));
 	}
@@ -2077,14 +2257,14 @@ static void mem_dump_handler(struct ctdb_context *ctdb, uint64_t srvid,
 	TALLOC_CTX *tmp_ctx = talloc_new(ctdb);
 	TDB_DATA *dump;
 	int ret;
-	struct rd_memdump_reply *rd;
+	struct srvid_request *rd;
 
-	if (data.dsize != sizeof(struct rd_memdump_reply)) {
+	if (data.dsize != sizeof(struct srvid_request)) {
 		DEBUG(DEBUG_ERR, (__location__ " Wrong size of return address.\n"));
 		talloc_free(tmp_ctx);
 		return;
 	}
-	rd = (struct rd_memdump_reply *)data.dptr;
+	rd = (struct srvid_request *)data.dptr;
 
 	dump = talloc_zero(tmp_ctx, TDB_DATA);
 	if (dump == NULL) {
@@ -2126,13 +2306,14 @@ static void getlog_handler(struct ctdb_context *ctdb, uint64_t srvid,
 	}
 	log_addr = (struct ctdb_get_log_addr *)data.dptr;
 
-	child = ctdb_fork(ctdb);
+	child = ctdb_fork_no_free_ringbuffer(ctdb);
 	if (child == (pid_t)-1) {
 		DEBUG(DEBUG_ERR,("Failed to fork a log collector child\n"));
 		return;
 	}
 
 	if (child == 0) {
+		ctdb_set_process_name("ctdb_rec_log_collector");
 		if (switch_from_server_to_client(ctdb, "recoverd-log-collector") != 0) {
 			DEBUG(DEBUG_CRIT, (__location__ "ERROR: failed to switch log collector child into client mode.\n"));
 			_exit(1);
@@ -2161,67 +2342,88 @@ static void reload_nodes_handler(struct ctdb_context *ctdb, uint64_t srvid,
 
 	DEBUG(DEBUG_ERR, (__location__ " Reload nodes file from recovery daemon\n"));
 
-	reload_nodes_file(rec->ctdb);
+	ctdb_load_nodes_file(rec->ctdb);
 }
 
 
-static void reenable_ip_check(struct event_context *ev, struct timed_event *te, 
-			      struct timeval yt, void *p)
+static void ctdb_rebalance_timeout(struct event_context *ev,
+				   struct timed_event *te,
+				   struct timeval t, void *p)
 {
 	struct ctdb_recoverd *rec = talloc_get_type(p, struct ctdb_recoverd);
 
-	talloc_free(rec->ip_check_disable_ctx);
-	rec->ip_check_disable_ctx = NULL;
-}
-
-
-static void ctdb_rebalance_timeout(struct event_context *ev, struct timed_event *te, 
-				  struct timeval t, void *p)
-{
-	struct ctdb_recoverd *rec = talloc_get_type(p, struct ctdb_recoverd);
-	struct ctdb_context *ctdb = rec->ctdb;
-	int ret;
-
-	DEBUG(DEBUG_NOTICE,("Rebalance all nodes that have had ip assignment changes.\n"));
-
-	ret = ctdb_takeover_run(ctdb, rec->nodemap, NULL, NULL);
-	if (ret != 0) {
-		DEBUG(DEBUG_ERR, (__location__ " Unable to setup public takeover addresses. ctdb_takeover_run() failed.\n"));
-		rec->need_takeover_run = true;
+	if (rec->force_rebalance_nodes == NULL) {
+		DEBUG(DEBUG_ERR,
+		      ("Rebalance timeout occurred - no nodes to rebalance\n"));
+		return;
 	}
 
-	talloc_free(rec->deferred_rebalance_ctx);
-	rec->deferred_rebalance_ctx = NULL;
+	DEBUG(DEBUG_NOTICE,
+	      ("Rebalance timeout occurred - do takeover run\n"));
+	do_takeover_run(rec, rec->nodemap, false);
 }
 
 	
-static void recd_node_rebalance_handler(struct ctdb_context *ctdb, uint64_t srvid, 
-			     TDB_DATA data, void *private_data)
+static void recd_node_rebalance_handler(struct ctdb_context *ctdb,
+					uint64_t srvid,
+					TDB_DATA data, void *private_data)
 {
 	uint32_t pnn;
+	uint32_t *t;
+	int len;
+	uint32_t deferred_rebalance;
 	struct ctdb_recoverd *rec = talloc_get_type(private_data, struct ctdb_recoverd);
+
+	if (rec->recmaster != ctdb_get_pnn(ctdb)) {
+		return;
+	}
 
 	if (data.dsize != sizeof(uint32_t)) {
 		DEBUG(DEBUG_ERR,(__location__ " Incorrect size of node rebalance message. Was %zd but expected %zd bytes\n", data.dsize, sizeof(uint32_t)));
 		return;
 	}
 
-	if (ctdb->tunable.deferred_rebalance_on_node_add == 0) {
-		return;
-	}
-
 	pnn = *(uint32_t *)&data.dptr[0];
 
-	lcp2_forcerebalance(ctdb, pnn);
-	DEBUG(DEBUG_NOTICE,("Received message to perform node rebalancing for node %d\n", pnn));
+	DEBUG(DEBUG_NOTICE,("Setting up rebalance of IPs to node %u\n", pnn));
 
-	if (rec->deferred_rebalance_ctx != NULL) {
-		talloc_free(rec->deferred_rebalance_ctx);
+	/* Copy any existing list of nodes.  There's probably some
+	 * sort of realloc variant that will do this but we need to
+	 * make sure that freeing the old array also cancels the timer
+	 * event for the timeout... not sure if realloc will do that.
+	 */
+	len = (rec->force_rebalance_nodes != NULL) ?
+		talloc_array_length(rec->force_rebalance_nodes) :
+		0;
+
+	/* This allows duplicates to be added but they don't cause
+	 * harm.  A call to add a duplicate PNN arguably means that
+	 * the timeout should be reset, so this is the simplest
+	 * solution.
+	 */
+	t = talloc_zero_array(rec, uint32_t, len+1);
+	CTDB_NO_MEMORY_VOID(ctdb, t);
+	if (len > 0) {
+		memcpy(t, rec->force_rebalance_nodes, sizeof(uint32_t) * len);
 	}
-	rec->deferred_rebalance_ctx = talloc_new(rec);
-	event_add_timed(ctdb->ev, rec->deferred_rebalance_ctx, 
-			timeval_current_ofs(ctdb->tunable.deferred_rebalance_on_node_add, 0),
-			ctdb_rebalance_timeout, rec);
+	t[len] = pnn;
+
+	talloc_free(rec->force_rebalance_nodes);
+
+	rec->force_rebalance_nodes = t;
+
+	/* If configured, setup a deferred takeover run to make sure
+	 * that certain nodes get IPs rebalanced to them.  This will
+	 * be cancelled if a successful takeover run happens before
+	 * the timeout.  Assign tunable value to variable for
+	 * readability.
+	 */
+	deferred_rebalance = ctdb->tunable.deferred_rebalance_on_node_add;
+	if (deferred_rebalance != 0) {
+		event_add_timed(ctdb->ev, rec->force_rebalance_nodes,
+				timeval_current_ofs(deferred_rebalance, 0),
+				ctdb_rebalance_timeout, rec);
+	}
 }
 
 
@@ -2248,157 +2450,173 @@ static void recd_update_ip_handler(struct ctdb_context *ctdb, uint64_t srvid,
 }
 
 
-static void disable_ip_check_handler(struct ctdb_context *ctdb, uint64_t srvid, 
-			     TDB_DATA data, void *private_data)
+static void clear_takeover_runs_disable(struct ctdb_recoverd *rec)
 {
-	struct ctdb_recoverd *rec = talloc_get_type(private_data, struct ctdb_recoverd);
-	uint32_t timeout;
+	TALLOC_FREE(rec->takeover_runs_disable_ctx);
+}
 
-	if (rec->ip_check_disable_ctx != NULL) {
-		talloc_free(rec->ip_check_disable_ctx);
-		rec->ip_check_disable_ctx = NULL;
+static void reenable_takeover_runs(struct event_context *ev,
+				   struct timed_event *te,
+				   struct timeval yt, void *p)
+{
+	struct ctdb_recoverd *rec = talloc_get_type(p, struct ctdb_recoverd);
+
+	DEBUG(DEBUG_NOTICE,("Reenabling takeover runs after timeout\n"));
+	clear_takeover_runs_disable(rec);
+}
+
+static void disable_takeover_runs_handler(struct ctdb_context *ctdb,
+					  uint64_t srvid, TDB_DATA data,
+					  void *private_data)
+{
+	struct ctdb_recoverd *rec = talloc_get_type(private_data,
+						    struct ctdb_recoverd);
+	struct srvid_request_data *r;
+	uint32_t timeout;
+	TDB_DATA result;
+	int32_t ret = 0;
+
+	/* Validate input data */
+	if (data.dsize != sizeof(struct srvid_request_data)) {
+		DEBUG(DEBUG_ERR,(__location__ " Wrong size for data :%lu "
+				 "expecting %lu\n", (long unsigned)data.dsize,
+				 (long unsigned)sizeof(struct srvid_request)));
+		return;
 	}
+	if (data.dptr == NULL) {
+		DEBUG(DEBUG_ERR,(__location__ " No data received\n"));
+		return;
+	}
+
+	r = (struct srvid_request_data *)data.dptr;
+	timeout = r->data;
+
+	if (timeout == 0) {
+		DEBUG(DEBUG_NOTICE,("Reenabling takeover runs\n"));
+		clear_takeover_runs_disable(rec);
+		ret = ctdb_get_pnn(ctdb);
+		goto done;
+	}
+
+	if (rec->node_flags & NODE_FLAGS_INACTIVE) {
+		DEBUG(DEBUG_ERR,
+		      ("Refusing to disable takeover runs on inactive node\n"));
+		ret = -EHOSTDOWN;
+		goto done;
+	}
+
+	if (rec->takeover_run_in_progress) {
+		DEBUG(DEBUG_ERR,
+		      ("Unable to disable takeover runs - in progress\n"));
+		ret = -EAGAIN;
+		goto done;
+	}
+
+	DEBUG(DEBUG_NOTICE,("Disabling takeover runs for %u seconds\n", timeout));
+
+	/* Clear any old timers */
+	clear_takeover_runs_disable(rec);
+
+	/* When this is non-NULL it indicates that takeover runs are
+	 * disabled.  This context also holds the timeout timer.
+	 */
+	rec->takeover_runs_disable_ctx = talloc_new(rec);
+	if (rec->takeover_runs_disable_ctx == NULL) {
+		DEBUG(DEBUG_ERR,(__location__ " Unable to allocate memory\n"));
+		ret = -ENOMEM;
+		goto done;
+	}
+
+	/* Arrange for the timeout to occur */
+	event_add_timed(ctdb->ev, rec->takeover_runs_disable_ctx,
+			timeval_current_ofs(timeout, 0),
+			reenable_takeover_runs,
+			rec);
+
+	/* Returning our PNN tells the caller that we succeeded */
+	ret = ctdb_get_pnn(ctdb);
+done:
+	result.dsize = sizeof(int32_t);
+	result.dptr  = (uint8_t *)&ret;
+	srvid_request_reply(ctdb, (struct srvid_request *)r, result);
+}
+
+/* Backward compatibility for this SRVID - call
+ * disable_takeover_runs_handler() instead
+ */
+static void disable_ip_check_handler(struct ctdb_context *ctdb, uint64_t srvid,
+				     TDB_DATA data, void *private_data)
+{
+	struct ctdb_recoverd *rec = talloc_get_type(private_data,
+						    struct ctdb_recoverd);
+	TDB_DATA data2;
+	struct srvid_request_data *req;
 
 	if (data.dsize != sizeof(uint32_t)) {
 		DEBUG(DEBUG_ERR,(__location__ " Wrong size for data :%lu "
-				 "expexting %lu\n", (long unsigned)data.dsize,
+				 "expecting %lu\n", (long unsigned)data.dsize,
 				 (long unsigned)sizeof(uint32_t)));
 		return;
 	}
 	if (data.dptr == NULL) {
-		DEBUG(DEBUG_ERR,(__location__ " No data recaived\n"));
+		DEBUG(DEBUG_ERR,(__location__ " No data received\n"));
 		return;
 	}
 
-	timeout = *((uint32_t *)data.dptr);
+	req = talloc(ctdb, struct srvid_request_data);
+	CTDB_NO_MEMORY_VOID(ctdb, req);
 
-	if (timeout == 0) {
-		DEBUG(DEBUG_NOTICE,("Reenabling ip check\n"));
-		return;
-	}
-		
-	DEBUG(DEBUG_NOTICE,("Disabling ip check for %u seconds\n", timeout));
+	req->srvid = 0; /* No reply */
+	req->pnn = -1;
+	req->data = *((uint32_t *)data.dptr); /* Timeout */
 
-	rec->ip_check_disable_ctx = talloc_new(rec);
-	CTDB_NO_MEMORY_VOID(ctdb, rec->ip_check_disable_ctx);
+	data2.dsize = sizeof(*req);
+	data2.dptr = (uint8_t *)req;
 
-	event_add_timed(ctdb->ev, rec->ip_check_disable_ctx, timeval_current_ofs(timeout, 0), reenable_ip_check, rec);
+	disable_takeover_runs_handler(rec->ctdb,
+				      CTDB_SRVID_DISABLE_TAKEOVER_RUNS,
+				      data2, rec);
 }
-
 
 /*
-  handler for reload all ips.
-*/
-static void ip_reloadall_handler(struct ctdb_context *ctdb, uint64_t srvid, 
-			     TDB_DATA data, void *private_data)
-{
-	struct ctdb_recoverd *rec = talloc_get_type(private_data, struct ctdb_recoverd);
-
-	if (data.dsize != sizeof(struct reloadips_all_reply)) {
-		DEBUG(DEBUG_ERR, (__location__ " Wrong size of return address.\n"));
-		return;
-	}
-
-	reload_all_ips_request = (struct reloadips_all_reply *)talloc_steal(rec, data.dptr);
-
-	DEBUG(DEBUG_NOTICE,("RELOAD_ALL_IPS message received from node:%d srvid:%d\n", reload_all_ips_request->pnn, (int)reload_all_ips_request->srvid));
-	return;
-}
-
-static void async_reloadips_callback(struct ctdb_context *ctdb, uint32_t node_pnn, int32_t res, TDB_DATA outdata, void *callback_data)
-{
-	uint32_t *status = callback_data;
-
-	if (res != 0) {
-		DEBUG(DEBUG_ERR,("Reload ips all failed on node %d\n", node_pnn));
-		*status = 1;
-	}
-}
-
-static int
-reload_all_ips(struct ctdb_context *ctdb, struct ctdb_recoverd *rec, struct ctdb_node_map *nodemap, struct reloadips_all_reply *rips)
-{
-	TALLOC_CTX *tmp_ctx = talloc_new(ctdb);
-	uint32_t *nodes;
-	uint32_t status;
-	int i;
-
-	DEBUG(DEBUG_ERR,("RELOAD ALL IPS on all active nodes\n"));
-	for (i = 0; i< nodemap->num; i++) {
-		if (nodemap->nodes[i].flags != 0) {
-			DEBUG(DEBUG_ERR, ("Can not reload ips on all nodes. Node %d is not up and healthy\n", i));
-			talloc_free(tmp_ctx);
-			return -1;
-		}
-	}
-
-	/* send the flags update to all connected nodes */
-	nodes = list_of_connected_nodes(ctdb, nodemap, tmp_ctx, true);
-	status = 0;
-	if (ctdb_client_async_control(ctdb, CTDB_CONTROL_RELOAD_PUBLIC_IPS,
-					nodes, 0,
-					CONTROL_TIMEOUT(),
-					false, tdb_null,
-					async_reloadips_callback, NULL,
-					&status) != 0) {
-		DEBUG(DEBUG_ERR, (__location__ " Failed to reloadips on all nodes.\n"));
-		talloc_free(tmp_ctx);
-		return -1;
-	}
-
-	if (status != 0) {
-		DEBUG(DEBUG_ERR, (__location__ " Failed to reloadips on all nodes.\n"));
-		talloc_free(tmp_ctx);
-		return -1;
-	}
-
-	ctdb_client_send_message(ctdb, rips->pnn, rips->srvid, tdb_null);
-
-	talloc_free(tmp_ctx);
-	return 0;
-}
-
-
-/*
-  handler for ip reallocate, just add it to the list of callers and 
+  handler for ip reallocate, just add it to the list of requests and 
   handle this later in the monitor_cluster loop so we do not recurse
-  with other callers to takeover_run()
+  with other requests to takeover_run()
 */
-static void ip_reallocate_handler(struct ctdb_context *ctdb, uint64_t srvid, 
-			     TDB_DATA data, void *private_data)
+static void ip_reallocate_handler(struct ctdb_context *ctdb, uint64_t srvid,
+				  TDB_DATA data, void *private_data)
 {
-	struct ctdb_recoverd *rec = talloc_get_type(private_data, struct ctdb_recoverd);
-	struct ip_reallocate_list *caller;
+	struct srvid_request *request;
+	struct ctdb_recoverd *rec = talloc_get_type(private_data,
+						    struct ctdb_recoverd);
 
-	if (data.dsize != sizeof(struct rd_memdump_reply)) {
+	if (data.dsize != sizeof(struct srvid_request)) {
 		DEBUG(DEBUG_ERR, (__location__ " Wrong size of return address.\n"));
 		return;
 	}
 
-	if (rec->ip_reallocate_ctx == NULL) {
-		rec->ip_reallocate_ctx = talloc_new(rec);
-		CTDB_NO_MEMORY_FATAL(ctdb, rec->ip_reallocate_ctx);
-	}
+	request = (struct srvid_request *)data.dptr;
 
-	caller = talloc(rec->ip_reallocate_ctx, struct ip_reallocate_list);
-	CTDB_NO_MEMORY_FATAL(ctdb, caller);
-
-	caller->rd   = (struct rd_memdump_reply *)talloc_steal(caller, data.dptr);
-	caller->next = rec->reallocate_callers;
-	rec->reallocate_callers = caller;
-
-	return;
+	srvid_request_add(ctdb, &rec->reallocate_requests, request);
 }
 
-static void process_ipreallocate_requests(struct ctdb_context *ctdb, struct ctdb_recoverd *rec)
+static void process_ipreallocate_requests(struct ctdb_context *ctdb,
+					  struct ctdb_recoverd *rec)
 {
-	TALLOC_CTX *tmp_ctx = talloc_new(ctdb);
 	TDB_DATA result;
 	int32_t ret;
-	struct ip_reallocate_list *callers;
 	uint32_t culprit;
+	struct srvid_requests *current;
 
 	DEBUG(DEBUG_INFO, ("recovery master forced ip reallocation\n"));
+
+	/* Only process requests that are currently pending.  More
+	 * might come in while the takeover run is in progress and
+	 * they will need to be processed later since they might
+	 * be in response flag changes.
+	 */
+	current = rec->reallocate_requests;
+	rec->reallocate_requests = NULL;
 
 	/* update the list of public ips that a node can handle for
 	   all connected nodes
@@ -2410,39 +2628,17 @@ static void process_ipreallocate_requests(struct ctdb_context *ctdb, struct ctdb
 		rec->need_takeover_run = true;
 	}
 	if (ret == 0) {
-		ret = ctdb_takeover_run(ctdb, rec->nodemap, NULL, NULL);
-		if (ret != 0) {
-			DEBUG(DEBUG_ERR,("Failed to reallocate addresses: ctdb_takeover_run() failed.\n"));
-			rec->need_takeover_run = true;
+		if (do_takeover_run(rec, rec->nodemap, false)) {
+			ret = ctdb_get_pnn(ctdb);
+		} else {
+			ret = -1;
 		}
 	}
 
 	result.dsize = sizeof(int32_t);
 	result.dptr  = (uint8_t *)&ret;
 
-	for (callers=rec->reallocate_callers; callers; callers=callers->next) {
-
-		/* Someone that sent srvid==0 does not want a reply */
-		if (callers->rd->srvid == 0) {
-			continue;
-		}
-		DEBUG(DEBUG_INFO,("Sending ip reallocate reply message to "
-				  "%u:%llu\n", (unsigned)callers->rd->pnn,
-				  (unsigned long long)callers->rd->srvid));
-		ret = ctdb_client_send_message(ctdb, callers->rd->pnn, callers->rd->srvid, result);
-		if (ret != 0) {
-			DEBUG(DEBUG_ERR,("Failed to send ip reallocate reply "
-					 "message to %u:%llu\n",
-					 (unsigned)callers->rd->pnn,
-					 (unsigned long long)callers->rd->srvid));
-		}
-	}
-
-	talloc_free(tmp_ctx);
-	talloc_free(rec->ip_reallocate_ctx);
-	rec->ip_reallocate_ctx = NULL;
-	rec->reallocate_callers = NULL;
-	
+	srvid_requests_reply(ctdb, &current, result);
 }
 
 
@@ -2456,6 +2652,11 @@ static void election_handler(struct ctdb_context *ctdb, uint64_t srvid,
 	int ret;
 	struct election_message *em = (struct election_message *)data.dptr;
 	TALLOC_CTX *mem_ctx;
+
+	/* Ignore election packets from ourself */
+	if (ctdb->pnn == em->pnn) {
+		return;
+	}
 
 	/* we got an election packet - update the timeout for the election */
 	talloc_free(rec->election_timeout);
@@ -2534,7 +2735,7 @@ static void force_election(struct ctdb_recoverd *rec, uint32_t pnn,
 						timeval_current_ofs(ctdb->tunable.election_timeout, 0), 
 						ctdb_election_timeout, rec);
 
-	ret = send_election_request(rec, pnn, true);
+	ret = send_election_request(rec, pnn);
 	if (ret!=0) {
 		DEBUG(DEBUG_ERR, (__location__ " failed to initiate recmaster election"));
 		return;
@@ -2586,8 +2787,8 @@ static void monitor_handler(struct ctdb_context *ctdb, uint64_t srvid,
 		return;
 	}
 
-	if (nodemap->nodes[i].flags != c->new_flags) {
-		DEBUG(DEBUG_NOTICE,("Node %u has changed flags - now 0x%x  was 0x%x\n", c->pnn, c->new_flags, nodemap->nodes[i].flags));
+	if (c->old_flags != c->new_flags) {
+		DEBUG(DEBUG_NOTICE,("Node %u has changed flags - now 0x%x  was 0x%x\n", c->pnn, c->new_flags, c->old_flags));
 	}
 
 	disabled_flag_changed =  (nodemap->nodes[i].flags ^ c->new_flags) & NODE_FLAGS_DISABLED;
@@ -2699,7 +2900,7 @@ static void verify_recmode_normal_callback(struct ctdb_client_control_state *sta
 	   status field
 	*/
 	if (state->status != CTDB_RECOVERY_NORMAL) {
-		DEBUG(DEBUG_NOTICE, (__location__ " Node:%u was in recovery mode. Restart recovery process\n", state->c->hdr.destnode));
+		DEBUG(DEBUG_NOTICE, ("Node:%u was in recovery mode. Start recovery process\n", state->c->hdr.destnode));
 		rmdata->status = MONITOR_RECOVERY_NEEDED;
 	}
 
@@ -2790,7 +2991,7 @@ static void verify_recmaster_callback(struct ctdb_client_control_state *state)
 	   status field
 	*/
 	if (state->status != rmdata->pnn) {
-		DEBUG(DEBUG_ERR,("Node %d does not agree we are the recmaster. Need a new recmaster election\n", state->c->hdr.destnode));
+		DEBUG(DEBUG_ERR,("Node %d thinks node %d is recmaster. Need a new recmaster election\n", state->c->hdr.destnode, state->status));
 		ctdb_set_culprit(rmdata->rec, state->c->hdr.destnode);
 		rmdata->status = MONITOR_ELECTION_NEEDED;
 	}
@@ -2855,17 +3056,74 @@ static enum monitor_result verify_recmaster(struct ctdb_recoverd *rec, struct ct
 	return status;
 }
 
+static bool interfaces_have_changed(struct ctdb_context *ctdb,
+				    struct ctdb_recoverd *rec)
+{
+	struct ctdb_control_get_ifaces *ifaces = NULL;
+	TALLOC_CTX *mem_ctx;
+	bool ret = false;
+
+	mem_ctx = talloc_new(NULL);
+
+	/* Read the interfaces from the local node */
+	if (ctdb_ctrl_get_ifaces(ctdb, CONTROL_TIMEOUT(),
+				 CTDB_CURRENT_NODE, mem_ctx, &ifaces) != 0) {
+		DEBUG(DEBUG_ERR, ("Unable to get interfaces from local node %u\n", ctdb->pnn));
+		/* We could return an error.  However, this will be
+		 * rare so we'll decide that the interfaces have
+		 * actually changed, just in case.
+		 */
+		talloc_free(mem_ctx);
+		return true;
+	}
+
+	if (!rec->ifaces) {
+		/* We haven't been here before so things have changed */
+		DEBUG(DEBUG_NOTICE, ("Initial interface fetched\n"));
+		ret = true;
+	} else if (rec->ifaces->num != ifaces->num) {
+		/* Number of interfaces has changed */
+		DEBUG(DEBUG_NOTICE, ("Interface count changed from %d to %d\n",
+				     rec->ifaces->num, ifaces->num));
+		ret = true;
+	} else {
+		/* See if interface names or link states have changed */
+		int i;
+		for (i = 0; i < rec->ifaces->num; i++) {
+			struct ctdb_control_iface_info * iface = &rec->ifaces->ifaces[i];
+			if (strcmp(iface->name, ifaces->ifaces[i].name) != 0) {
+				DEBUG(DEBUG_NOTICE,
+				      ("Interface in slot %d changed: %s => %s\n",
+				       i, iface->name, ifaces->ifaces[i].name));
+				ret = true;
+				break;
+			}
+			if (iface->link_state != ifaces->ifaces[i].link_state) {
+				DEBUG(DEBUG_NOTICE,
+				      ("Interface %s changed state: %d => %d\n",
+				       iface->name, iface->link_state,
+				       ifaces->ifaces[i].link_state));
+				ret = true;
+				break;
+			}
+		}
+	}
+
+	talloc_free(rec->ifaces);
+	rec->ifaces = talloc_steal(rec, ifaces);
+
+	talloc_free(mem_ctx);
+	return ret;
+}
 
 /* called to check that the local allocation of public ip addresses is ok.
 */
 static int verify_local_ip_allocation(struct ctdb_context *ctdb, struct ctdb_recoverd *rec, uint32_t pnn, struct ctdb_node_map *nodemap)
 {
 	TALLOC_CTX *mem_ctx = talloc_new(NULL);
-	struct ctdb_control_get_ifaces *ifaces = NULL;
 	struct ctdb_uptime *uptime1 = NULL;
 	struct ctdb_uptime *uptime2 = NULL;
 	int ret, j;
-	bool need_iface_check = false;
 	bool need_takeover_run = false;
 
 	ret = ctdb_ctrl_uptime(ctdb, mem_ctx, CONTROL_TIMEOUT(),
@@ -2876,27 +3134,7 @@ static int verify_local_ip_allocation(struct ctdb_context *ctdb, struct ctdb_rec
 		return -1;
 	}
 
-
-	/* read the interfaces from the local node */
-	ret = ctdb_ctrl_get_ifaces(ctdb, CONTROL_TIMEOUT(), CTDB_CURRENT_NODE, mem_ctx, &ifaces);
-	if (ret != 0) {
-		DEBUG(DEBUG_ERR, ("Unable to get interfaces from local node %u\n", pnn));
-		talloc_free(mem_ctx);
-		return -1;
-	}
-
-	if (!rec->ifaces) {
-		need_iface_check = true;
-	} else if (rec->ifaces->num != ifaces->num) {
-		need_iface_check = true;
-	} else if (memcmp(rec->ifaces, ifaces, talloc_get_size(ifaces)) != 0) {
-		need_iface_check = true;
-	}
-
-	talloc_free(rec->ifaces);
-	rec->ifaces = talloc_steal(rec, ifaces);
-
-	if (need_iface_check) {
+	if (interfaces_have_changed(ctdb, rec)) {
 		DEBUG(DEBUG_NOTICE, ("The interfaces status has changed on "
 				     "local node %u - force takeover run\n",
 				     pnn));
@@ -2997,7 +3235,7 @@ static int verify_local_ip_allocation(struct ctdb_context *ctdb, struct ctdb_rec
 	}
 
 	if (need_takeover_run) {
-		struct takeover_run_reply rd;
+		struct srvid_request rd;
 		TDB_DATA data;
 
 		DEBUG(DEBUG_CRIT,("Trigger takeoverrun\n"));
@@ -3168,6 +3406,7 @@ static int check_recovery_lock(struct ctdb_context *ctdb)
 		close(state->fd[0]);
 		state->fd[0] = -1;
 
+		ctdb_set_process_name("ctdb_rec_reclock");
 		debug_extra = talloc_asprintf(NULL, "recovery-lock:");
 		if (pread(ctdb->recovery_lock_fd, &cc, 1, 0) == -1) {
 			DEBUG(DEBUG_CRIT,("failed read from recovery_lock_fd - %s\n", strerror(errno)));
@@ -3178,7 +3417,6 @@ static int check_recovery_lock(struct ctdb_context *ctdb)
 		/* make sure we die when our parent dies */
 		while (ctdb_kill(ctdb, parent, 0) == 0 || errno != ESRCH) {
 			sleep(5);
-			write(state->fd[1], &cc, 1);
 		}
 		_exit(0);
 	}
@@ -3291,7 +3529,7 @@ static void main_loop(struct ctdb_context *ctdb, struct ctdb_recoverd *rec,
 	struct ctdb_vnn_map *remote_vnnmap=NULL;
 	int32_t debug_level;
 	int i, j, ret;
-
+	bool self_ban;
 
 
 	/* verify that the main daemon is still running */
@@ -3316,28 +3554,6 @@ static void main_loop(struct ctdb_context *ctdb, struct ctdb_recoverd *rec,
 	}
 	LogLevel = debug_level;
 
-
-	/* We must check if we need to ban a node here but we want to do this
-	   as early as possible so we dont wait until we have pulled the node
-	   map from the local node. thats why we have the hardcoded value 20
-	*/
-	for (i=0; i<ctdb->num_nodes; i++) {
-		struct ctdb_banning_state *ban_state;
-
-		if (ctdb->nodes[i]->ban_state == NULL) {
-			continue;
-		}
-		ban_state = (struct ctdb_banning_state *)ctdb->nodes[i]->ban_state;
-		if (ban_state->count < 20) {
-			continue;
-		}
-		DEBUG(DEBUG_NOTICE,("Node %u has caused %u recoveries recently - banning it for %u seconds\n",
-			ctdb->nodes[i]->pnn, ban_state->count,
-			ctdb->tunable.recovery_ban_period));
-		ctdb_ban_node(rec, ctdb->nodes[i]->pnn, ctdb->tunable.recovery_ban_period);
-		ban_state->count = 0;
-	}
-
 	/* get relevant tunables */
 	ret = ctdb_ctrl_get_all_tunables(ctdb, CONTROL_TIMEOUT(), CTDB_CURRENT_NODE, &ctdb->tunable);
 	if (ret != 0) {
@@ -3361,11 +3577,7 @@ static void main_loop(struct ctdb_context *ctdb, struct ctdb_recoverd *rec,
 		}
 	}
 
-	pnn = ctdb_ctrl_getpnn(ctdb, CONTROL_TIMEOUT(), CTDB_CURRENT_NODE);
-	if (pnn == (uint32_t)-1) {
-		DEBUG(DEBUG_ERR,("Failed to get local pnn - retrying\n"));
-		return;
-	}
+	pnn = ctdb_get_pnn(ctdb);
 
 	/* get the vnnmap */
 	ret = ctdb_ctrl_getvnnmap(ctdb, CONTROL_TIMEOUT(), pnn, mem_ctx, &vnnmap);
@@ -3388,10 +3600,51 @@ static void main_loop(struct ctdb_context *ctdb, struct ctdb_recoverd *rec,
 	}
 	nodemap = rec->nodemap;
 
-	/* update the capabilities for all nodes */
-	ret = update_capabilities(ctdb, nodemap);
-	if (ret != 0) {
-		DEBUG(DEBUG_ERR, (__location__ " Unable to update node capabilities.\n"));
+	/* remember our own node flags */
+	rec->node_flags = nodemap->nodes[pnn].flags;
+
+	ban_misbehaving_nodes(rec, &self_ban);
+	if (self_ban) {
+		DEBUG(DEBUG_NOTICE, ("This node was banned, restart main_loop\n"));
+		return;
+	}
+
+	/* if the local daemon is STOPPED or BANNED, we verify that the databases are
+	   also frozen and that the recmode is set to active.
+	*/
+	if (rec->node_flags & (NODE_FLAGS_STOPPED | NODE_FLAGS_BANNED)) {
+		/* If this node has become inactive then we want to
+		 * reduce the chances of it taking over the recovery
+		 * master role when it becomes active again.  This
+		 * helps to stabilise the recovery master role so that
+		 * it stays on the most stable node.
+		 */
+		rec->priority_time = timeval_current();
+
+		ret = ctdb_ctrl_getrecmode(ctdb, mem_ctx, CONTROL_TIMEOUT(), CTDB_CURRENT_NODE, &ctdb->recovery_mode);
+		if (ret != 0) {
+			DEBUG(DEBUG_ERR,(__location__ " Failed to read recmode from local node\n"));
+		}
+		if (ctdb->recovery_mode == CTDB_RECOVERY_NORMAL) {
+			DEBUG(DEBUG_ERR,("Node is stopped or banned but recovery mode is not active. Activate recovery mode and lock databases\n"));
+
+			ret = ctdb_ctrl_freeze_priority(ctdb, CONTROL_TIMEOUT(), CTDB_CURRENT_NODE, 1);
+			if (ret != 0) {
+				DEBUG(DEBUG_ERR,(__location__ " Failed to freeze node in STOPPED or BANNED state\n"));
+				return;
+			}
+			ret = ctdb_ctrl_setrecmode(ctdb, CONTROL_TIMEOUT(), CTDB_CURRENT_NODE, CTDB_RECOVERY_ACTIVE);
+			if (ret != 0) {
+				DEBUG(DEBUG_ERR,(__location__ " Failed to activate recovery mode in STOPPED or BANNED state\n"));
+
+				return;
+			}
+		}
+
+		/* If this node is stopped or banned then it is not the recovery
+		 * master, so don't do anything. This prevents stopped or banned
+		 * node from starting election and sending unnecessary controls.
+		 */
 		return;
 	}
 
@@ -3402,59 +3655,41 @@ static void main_loop(struct ctdb_context *ctdb, struct ctdb_recoverd *rec,
 		return;
 	}
 
-	/* if we are not the recmaster we can safely ignore any ip reallocate requests */
+	/* If we are not the recmaster then do some housekeeping */
 	if (rec->recmaster != pnn) {
-		if (rec->ip_reallocate_ctx != NULL) {
-			talloc_free(rec->ip_reallocate_ctx);
-			rec->ip_reallocate_ctx = NULL;
-			rec->reallocate_callers = NULL;
-		}
+		/* Ignore any IP reallocate requests - only recmaster
+		 * processes them
+		 */
+		TALLOC_FREE(rec->reallocate_requests);
+		/* Clear any nodes that should be force rebalanced in
+		 * the next takeover run.  If the recovery master role
+		 * has moved then we don't want to process these some
+		 * time in the future.
+		 */
+		TALLOC_FREE(rec->force_rebalance_nodes);
 	}
 
+	/* This is a special case.  When recovery daemon is started, recmaster
+	 * is set to -1.  If a node is not started in stopped state, then
+	 * start election to decide recovery master
+	 */
 	if (rec->recmaster == (uint32_t)-1) {
 		DEBUG(DEBUG_NOTICE,(__location__ " Initial recovery master set - forcing election\n"));
 		force_election(rec, pnn, nodemap);
 		return;
 	}
 
-	/* if the local daemon is STOPPED, we verify that the databases are
-	   also frozen and thet the recmode is set to active 
-	*/
-	if (nodemap->nodes[pnn].flags & NODE_FLAGS_STOPPED) {
-		ret = ctdb_ctrl_getrecmode(ctdb, mem_ctx, CONTROL_TIMEOUT(), CTDB_CURRENT_NODE, &ctdb->recovery_mode);
-		if (ret != 0) {
-			DEBUG(DEBUG_ERR,(__location__ " Failed to read recmode from local node\n"));
-		}
-		if (ctdb->recovery_mode == CTDB_RECOVERY_NORMAL) {
-			DEBUG(DEBUG_ERR,("Node is stopped but recovery mode is not active. Activate recovery mode and lock databases\n"));
-
-			ret = ctdb_ctrl_freeze_priority(ctdb, CONTROL_TIMEOUT(), CTDB_CURRENT_NODE, 1);
-			if (ret != 0) {
-				DEBUG(DEBUG_ERR,(__location__ " Failed to freeze node in STOPPED state\n"));
-				return;
-			}
-			ret = ctdb_ctrl_setrecmode(ctdb, CONTROL_TIMEOUT(), CTDB_CURRENT_NODE, CTDB_RECOVERY_ACTIVE);
-			if (ret != 0) {
-				DEBUG(DEBUG_ERR,(__location__ " Failed to activate recovery mode in STOPPED state\n"));
-
-				return;
-			}
-			return;
-		}
-	}
-	/* If the local node is stopped, verify we are not the recmaster 
-	   and yield this role if so
-	*/
-	if ((nodemap->nodes[pnn].flags & NODE_FLAGS_INACTIVE) && (rec->recmaster == pnn)) {
-		DEBUG(DEBUG_ERR,("Local node is INACTIVE. Yielding recmaster role\n"));
-		force_election(rec, pnn, nodemap);
+	/* update the capabilities for all nodes */
+	ret = update_capabilities(ctdb, nodemap);
+	if (ret != 0) {
+		DEBUG(DEBUG_ERR, (__location__ " Unable to update node capabilities.\n"));
 		return;
 	}
-	
+
 	/*
-	 * if the current recmaster do not have CTDB_CAP_RECMASTER,
-	 * but we have force an election and try to become the new
-	 * recmaster
+	 * If the current recmaster does not have CTDB_CAP_RECMASTER,
+	 * but we have, then force an election and try to become the new
+	 * recmaster.
 	 */
 	if ((rec->ctdb->nodes[rec->recmaster]->capabilities & CTDB_CAP_RECMASTER) == 0 &&
 	    (rec->ctdb->capabilities & CTDB_CAP_RECMASTER) &&
@@ -3466,20 +3701,16 @@ static void main_loop(struct ctdb_context *ctdb, struct ctdb_recoverd *rec,
 		return;
 	}
 
-	/* check that we (recovery daemon) and the local ctdb daemon
-	   agrees on whether we are banned or not
-	*/
-//qqq
-
-	/* remember our own node flags */
-	rec->node_flags = nodemap->nodes[pnn].flags;
-
 	/* count how many active nodes there are */
 	rec->num_active    = 0;
+	rec->num_lmasters  = 0;
 	rec->num_connected = 0;
 	for (i=0; i<nodemap->num; i++) {
 		if (!(nodemap->nodes[i].flags & NODE_FLAGS_INACTIVE)) {
 			rec->num_active++;
+			if (rec->ctdb->nodes[i]->capabilities & CTDB_CAP_LMASTER) {
+				rec->num_lmasters++;
+			}
 		}
 		if (!(nodemap->nodes[i].flags & NODE_FLAGS_DISCONNECTED)) {
 			rec->num_connected++;
@@ -3520,27 +3751,23 @@ static void main_loop(struct ctdb_context *ctdb, struct ctdb_recoverd *rec,
 	if ((recmaster_nodemap->nodes[j].flags & NODE_FLAGS_INACTIVE) &&
 	    (rec->node_flags & NODE_FLAGS_INACTIVE) == 0) {
 		DEBUG(DEBUG_NOTICE, ("Recmaster node %u no longer available. Force reelection\n", nodemap->nodes[j].pnn));
+		/*
+		 * update our nodemap to carry the recmaster's notion of
+		 * its own flags, so that we don't keep freezing the
+		 * inactive recmaster node...
+		 */
+		nodemap->nodes[j].flags = recmaster_nodemap->nodes[j].flags;
 		force_election(rec, pnn, nodemap);
-		return;
-	}
-
-	/* If this node is stopped then it is not the recovery master
-	 * so the only remaining action is to potentially to verify
-	 * the local IP allocation below.  This won't accomplish
-	 * anything useful so skip it.
-	 */
-	if (rec->node_flags & NODE_FLAGS_STOPPED) {
 		return;
 	}
 
 	/* verify that we have all ip addresses we should have and we dont
 	 * have addresses we shouldnt have.
 	 */ 
-	if (ctdb->tunable.disable_ip_failover == 0) {
-		if (rec->ip_check_disable_ctx == NULL) {
-			if (verify_local_ip_allocation(ctdb, rec, pnn, nodemap) != 0) {
-				DEBUG(DEBUG_ERR, (__location__ " Public IPs were inconsistent.\n"));
-			}
+	if (ctdb->tunable.disable_ip_failover == 0 &&
+	    rec->takeover_runs_disable_ctx == NULL) {
+		if (verify_local_ip_allocation(ctdb, rec, pnn, nodemap) != 0) {
+			DEBUG(DEBUG_ERR, (__location__ " Public IPs were inconsistent.\n"));
 		}
 	}
 
@@ -3567,7 +3794,7 @@ static void main_loop(struct ctdb_context *ctdb, struct ctdb_recoverd *rec,
 
 	if (ctdb->num_nodes != nodemap->num) {
 		DEBUG(DEBUG_ERR, (__location__ " ctdb->num_nodes (%d) != nodemap->num (%d) reloading nodes file\n", ctdb->num_nodes, nodemap->num));
-		reload_nodes_file(ctdb);
+		ctdb_load_nodes_file(ctdb);
 		return;
 	}
 
@@ -3620,15 +3847,9 @@ static void main_loop(struct ctdb_context *ctdb, struct ctdb_recoverd *rec,
 	}
 
 
-	/* is there a pending reload all ips ? */
-	if (reload_all_ips_request != NULL) {
-		reload_all_ips(ctdb, rec, nodemap, reload_all_ips_request);
-		talloc_free(reload_all_ips_request);
-		reload_all_ips_request = NULL;
-	}
-
 	/* if there are takeovers requested, perform it and notify the waiters */
-	if (rec->reallocate_callers) {
+	if (rec->takeover_runs_disable_ctx == NULL &&
+	    rec->reallocate_requests) {
 		process_ipreallocate_requests(ctdb, rec);
 	}
 
@@ -3686,6 +3907,23 @@ static void main_loop(struct ctdb_context *ctdb, struct ctdb_recoverd *rec,
 				return;
 			}
 		}
+	}
+
+	/*
+	 * Update node flags obtained from each active node. This ensure we have
+	 * up-to-date information for all the nodes.
+	 */
+	for (j=0; j<nodemap->num; j++) {
+		if (nodemap->nodes[j].flags & NODE_FLAGS_INACTIVE) {
+			continue;
+		}
+		nodemap->nodes[j].flags = remote_nodemaps[j]->nodes[j].flags;
+	}
+
+	for (j=0; j<nodemap->num; j++) {
+		if (nodemap->nodes[j].flags & NODE_FLAGS_INACTIVE) {
+			continue;
+		}
 
 		/* verify the flags are consistent
 		*/
@@ -3699,7 +3937,7 @@ static void main_loop(struct ctdb_context *ctdb, struct ctdb_recoverd *rec,
 				  nodemap->nodes[j].pnn, 
 				  nodemap->nodes[i].pnn, 
 				  remote_nodemaps[j]->nodes[i].flags,
-				  nodemap->nodes[j].flags));
+				  nodemap->nodes[i].flags));
 				if (i == j) {
 					DEBUG(DEBUG_ERR,("Use flags 0x%02x from remote node %d for cluster update of its own flags\n", remote_nodemaps[j]->nodes[i].flags, j));
 					update_flags_on_all_nodes(ctdb, nodemap, nodemap->nodes[i].pnn, remote_nodemaps[j]->nodes[i].flags);
@@ -3720,12 +3958,13 @@ static void main_loop(struct ctdb_context *ctdb, struct ctdb_recoverd *rec,
 	}
 
 
-	/* there better be the same number of lmasters in the vnn map
-	   as there are active nodes or we will have to do a recovery
+	/* There must be the same number of lmasters in the vnn map as
+	 * there are active nodes with the lmaster capability...  or
+	 * do a recovery.
 	 */
-	if (vnnmap->size != rec->num_active) {
-		DEBUG(DEBUG_ERR, (__location__ " The vnnmap count is different from the number of active nodes. %u vs %u\n", 
-			  vnnmap->size, rec->num_active));
+	if (vnnmap->size != rec->num_lmasters) {
+		DEBUG(DEBUG_ERR, (__location__ " The vnnmap count is different from the number of active lmaster nodes: %u vs %u\n",
+			  vnnmap->size, rec->num_lmasters));
 		ctdb_set_culprit(rec, ctdb->pnn);
 		do_recovery(rec, mem_ctx, pnn, nodemap, vnnmap);
 		return;
@@ -3842,9 +4081,7 @@ static void main_loop(struct ctdb_context *ctdb, struct ctdb_recoverd *rec,
 		 * failure, monitoring is disabled cluster-wide (via
 		 * startrecovery eventscript) and will not get enabled.
 		 */
-		ret = ctdb_takeover_run(ctdb, nodemap, takeover_fail_callback, rec);
-		if (ret != 0) {
-			DEBUG(DEBUG_ERR, (__location__ " Unable to setup public takeover addresses. Trying again\n"));
+		if (!do_takeover_run(rec, nodemap, true)) {
 			return;
 		}
 
@@ -3878,6 +4115,8 @@ static void monitor_cluster(struct ctdb_context *ctdb)
 
 	rec->ctdb = ctdb;
 
+	rec->takeover_run_in_progress = false;
+
 	rec->priority_time = timeval_current();
 
 	/* register a message port for sending memory dumps */
@@ -3907,9 +4146,6 @@ static void monitor_cluster(struct ctdb_context *ctdb)
 	/* register a message port for performing a takeover run */
 	ctdb_client_set_message_handler(ctdb, CTDB_SRVID_TAKEOVER_RUN, ip_reallocate_handler, rec);
 
-	/* register a message port for performing a reload all ips */
-	ctdb_client_set_message_handler(ctdb, CTDB_SRVID_RELOAD_ALL_IPS, ip_reloadall_handler, rec);
-
 	/* register a message port for disabling the ip check for a short while */
 	ctdb_client_set_message_handler(ctdb, CTDB_SRVID_DISABLE_IP_CHECK, disable_ip_check_handler, rec);
 
@@ -3919,6 +4155,11 @@ static void monitor_cluster(struct ctdb_context *ctdb)
 	/* register a message port for forcing a rebalance of a node next
 	   reallocation */
 	ctdb_client_set_message_handler(ctdb, CTDB_SRVID_REBALANCE_NODE, recd_node_rebalance_handler, rec);
+
+	/* Register a message port for disabling takeover runs */
+	ctdb_client_set_message_handler(ctdb,
+					CTDB_SRVID_DISABLE_TAKEOVER_RUNS,
+					disable_takeover_runs_handler, rec);
 
 	for (;;) {
 		TALLOC_CTX *mem_ctx = talloc_new(ctdb);
@@ -3971,7 +4212,7 @@ static void ctdb_check_recd(struct event_context *ev, struct timed_event *te,
 		return;
 	}
 
-	event_add_timed(ctdb->ev, ctdb, 
+	event_add_timed(ctdb->ev, ctdb->recd_ctx,
 			timeval_current_ofs(30, 0),
 			ctdb_check_recd, ctdb);
 }
@@ -4014,7 +4255,7 @@ int ctdb_start_recoverd(struct ctdb_context *ctdb)
 
 	ctdb->ctdbd_pid = getpid();
 
-	ctdb->recoverd_pid = ctdb_fork(ctdb);
+	ctdb->recoverd_pid = ctdb_fork_no_free_ringbuffer(ctdb);
 	if (ctdb->recoverd_pid == -1) {
 		return -1;
 	}
@@ -4035,6 +4276,10 @@ int ctdb_start_recoverd(struct ctdb_context *ctdb)
 
 	srandom(getpid() ^ time(NULL));
 
+	/* Clear the log ringbuffer */
+	ctdb_clear_log(ctdb);
+
+	ctdb_set_process_name("ctdb_recovered");
 	if (switch_from_server_to_client(ctdb, "recoverd") != 0) {
 		DEBUG(DEBUG_CRIT, (__location__ "ERROR: failed to switch recovery daemon into client mode. shutting down.\n"));
 		exit(1);

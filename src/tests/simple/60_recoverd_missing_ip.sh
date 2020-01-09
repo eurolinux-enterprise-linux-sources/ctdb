@@ -37,6 +37,10 @@ fi
 
 echo "$test_ip/$mask is on $iface"
 
+# Push out the next monitor event so it is less likely to be cancelled
+# and result in services not being restarted properly.
+try_command_on_node $test_node $CTDB eventscript monitor
+
 echo "Deleting IP $test_ip from all nodes"
 try_command_on_node -v $test_node $CTDB delip -n all $test_ip
 
@@ -53,14 +57,18 @@ my_exit_hook ()
 
 ctdb_test_exit_hook_add my_exit_hook
 
-if [ -z "$TEST_LOCAL_DAEMONS" ] ; then
-    # Stop monitor events from bringing up the link status of an interface
-    try_command_on_node $test_node $CTDB disablescript 10.interface
-fi
+# This forces us to wait until the ipreallocated associated with the
+# delips is complete.
+try_command_on_node $test_node $CTDB sync
 
 # This effectively cancels any monitor event that is in progress and
 # runs a new one
 try_command_on_node $test_node $CTDB eventscript monitor
+
+if [ -z "$TEST_LOCAL_DAEMONS" ] ; then
+    # Stop monitor events from bringing up the link status of an interface
+    try_command_on_node $test_node $CTDB disablescript 10.interface
+fi
 
 echo "Marking interface $iface down on node $test_node"
 try_command_on_node $test_node $CTDB setifacelink $iface down
@@ -76,8 +84,6 @@ sleep_for 15
 try_command_on_node $test_node $CTDB getlog recoverd
 
 msg="Public IP '$test_ip' is not assigned and we could serve it"
-
-echo "$msg"
 
 if grep "$msg"  <<<"$out" ; then
     echo "BAD: the recovery daemon noticed that the IP was unhosted"

@@ -20,7 +20,7 @@
 
 #include "includes.h"
 #include "db_wrap.h"
-#include "lib/tdb/include/tdb.h"
+#include "tdb.h"
 #include "ctdb_private.h"
 
 struct ctdb_persistent_write_state {
@@ -250,6 +250,7 @@ static struct childwrite_handle *ctdb_childwrite(
 		char c = 0;
 
 		close(result->fd[0]);
+		ctdb_set_process_name("ctdb_write_persistent");
 		debug_extra = talloc_asprintf(NULL, "childwrite-%s:", ctdb_db->db_name);
 		ret = ctdb_persistent_store(state);
 		if (ret != 0) {

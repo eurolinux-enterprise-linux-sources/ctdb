@@ -40,8 +40,6 @@ ctdb_start_stop_service
 
 is_ctdb_managed_service || exit 0
 
-ctdb_service_check_reconfigure
-
 ###########################
 
 case "$1" in 
@@ -54,7 +52,7 @@ case "$1" in
 	;;
 
      monitor)
-	ctdb_check_command "winbind" "wbinfo -p"
+	ctdb_check_command wbinfo -p
 	;;
 
      takeip|releaseip)

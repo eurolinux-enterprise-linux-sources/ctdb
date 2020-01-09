@@ -20,6 +20,8 @@
 
 #include "includes.h"
 #include "system/network.h"
+#include "system/filesys.h"
+#include <libgen.h>
 
 /*
   uint16 checksum for n bytes
@@ -50,7 +52,7 @@ bool ctdb_sys_have_ip(ctdb_sock_addr *_addr)
 	int ret;
 	ctdb_sock_addr __addr = *_addr;
 	ctdb_sock_addr *addr = &__addr;
-	socklen_t addrlen;
+	socklen_t addrlen = 0;
 
 	switch (addr->sa.sa_family) {
 	case AF_INET:
@@ -156,4 +158,30 @@ char *ctdb_sys_find_ifname(ctdb_sock_addr *addr)
 	close(s);
 
 	return NULL;
+}
+
+int mkdir_p(const char *dir, int mode)
+{
+	char * t;
+	int ret;
+
+	if (strcmp(dir, "/") == 0) {
+		return 0;
+	}
+
+	t = talloc_strdup(NULL, dir);
+	if (t == NULL) {
+		return ENOMEM;
+	}
+	ret = mkdir_p(dirname(t), mode);
+	talloc_free(t);
+
+	if (ret == 0) {
+		ret = mkdir(dir, mode);
+		if ((ret == -1) &&  (errno == EEXIST)) {
+			ret = 0;
+		}
+	}
+
+	return ret;
 }

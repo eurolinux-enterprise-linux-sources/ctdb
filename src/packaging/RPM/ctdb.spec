@@ -1,9 +1,10 @@
+%define with_systemd  %{?_with_systemd: 1} %{?!_with_systemd: 0}
 %define initdir %{_sysconfdir}/init.d
 Name: ctdb
 Summary: Clustered TDB
 Vendor: Samba Team
 Packager: Samba Team <samba@samba.org>
-Version: 2.1
+Version: 2.5.1
 Release: 1
 Epoch: 0
 License: GNU GPL version 3
@@ -13,36 +14,50 @@ URL: http://ctdb.samba.org/
 Source: ctdb-%{version}.tar.gz
 
 # Packages
-Requires: coreutils, sed, gawk, iptables, iproute, procps, ethtool
+Requires: coreutils, sed, gawk, iptables, iproute, procps, ethtool, sudo
 # Commands - package name might vary
 Requires: /usr/bin/killall, /bin/kill, /bin/netstat
-# Directories
-Requires: /etc/init.d
 
 Provides: ctdb = %{version}
 
 Prefix: /usr
 BuildRoot: %{_tmppath}/%{name}-%{version}-root
 
-# Always use the bundled versions of these libraries.
-%define with_included_talloc 1
-%define with_included_tdb 1
-%define with_included_tevent 1
+# Allow build with system libraries
+# To enable, run rpmbuild with,
+#      "--with system_talloc"
+#      "--with system_tdb"
+#      "--with system_tevent"
+%define with_included_talloc %{?_with_system_talloc: 0} %{?!_with_system_talloc: 1}
+%define with_included_tdb %{?_with_system_tdb: 0} %{?!_with_system_tdb: 1}
+%define with_included_tevent %{?_with_system_tevent: 0} %{?!_with_system_tevent: 1}
 
-# If the above options are changed then mandate minimum system
-# versions.
-%define libtalloc_version 2.0.6
-%define libtdb_version 1.2.9
-%define libtevent_version 0.9.13
+# Required minimum library versions when building with system libraries
+%define libtalloc_version 2.0.8
+%define libtdb_version 1.2.11
+%define libtevent_version 0.9.18
 
 %if ! %with_included_talloc
 BuildRequires: libtalloc-devel >= %{libtalloc_version}
+Requires: libtalloc >= %{libtalloc_version}
 %endif
 %if ! %with_included_tdb
 BuildRequires: libtdb-devel >= %{libtdb_version}
+Requires: libtdb >= %{libtdb_version}
 %endif
 %if ! %with_included_tevent
 BuildRequires: libtevent-devel >= %{libtevent_version}
+Requires: libtevent >= %{libtevent_version}
+%endif
+
+# To build the ctdb-pcp-pmda package, run rpmbuild with "--with pmda"
+%define with_pcp_pmda  %{?_with_pmda: 1} %{?!_with_pmda: 0}
+%if %with_pcp_pmda
+BuildRequires: pcp-libs-devel
+%endif
+
+%if %{with_systemd}
+BuildRequires: systemd-units
 %endif
 
 %description
@@ -71,7 +86,7 @@ export CC
 ## always run autogen.sh
 ./autogen.sh
 
-CFLAGS="$RPM_OPT_FLAGS $EXTRA -O0 -D_GNU_SOURCE" ./configure \
+CFLAGS="$RPM_OPT_FLAGS $EXTRA -D_GNU_SOURCE" ./configure \
 %if %with_included_talloc
 	--with-included-talloc \
 %endif
@@ -80,6 +95,9 @@ CFLAGS="$RPM_OPT_FLAGS $EXTRA -O0 -D_GNU_SOURCE" ./configure \
 %endif
 %if %with_included_tevent
 	--with-included-tevent \
+%endif
+%if %with_pcp_pmda
+	--enable-pmda \
 %endif
 	--prefix=%{_prefix} \
 	--sysconfdir=%{_sysconfdir} \
@@ -95,15 +113,22 @@ rm -rf $RPM_BUILD_ROOT
 
 # Create the target build directory hierarchy
 mkdir -p $RPM_BUILD_ROOT%{_sysconfdir}/sysconfig
-mkdir -p $RPM_BUILD_ROOT%{_sysconfdir}/init.d
+mkdir -p $RPM_BUILD_ROOT%{_sysconfdir}/sudoers.d
 
 make DESTDIR=$RPM_BUILD_ROOT docdir=%{_docdir} install install_tests
 
 install -m644 config/ctdb.sysconfig $RPM_BUILD_ROOT%{_sysconfdir}/sysconfig/ctdb
-install -m755 config/ctdb.init $RPM_BUILD_ROOT%{initdir}/ctdb
 
-mkdir -p $RPM_BUILD_ROOT%{_docdir}/ctdb/tests/bin
-install -m755 tests/bin/ctdb_transaction $RPM_BUILD_ROOT%{_docdir}/ctdb/tests/bin
+%if %{with_systemd}
+mkdir -p $RPM_BUILD_ROOT%{_unitdir}
+install -m 755 config/ctdb.service $RPM_BUILD_ROOT%{_unitdir}
+%else
+mkdir -p $RPM_BUILD_ROOT%{initdir}
+install -m755 config/ctdb.init $RPM_BUILD_ROOT%{initdir}/ctdb
+%endif
+
+cp config/events.d/README README.eventscripts
+cp config/notify.d.README README.notify.d
 
 # Remove "*.old" files
 find $RPM_BUILD_ROOT -name "*.old" -exec rm -f {} \;
@@ -124,18 +149,23 @@ rm -rf $RPM_BUILD_ROOT
 %config(noreplace) %{_sysconfdir}/ctdb/debug-hung-script.sh
 %config(noreplace) %{_sysconfdir}/ctdb/ctdb-crash-cleanup.sh
 %config(noreplace) %{_sysconfdir}/ctdb/gcore_trace.sh
-%config(noreplace) %{_sysconfdir}/ctdb/functions
-%attr(755,root,root) %{initdir}/ctdb
+%config(noreplace) %{_sysconfdir}/ctdb/debug_locks.sh
 
-%{_docdir}/ctdb/README
-%{_docdir}/ctdb/COPYING
-%{_docdir}/ctdb/README.eventscripts
-%{_docdir}/ctdb/recovery-process.txt
-%{_docdir}/ctdb/ctdb.1.html
-%{_docdir}/ctdb/ctdbd.1.html
-%{_docdir}/ctdb/onnode.1.html
-%{_docdir}/ctdb/ltdbtool.1.html
-%{_docdir}/ctdb/ping_pong.1.html
+%if %{with_systemd}
+%{_unitdir}/ctdb.service
+%else
+%attr(755,root,root) %{initdir}/ctdb
+%endif
+
+%attr(755,root,root) %{_sysconfdir}/ctdb/notify.d
+
+%doc README COPYING NEWS
+%doc README.eventscripts README.notify.d
+%doc doc/recovery-process.txt
+%doc doc/*.html
+%doc doc/examples
+%{_sysconfdir}/sudoers.d/ctdb
+%{_sysconfdir}/ctdb/functions
 %{_sysconfdir}/ctdb/events.d/00.ctdb
 %{_sysconfdir}/ctdb/events.d/01.reclock
 %{_sysconfdir}/ctdb/events.d/10.interface
@@ -154,9 +184,17 @@ rm -rf $RPM_BUILD_ROOT
 %{_sysconfdir}/ctdb/events.d/62.cnfs
 %{_sysconfdir}/ctdb/events.d/70.iscsi
 %{_sysconfdir}/ctdb/events.d/91.lvs
+%{_sysconfdir}/ctdb/events.d/99.timeout
+%config(noreplace) %{_sysconfdir}/ctdb/nfs-rpc-checks.d/10.statd.check
+%config(noreplace) %{_sysconfdir}/ctdb/nfs-rpc-checks.d/20.nfsd.check
+%config(noreplace) %{_sysconfdir}/ctdb/nfs-rpc-checks.d/30.lockd.check
+%config(noreplace) %{_sysconfdir}/ctdb/nfs-rpc-checks.d/40.mountd.check
+%config(noreplace) %{_sysconfdir}/ctdb/nfs-rpc-checks.d/50.rquotad.check
 %{_sysconfdir}/ctdb/statd-callout
 %{_sbindir}/ctdbd
+%{_sbindir}/ctdbd_wrapper
 %{_bindir}/ctdb
+%{_bindir}/ctdb_lock_helper
 %{_bindir}/smnotify
 %{_bindir}/ping_pong
 %{_bindir}/ltdbtool
@@ -169,7 +207,6 @@ rm -rf $RPM_BUILD_ROOT
 %{_mandir}/man1/ping_pong.1.gz
 %{_libdir}/pkgconfig/ctdb.pc
 
-%{_docdir}/ctdb/tests/bin/ctdb_transaction
 
 %package devel
 Summary: CTDB development libraries
@@ -185,7 +222,6 @@ development libraries for ctdb
 %{_includedir}/ctdb_protocol.h
 %{_includedir}/ctdb_private.h
 %{_includedir}/ctdb_typesafe_cb.h
-%{_libdir}/libctdb.a
 
 %package tests
 Summary: CTDB test suite
@@ -205,6 +241,24 @@ test suite for ctdb
 %{_bindir}/ctdb_run_tests
 %{_bindir}/ctdb_run_cluster_tests
 %doc tests/README
+
+%if %with_pcp_pmda
+
+%package pcp-pmda
+Summary: CTDB PCP pmda support
+Group: Development/Tools
+Requires: ctdb = %{version}
+Requires: pcp-libs
+
+%description pcp-pmda
+Performance Co-Pilot (PCP) support for CTDB
+
+%files pcp-pmda
+%dir /var/lib/pcp/pmdas/ctdb
+/var/lib/pcp/pmdas/ctdb/*
+
+%endif
+
 
 
 %changelog

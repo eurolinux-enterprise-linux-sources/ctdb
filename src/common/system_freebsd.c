@@ -75,8 +75,8 @@ static uint16_t tcp_checksum6(uint16_t *data, size_t n, struct ip6_hdr *ip6)
  */
 int ctdb_sys_send_arp(const ctdb_sock_addr *addr, const char *iface)
 {
-	/* FIXME We dont do gratuitous arp on Hurd yet */
-	return 0;
+	/* FIXME FreeBSD: We dont do gratuitous arp yet */
+	return -1;
 }
 
 
@@ -360,29 +360,50 @@ int ctdb_sys_read_tcp_packet(int s, void *private_data,
 
 bool ctdb_sys_check_iface_exists(const char *iface)
 {
+	/* FIXME FreeBSD: Interface always considered present */
 	return true;
 }
 
 int ctdb_get_peer_pid(const int fd, pid_t *peer_pid)
 {
-	/* FIXME not implemented */
+	/* FIXME FreeBSD: get_peer_pid not implemented */
 	return 1;
 }
 
 char *ctdb_get_process_name(pid_t pid)
 {
-	/* FIXME: not implemented */
+	char path[32];
+	char buf[PATH_MAX];
+	char *ptr;
+	int n;
+
+	snprintf(path, sizeof(path), "/proc/%d/exe", pid);
+	n = readlink(path, buf, sizeof(buf));
+	if (n < 0) {
+		return NULL;
+	}
+
+	/* Remove any extra fields */
+	buf[n] = '\0';
+	ptr = strtok(buf, " ");
+	return strdup(ptr);
 	return NULL;
+}
+
+int ctdb_set_process_name(const char *name)
+{
+	/* FIXME FreeBSD: set_process_name not implemented */
+	return -ENOSYS;
 }
 
 bool ctdb_get_lock_info(pid_t req_pid, struct ctdb_lock_info *lock_info)
 {
-	/* FIXME: not implemented */
+	/* FIXME FreeBSD: get_lock_info not implemented */
 	return false;
 }
 
 bool ctdb_get_blocker_pid(struct ctdb_lock_info *reqlock, pid_t *blocker_pid)
 {
-	/* FIXME: not implemented */
+	/* FIXME FreeBSD: get_blocker_pid not implemented */
 	return false;
 }

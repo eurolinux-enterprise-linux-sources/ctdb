@@ -11,21 +11,25 @@
 . $CTDB_BASE/functions
 loadconfig
 
-[ -z "$CTDB_NATGW_NODES" ] && exit 0
+[ -n "$CTDB_NATGW_NODES" ] || exit 0
+export CTDB_NATGW_NODES
 
-# Update capabilities to show whether we support teh NATGW capability or not
-if [ "$CTDB_NATGW_SLAVE_ONLY" = "yes" ] ; then
+set_natgw_capability ()
+{
+    # Set NATGW capability depending on configuration
+    if [ "$CTDB_NATGW_SLAVE_ONLY" = "yes" ] ; then
 	ctdb setnatgwstate off
-else
+    else
 	ctdb setnatgwstate on
-fi
+    fi
+}
 
 delete_all() {
 	_ip="${CTDB_NATGW_PUBLIC_IP%/*}"
 	_maskbits="${CTDB_NATGW_PUBLIC_IP#*/}"
 
 	[ -z "$CTDB_NATGW_PUBLIC_IFACE" ] || {
-	    delete_ip_from_iface $CTDB_NATGW_PUBLIC_IFACE $_ip $_maskbits 2>/dev/null
+	    delete_ip_from_iface $CTDB_NATGW_PUBLIC_IFACE $_ip $_maskbits >/dev/null 2>&1
 	}
 	ip route del 0.0.0.0/0 metric 10 >/dev/null 2>/dev/null
 
@@ -46,18 +50,16 @@ ensure_natgwmaster ()
     natgwip="$2"
 
     if [ "$natgwmaster" = "-1" ]; then
-	echo "There is no NATGW master node"
-	# The recovered event should never fail - we'll catch this
-	# failure in the monitor event.
-	if [ "$_event" = "recovered" ] ; then
-	    exit 0
-	else
-	    exit 1
-	fi
+	# Fail...
+	die "There is no NATGW master node"
     fi
 }
 
 case "$1" in 
+    setup)
+	set_natgw_capability
+	;;
+
     startup)
 	# Error if CTDB_NATGW_PUBLIC_IP is listed in public addresses
 	grep -q "^$CTDB_NATGW_PUBLIC_IP[[:space:]]" "${CTDB_PUBLIC_ADDRESSES:-/etc/ctdb/public_addresses}" && \
@@ -67,9 +69,10 @@ case "$1" in
 	echo 2 > /proc/sys/net/ipv4/conf/all/arp_announce
 	;;
 
-    recovered|updatenatgw|ipreallocated)
+    updatenatgw|ipreallocated)
 	mypnn=$(ctdb pnn | cut -d: -f2)
 
+	set_natgw_capability
 	ensure_natgwmaster "$1"
 
 	delete_all
@@ -98,11 +101,12 @@ case "$1" in
 	echo 1 > /proc/sys/net/ipv4/route/flush
 	;;
 
-    shutdown|stopped|removenatgw)
+    shutdown|removenatgw)
 	delete_all
 	;;
 
     monitor)
+	set_natgw_capability
 	ensure_natgwmaster "$1"
 	;;
 

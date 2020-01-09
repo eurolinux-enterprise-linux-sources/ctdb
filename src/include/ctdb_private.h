@@ -24,19 +24,17 @@
 #include <sys/socket.h>
 
 /*
-  recovery daemon memdump reply address
+ * Structures to support SRVID requests and replies
  */
-struct rd_memdump_reply {
+struct srvid_request {
 	uint32_t pnn;
 	uint64_t srvid;
 };
 
-/*
-  description for a TAKEOVER_RUN message reply address
- */
-struct takeover_run_reply {
+struct srvid_request_data {
 	uint32_t pnn;
 	uint64_t srvid;
+	uint32_t data;
 };
 
 /*
@@ -109,12 +107,9 @@ struct ctdb_tunable {
 	uint32_t recovery_drop_all_ips;
 	uint32_t verify_recovery_lock;
 	uint32_t vacuum_interval;
-	uint32_t vacuum_default_interval;
 	uint32_t vacuum_max_run_time;
 	uint32_t repack_limit;
 	uint32_t vacuum_limit;
-	uint32_t vacuum_min_interval;
-	uint32_t vacuum_max_interval;
 	uint32_t max_queue_depth_drop_msg;
 	uint32_t use_status_events_for_monitoring;
 	uint32_t allow_unhealthy_db_read;
@@ -126,7 +121,6 @@ struct ctdb_tunable {
 	uint32_t recover_pdb_by_seqnum;
 	uint32_t deferred_rebalance_on_node_add;
 	uint32_t fetch_collapse;
-	uint32_t max_lacount;
 	uint32_t hopcount_make_sticky;
 	uint32_t sticky_duration;
 	uint32_t sticky_pindown;
@@ -135,8 +129,7 @@ struct ctdb_tunable {
 	uint32_t db_record_size_warn;
 	uint32_t db_size_warn;
 	uint32_t pulldb_preallocation_size;
-	uint32_t no_ip_takeover_on_disabled;
-	uint32_t deadlock_timeout;
+	uint32_t no_ip_host_on_all_disabled;
 	uint32_t samba3_hack;
 };
 
@@ -286,10 +279,15 @@ struct ctdb_upcalls {
 
 /* list of message handlers - needs to be changed to a more efficient data
    structure so we can find a message handler given a srvid quickly */
-struct ctdb_message_list {
+struct ctdb_message_list_header {
+	struct ctdb_message_list_header *next, *prev;
 	struct ctdb_context *ctdb;
-	struct ctdb_message_list *next, *prev;
 	uint64_t srvid;
+	struct ctdb_message_list *m;
+};
+struct ctdb_message_list {
+	struct ctdb_message_list *next, *prev;
+	struct ctdb_message_list_header *h;
 	ctdb_msg_fn_t message_handler;
 	void *message_private;
 };
@@ -431,6 +429,22 @@ struct ctdb_write_record {
 
 enum ctdb_freeze_mode {CTDB_FREEZE_NONE, CTDB_FREEZE_PENDING, CTDB_FREEZE_FROZEN};
 
+enum ctdb_runstate {
+	CTDB_RUNSTATE_UNKNOWN,
+	CTDB_RUNSTATE_INIT,
+	CTDB_RUNSTATE_SETUP,
+	CTDB_RUNSTATE_FIRST_RECOVERY,
+	CTDB_RUNSTATE_STARTUP,
+	CTDB_RUNSTATE_RUNNING,
+	CTDB_RUNSTATE_SHUTDOWN,
+};
+
+const char *runstate_to_string(enum ctdb_runstate runstate);
+enum ctdb_runstate runstate_from_string(const char *label);
+void ctdb_set_runstate(struct ctdb_context *ctdb, enum ctdb_runstate runstate);
+
+void ctdb_shutdown_sequence(struct ctdb_context *ctdb, int exit_code);
+
 #define CTDB_MONITORING_ACTIVE		0
 #define CTDB_MONITORING_DISABLED	1
 
@@ -478,7 +492,8 @@ struct ctdb_context {
 	const struct ctdb_upcalls *upcalls; /* transport upcalls */
 	void *private_data; /* private to transport */
 	struct ctdb_db_context *db_list;
-	struct ctdb_message_list *message_list;
+	struct ctdb_message_list_header *message_list_header;
+	struct tdb_context *message_list_indexdb;
 	struct ctdb_daemon_data daemon;
 	struct ctdb_statistics statistics;
 	struct ctdb_statistics statistics_current;
@@ -494,13 +509,12 @@ struct ctdb_context {
 	bool do_setsched;
 	void *saved_scheduler_param;
 	const char *event_script_dir;
-	const char *debug_hung_script;
 	const char *notification_script;
 	const char *default_public_interface;
 	pid_t ctdbd_pid;
 	pid_t recoverd_pid;
 	pid_t syslogd_pid;
-	bool done_startup;
+	enum ctdb_runstate runstate;
 	struct ctdb_monitor_state *monitor;
 	struct ctdb_log_state *log;
 	int start_as_disabled;
@@ -537,12 +551,11 @@ struct ctdb_context {
 
 	struct ctdb_reloadips_handle *reload_ips;
 
+	const char *nodes_file;
 	const char *public_addresses_file;
 	struct trbt_tree *child_processes; 
-	TALLOC_CTX *debug_hung_script_ctx;
 
 	/* Used for locking record/db/alldb */
-	int lock_num_current;
 	int lock_num_pending;
 	struct lock_context *lock_current;
 	struct lock_context *lock_pending;
@@ -564,7 +577,6 @@ struct ctdb_db_context {
 	uint32_t seqnum;
 	struct timed_event *seqnum_update;
 	struct ctdb_traverse_local_handle *traverse;
-	bool transaction_active;
 	struct ctdb_vacuum_handle *vacuum_handle;
 	char *unhealthy_reason;
 	int pending_requests;
@@ -583,6 +595,8 @@ struct ctdb_db_context {
 	struct trbt_tree *deferred_fetch;
 
 	struct ctdb_db_statistics statistics;
+
+	int lock_num_current;
 };
 
 
@@ -705,6 +719,7 @@ struct ctdb_fetch_handle {
 /* internal prototypes */
 void ctdb_set_error(struct ctdb_context *ctdb, const char *fmt, ...) PRINTF_ATTRIBUTE(2,3);
 void ctdb_fatal(struct ctdb_context *ctdb, const char *msg);
+void ctdb_die(struct ctdb_context *ctdb, const char *msg);
 void ctdb_external_trace(void);
 bool ctdb_same_address(struct ctdb_address *a1, struct ctdb_address *a2);
 int ctdb_parse_address(struct ctdb_context *ctdb,
@@ -756,7 +771,8 @@ struct ctdb_call_state *ctdb_call_local_send(struct ctdb_db_context *ctdb_db,
 					     TDB_DATA *data);
 
 
-int ctdbd_start(struct ctdb_context *ctdb);
+int ctdb_start_daemon(struct ctdb_context *ctdb, bool do_fork,
+		      bool use_syslog);
 struct ctdb_call_state *ctdbd_call_send(struct ctdb_db_context *ctdb_db, struct ctdb_call *call);
 int ctdbd_call_recv(struct ctdb_call_state *state, struct ctdb_call *call);
 
@@ -850,7 +866,7 @@ struct ctdb_call_state *ctdb_daemon_call_send_remote(struct ctdb_db_context *ctd
 
 int ctdb_call_local(struct ctdb_db_context *ctdb_db, struct ctdb_call *call,
 		    struct ctdb_ltdb_header *header, TALLOC_CTX *mem_ctx,
-		    TDB_DATA *data, bool updatetdb, uint32_t caller);
+		    TDB_DATA *data, bool updatetdb);
 
 #define ctdb_reqid_find(ctdb, reqid, type)	(type *)_ctdb_reqid_find(ctdb, reqid, #type, __location__)
 
@@ -939,12 +955,6 @@ struct ctdb_marshall_buffer {
 	uint8_t data[1];
 };
 
-/* set dmaster control structure */
-struct ctdb_control_set_dmaster {
-	uint32_t db_id;
-	uint32_t dmaster;
-};
-
 /*
   structure for setting a tunable
  */
@@ -1011,11 +1021,13 @@ int32_t ctdb_control_traverse_start_ext(struct ctdb_context *ctdb,
 int32_t ctdb_control_traverse_start(struct ctdb_context *ctdb, TDB_DATA indata, 
 				    TDB_DATA *outdata, uint32_t srcnode, uint32_t client_id);
 int32_t ctdb_control_traverse_all(struct ctdb_context *ctdb, TDB_DATA data, TDB_DATA *outdata);
+int32_t ctdb_control_traverse_all_ext(struct ctdb_context *ctdb, TDB_DATA data, TDB_DATA *outdata);
 int32_t ctdb_control_traverse_data(struct ctdb_context *ctdb, TDB_DATA data, TDB_DATA *outdata);
 int32_t ctdb_control_traverse_kill(struct ctdb_context *ctdb, TDB_DATA indata, 
 				    TDB_DATA *outdata, uint32_t srcnode);
 
 int ctdb_dispatch_message(struct ctdb_context *ctdb, uint64_t srvid, TDB_DATA data);
+bool ctdb_check_message_handler(struct ctdb_context *ctdb, uint64_t srvid);
 
 int daemon_register_message_handler(struct ctdb_context *ctdb, uint32_t client_id, uint64_t srvid);
 int ctdb_deregister_message_handler(struct ctdb_context *ctdb, uint64_t srvid, void *private_data);
@@ -1036,7 +1048,6 @@ struct ctdb_rec_data *ctdb_marshall_loop_next(struct ctdb_marshall_buffer *m, st
 
 int32_t ctdb_control_pull_db(struct ctdb_context *ctdb, TDB_DATA indata, TDB_DATA *outdata);
 int32_t ctdb_control_push_db(struct ctdb_context *ctdb, TDB_DATA indata);
-int32_t ctdb_control_set_dmaster(struct ctdb_context *ctdb, TDB_DATA indata);
 
 int32_t ctdb_control_set_recmode(struct ctdb_context *ctdb, 
 				 struct ctdb_req_control *c,
@@ -1073,7 +1084,11 @@ void ctdb_set_scheduler(struct ctdb_context *ctdb);
 void ctdb_restore_scheduler(struct ctdb_context *ctdb);
 
 struct tevent_signal *ctdb_init_sigchld(struct ctdb_context *ctdb);
+void ctdb_track_child(struct ctdb_context *ctdb, pid_t pid);
 pid_t ctdb_fork(struct ctdb_context *ctdb);
+pid_t ctdb_fork_no_free_ringbuffer(struct ctdb_context *ctdb);
+void ctdb_set_child_info(TALLOC_CTX *mem_ctx, const char *child_name_fmt, ...);
+bool ctdb_is_child_process(void);
 int ctdb_kill(struct ctdb_context *ctdb, pid_t pid, int signum);
 
 int32_t ctdb_control_takeover_ip(struct ctdb_context *ctdb, 
@@ -1091,6 +1106,9 @@ int32_t ctdb_control_release_ip(struct ctdb_context *ctdb,
 int32_t ctdb_control_release_ipv4(struct ctdb_context *ctdb, 
 				 struct ctdb_req_control *c,
 				 TDB_DATA indata, 
+				 bool *async_reply);
+int32_t ctdb_control_ipreallocated(struct ctdb_context *ctdb, 
+				 struct ctdb_req_control *c,
 				 bool *async_reply);
 int32_t ctdb_control_start_recovery(struct ctdb_context *ctdb, 
 				 struct ctdb_req_control *c,
@@ -1193,6 +1211,7 @@ struct ctdb_lock_info {
 };
 
 char *ctdb_get_process_name(pid_t pid);
+int ctdb_set_process_name(const char *name);
 bool ctdb_get_lock_info(pid_t req_pid, struct ctdb_lock_info *lock_info);
 bool ctdb_get_blocker_pid(struct ctdb_lock_info *reqlock, pid_t *blocker_pid);
 
@@ -1203,11 +1222,10 @@ int ctdb_set_single_public_ip(struct ctdb_context *ctdb,
 			      const char *iface,
 			      const char *ip);
 int ctdb_set_event_script(struct ctdb_context *ctdb, const char *script);
-int ctdb_set_event_script_dir(struct ctdb_context *ctdb, const char *script_dir);
-int ctdb_set_debug_hung_script(struct ctdb_context *ctdb, const char *script);
 int ctdb_set_notification_script(struct ctdb_context *ctdb, const char *script);
-void lcp2_forcerebalance(struct ctdb_context *ctdb, uint32_t pnn);
-int ctdb_takeover_run(struct ctdb_context *ctdb, struct ctdb_node_map *nodemap, client_async_callback fail_callback, void *callback_data);
+int ctdb_takeover_run(struct ctdb_context *ctdb, struct ctdb_node_map *nodemap,
+		      uint32_t *force_rebalance_nodes,
+		      client_async_callback fail_callback, void *callback_data);
 
 int32_t ctdb_control_tcp_client(struct ctdb_context *ctdb, uint32_t client_id, 
 				TDB_DATA indata);
@@ -1244,6 +1262,7 @@ int32_t ctdb_control_get_tunable(struct ctdb_context *ctdb, TDB_DATA indata,
 int32_t ctdb_control_set_tunable(struct ctdb_context *ctdb, TDB_DATA indata);
 int32_t ctdb_control_list_tunables(struct ctdb_context *ctdb, TDB_DATA *outdata);
 int32_t ctdb_control_try_delete_records(struct ctdb_context *ctdb, TDB_DATA indata, TDB_DATA *outdata);
+int32_t ctdb_control_receive_records(struct ctdb_context *ctdb, TDB_DATA indata, TDB_DATA *outdata);
 int32_t ctdb_control_add_public_address(struct ctdb_context *ctdb, TDB_DATA indata);
 int32_t ctdb_control_del_public_address(struct ctdb_context *ctdb, TDB_DATA indata);
 
@@ -1256,7 +1275,7 @@ int ctdb_ctrl_get_all_tunables(struct ctdb_context *ctdb,
 			       uint32_t destnode,
 			       struct ctdb_tunable *tunables);
 
-int ctdb_start_freeze(struct ctdb_context *ctdb, uint32_t priority);
+void ctdb_start_freeze(struct ctdb_context *ctdb, uint32_t priority);
 
 bool parse_ip_mask(const char *s, const char *iface, ctdb_sock_addr *addr, unsigned *mask);
 bool parse_ip_port(const char *s, ctdb_sock_addr *addr);
@@ -1393,6 +1412,7 @@ int32_t ctdb_control_set_recmaster(struct ctdb_context *ctdb, uint32_t opcode, T
 
 extern int script_log_level;
 extern bool fast_start;
+extern const char *ctdbd_pidfile;
 
 int32_t ctdb_control_get_event_script_status(struct ctdb_context *ctdb,
 					     uint32_t call_type,
@@ -1401,7 +1421,7 @@ int32_t ctdb_control_get_event_script_status(struct ctdb_context *ctdb,
 int ctdb_log_event_script_output(struct ctdb_context *ctdb, char *str, uint16_t len);
 int ctdb_ctrl_report_recd_lock_latency(struct ctdb_context *ctdb, struct timeval timeout, double latency);
 
-int32_t ctdb_control_stop_node(struct ctdb_context *ctdb, struct ctdb_req_control *c, bool *async_reply);
+int32_t ctdb_control_stop_node(struct ctdb_context *ctdb);
 int32_t ctdb_control_continue_node(struct ctdb_context *ctdb);
 
 void ctdb_stop_vacuuming(struct ctdb_context *ctdb);
@@ -1410,7 +1430,7 @@ int ctdb_vacuum_init(struct ctdb_db_context *ctdb_db);
 int32_t ctdb_control_enable_script(struct ctdb_context *ctdb, TDB_DATA indata);
 int32_t ctdb_control_disable_script(struct ctdb_context *ctdb, TDB_DATA indata);
 
-int32_t ctdb_local_node_got_banned(struct ctdb_context *ctdb);
+void ctdb_local_node_got_banned(struct ctdb_context *ctdb);
 int32_t ctdb_control_set_ban_state(struct ctdb_context *ctdb, TDB_DATA indata);
 int32_t ctdb_control_get_ban_state(struct ctdb_context *ctdb, TDB_DATA *outdata);
 int32_t ctdb_control_set_db_priority(struct ctdb_context *ctdb, TDB_DATA indata);
@@ -1435,7 +1455,7 @@ void ctdb_collect_log(struct ctdb_context *ctdb, struct ctdb_get_log_addr *log_a
 void ctdb_clear_log(struct ctdb_context *ctdb);
 int32_t ctdb_control_get_log(struct ctdb_context *ctdb, TDB_DATA addr);
 int32_t ctdb_control_clear_log(struct ctdb_context *ctdb);
-
+void ctdb_log_ringbuffer_free(void);
 
 struct ctdb_log_state *ctdb_fork_with_logging(TALLOC_CTX *mem_ctx,
 					      struct ctdb_context *ctdb,
@@ -1463,7 +1483,8 @@ void ctdb_run_notification_script(struct ctdb_context *ctdb, const char *event);
 void ctdb_fault_setup(void);
 
 int verify_remote_ip_allocation(struct ctdb_context *ctdb, 
-				struct ctdb_all_public_ips *ips);
+				struct ctdb_all_public_ips *ips,
+				uint32_t pnn);
 int update_ip_assignment_tree(struct ctdb_context *ctdb,
 				struct ctdb_public_ip *ip);
 
@@ -1503,12 +1524,6 @@ void ctdb_local_remove_from_delete_queue(struct ctdb_db_context *ctdb_db,
 
 struct ctdb_ltdb_header *ctdb_header_from_record_handle(struct ctdb_record_handle *h);
 
-/* For unit testing ctdb_transaction.c. */
-struct ctdb_public_ip_list {
-	struct ctdb_public_ip_list *next;
-	uint32_t pnn;
-	ctdb_sock_addr addr;
-};
 int ctdb_trackingdb_add_pnn(struct ctdb_context *ctdb, TDB_DATA *data, uint32_t pnn);
 
 typedef void (*ctdb_trackingdb_cb)(struct ctdb_context *ctdb, uint32_t pnn, void *private_data);
@@ -1550,8 +1565,6 @@ int ctdb_start_monitoring_interfaces(struct ctdb_context *ctdb);
 /* from server/ctdb_lock.c */
 struct lock_request;
 
-int ctdb_lockall_prio(struct ctdb_context *ctdb, uint32_t priority);
-int ctdb_unlockall_prio(struct ctdb_context *ctdb, uint32_t priority);
 int ctdb_lockall_mark_prio(struct ctdb_context *ctdb, uint32_t priority);
 int ctdb_lockall_unmark_prio(struct ctdb_context *ctdb, uint32_t priority);
 
@@ -1578,5 +1591,8 @@ struct lock_request *ctdb_lock_alldb(struct ctdb_context *ctdb,
 				     bool auto_mark,
 				     void (*callback)(void *, bool),
 				     void *private_data);
+
+int mkdir_p(const char *dir, int mode);
+void ctdb_mkdir_p_or_die(struct ctdb_context *ctdb, const char *dir, int mode);
 
 #endif

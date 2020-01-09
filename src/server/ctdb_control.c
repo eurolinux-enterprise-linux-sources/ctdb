@@ -17,7 +17,7 @@
    along with this program; if not, see <http://www.gnu.org/licenses/>.
 */
 #include "includes.h"
-#include "lib/tdb/include/tdb.h"
+#include "tdb.h"
 #include "system/network.h"
 #include "system/filesys.h"
 #include "system/wait.h"
@@ -50,9 +50,18 @@ int32_t ctdb_dump_memory(struct ctdb_context *ctdb, TDB_DATA *outdata)
 	}
 	talloc_report_full(NULL, f);
 	fsize = ftell(f);
+	if (fsize == -1) {
+		DEBUG(DEBUG_ERR, (__location__ " Unable to get file size - %s\n",
+				  strerror(errno)));
+		fclose(f);
+		return -1;
+	}
 	rewind(f);
 	outdata->dptr = talloc_size(outdata, fsize);
-	CTDB_NO_MEMORY(ctdb, outdata->dptr);
+	if (outdata->dptr == NULL) {
+		fclose(f);
+		CTDB_NO_MEMORY(ctdb, outdata->dptr);
+	}
 	outdata->dsize = fread(outdata->dptr, 1, fsize, f);
 	fclose(f);
 	if (outdata->dsize != fsize) {
@@ -62,6 +71,20 @@ int32_t ctdb_dump_memory(struct ctdb_context *ctdb, TDB_DATA *outdata)
 	return 0;
 }
 
+static int32_t control_not_implemented(const char *unsupported,
+				       const char *alternate)
+{
+	if (alternate == NULL) {
+		DEBUG(DEBUG_ERR,
+		      ("Control %s is not implemented any more\n",
+		       unsupported));
+	} else {
+		DEBUG(DEBUG_ERR,
+		      ("Control %s is not implemented any more, use %s instead\n",
+		       unsupported, alternate));
+	}
+	return -1;
+}
 
 /*
   process a control request
@@ -100,6 +123,7 @@ static int32_t ctdb_control_dispatch(struct ctdb_context *ctdb,
 		int i;
 		CHECK_CONTROL_DATA_SIZE(0);
 		ctdb->statistics.memory_used = talloc_total_size(NULL);
+		ctdb->statistics.num_clients = ctdb->num_clients;
 		ctdb->statistics.frozen = 0;
 		for (i=1; i<= NUM_DB_PRIORITIES; i++) {
 			if (ctdb->freeze_mode[i] == CTDB_FREEZE_FROZEN) {
@@ -168,8 +192,7 @@ static int32_t ctdb_control_dispatch(struct ctdb_context *ctdb,
 		return ctdb_control_pull_db(ctdb, indata, outdata);
 
 	case CTDB_CONTROL_SET_DMASTER: 
-		CHECK_CONTROL_DATA_SIZE(sizeof(struct ctdb_control_set_dmaster));
-		return ctdb_control_set_dmaster(ctdb, indata);
+		return control_not_implemented("SET_DMASTER", NULL);
 
 	case CTDB_CONTROL_PUSH_DB:
 		return ctdb_control_push_db(ctdb, indata);
@@ -202,7 +225,14 @@ static int32_t ctdb_control_dispatch(struct ctdb_context *ctdb,
 
 	case CTDB_CONTROL_PING:
 		CHECK_CONTROL_DATA_SIZE(0);
-		return ctdb->statistics.num_clients;
+		return ctdb->num_clients;
+
+	case CTDB_CONTROL_GET_RUNSTATE:
+		CHECK_CONTROL_DATA_SIZE(0);
+		outdata->dptr = (uint8_t *)&ctdb->runstate;
+		outdata->dsize = sizeof(uint32_t);
+		return 0;
+
 
 	case CTDB_CONTROL_SET_DB_READONLY: {
 		uint32_t db_id;
@@ -264,6 +294,9 @@ static int32_t ctdb_control_dispatch(struct ctdb_context *ctdb,
 	case CTDB_CONTROL_TRAVERSE_ALL:
 		return ctdb_control_traverse_all(ctdb, indata, outdata);
 
+	case CTDB_CONTROL_TRAVERSE_ALL_EXT:
+		return ctdb_control_traverse_all_ext(ctdb, indata, outdata);
+
 	case CTDB_CONTROL_TRAVERSE_DATA:
 		return ctdb_control_traverse_data(ctdb, indata, outdata);
 
@@ -318,16 +351,10 @@ static int32_t ctdb_control_dispatch(struct ctdb_context *ctdb,
 		return 0;
 
 	case CTDB_CONTROL_SHUTDOWN:
-		DEBUG(DEBUG_NOTICE,("Received SHUTDOWN command. Stopping CTDB daemon.\n"));
-		ctdb_stop_recoverd(ctdb);
-		ctdb_stop_keepalive(ctdb);
-		ctdb_stop_monitoring(ctdb);
-		ctdb_release_all_ips(ctdb);
-		ctdb_event_script(ctdb, CTDB_EVENT_SHUTDOWN);
-		if (ctdb->methods != NULL) {
-			ctdb->methods->shutdown(ctdb);
-		}
-		exit(0);
+		DEBUG(DEBUG_NOTICE,("Received SHUTDOWN command.\n"));
+		ctdb_shutdown_sequence(ctdb, 0);
+		/* In case above returns due to duplicate shutdown */
+		return 0;
 
 	case CTDB_CONTROL_TAKEOVER_IPv4:
 		CHECK_CONTROL_DATA_SIZE(sizeof(struct ctdb_public_ipv4));
@@ -344,6 +371,10 @@ static int32_t ctdb_control_dispatch(struct ctdb_context *ctdb,
 	case CTDB_CONTROL_RELEASE_IP:
 		CHECK_CONTROL_DATA_SIZE(sizeof(struct ctdb_public_ip));
 		return ctdb_control_release_ip(ctdb, c, indata, async_reply);
+
+	case CTDB_CONTROL_IPREALLOCATED:
+		CHECK_CONTROL_DATA_SIZE(0);
+		return ctdb_control_ipreallocated(ctdb, c, async_reply);
 
 	case CTDB_CONTROL_GET_PUBLIC_IPSv4:
 		CHECK_CONTROL_DATA_SIZE(0);
@@ -414,7 +445,7 @@ static int32_t ctdb_control_dispatch(struct ctdb_context *ctdb,
 		return ctdb_control_get_server_id_list(ctdb, outdata);
 
 	case CTDB_CONTROL_PERSISTENT_STORE:
-		return ctdb_control_persistent_store(ctdb, c, indata, async_reply);
+		return control_not_implemented("PERSISTENT_STORE", NULL);
 
 	case CTDB_CONTROL_UPDATE_RECORD:
 		return ctdb_control_update_record(ctdb, c, indata, async_reply);
@@ -463,17 +494,16 @@ static int32_t ctdb_control_dispatch(struct ctdb_context *ctdb,
 
 	case CTDB_CONTROL_TRANS2_COMMIT:
 	case CTDB_CONTROL_TRANS2_COMMIT_RETRY:
-		return ctdb_control_trans2_commit(ctdb, c, indata, async_reply);
+		return control_not_implemented("TRANS2_COMMIT", "TRANS3_COMMIT");
 
 	case CTDB_CONTROL_TRANS2_ERROR:
-		return ctdb_control_trans2_error(ctdb, c);
+		return control_not_implemented("TRANS2_ERROR", NULL);
 
 	case CTDB_CONTROL_TRANS2_FINISHED:
-		return ctdb_control_trans2_finished(ctdb, c);
+		return control_not_implemented("TRANS2_FINISHED", NULL);
 
 	case CTDB_CONTROL_TRANS2_ACTIVE:
-		CHECK_CONTROL_DATA_SIZE(sizeof(uint32_t));
-		return ctdb_control_trans2_active(ctdb, c, *(uint32_t *)indata.dptr);
+		return control_not_implemented("TRANS2_ACTIVE", NULL);
 
 	case CTDB_CONTROL_TRANS3_COMMIT:
 		return ctdb_control_trans3_commit(ctdb, c, indata, async_reply);
@@ -511,7 +541,7 @@ static int32_t ctdb_control_dispatch(struct ctdb_context *ctdb,
 
 	case CTDB_CONTROL_STOP_NODE:
 		CHECK_CONTROL_DATA_SIZE(0);
-		return ctdb_control_stop_node(ctdb, c, async_reply);
+		return ctdb_control_stop_node(ctdb);
 
 	case CTDB_CONTROL_CONTINUE_NODE:
 		CHECK_CONTROL_DATA_SIZE(0);
@@ -647,6 +677,9 @@ static int32_t ctdb_control_dispatch(struct ctdb_context *ctdb,
 	case CTDB_CONTROL_RELOAD_PUBLIC_IPS:
 		CHECK_CONTROL_DATA_SIZE(0);
 		return ctdb_control_reload_public_ips(ctdb, c, async_reply);
+
+	case CTDB_CONTROL_RECEIVE_RECORDS:
+		return ctdb_control_receive_records(ctdb, indata, outdata);
 
 	default:
 		DEBUG(DEBUG_CRIT,(__location__ " Unknown CTDB control opcode %u\n", opcode));

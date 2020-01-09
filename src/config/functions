@@ -2,8 +2,6 @@
 
 # utility functions for ctdb event scripts
 
-PATH=/bin:/usr/bin:/usr/sbin:/sbin:$PATH
-
 [ -z "$CTDB_VARDIR" ] && {
     if [ -d "/var/lib/ctdb" ] ; then
 	export CTDB_VARDIR="/var/lib/ctdb"
@@ -23,9 +21,16 @@ _loadconfig() {
 	foo="${service_config:-${service_name}}"
 	if [ -n "$foo" ] ; then
 	    loadconfig "$foo"
+	    return
 	fi
-    elif [ "$1" != "ctdb" ] ; then
+    fi
+
+    if [ "$1" != "ctdb" ] ; then
 	loadconfig "ctdb"
+    fi
+
+    if [ -z "$1" ] ; then
+	return
     fi
 
     if [ -f $CTDB_ETCDIR/sysconfig/$1 ]; then
@@ -35,6 +40,13 @@ _loadconfig() {
     elif [ -f $CTDB_BASE/sysconfig/$1 ]; then
 	. $CTDB_BASE/sysconfig/$1
     fi
+
+    if [ "$1" = "ctdb" ] ; then
+	_config="${CTDB_BASE}/ctdbd.conf"
+	if [ -r "$_config" ] ; then
+	    . "$_config"
+	fi
+    fi
 }
 
 loadconfig () {
@@ -42,39 +54,12 @@ loadconfig () {
 }
 
 ##############################################################
-# make sure CTDB_CURRENT_DEBUGLEVEL is set to the desired debug level
-# (integer)
-#
-# If it is already set then do nothing, since it might have been set
-# via a file in rc.local.d/.  If it is not set then set it by sourcing
-# /var/ctdb/eventscript_debuglevel. If this file does not exist then
-# create it using output from "ctdb getdebug".  If the option 1st arg
-# is "create" then don't source an existing file but create a new one
-# instead - this is useful for creating the file just once in each
-# event run in 00.ctdb.  If there's a problem getting the debug level
-# from ctdb then it is silently set to 0 - no use spamming logs if our
-# debug code is broken...
-ctdb_set_current_debuglevel ()
-{
-    [ -z "$CTDB_CURRENT_DEBUGLEVEL" ] || return 0
 
-    _f="$CTDB_VARDIR/eventscript_debuglevel"
-
-    if [ "$1" = "create" -o ! -r "$_f" ] ; then
-	_t=$(ctdb getdebug -Y 2>/dev/null)
-	# get last field of output
-	_t="${_t%:}"
-	_t="${_t##*:}"
-	# Defaults to 0
-	echo "export CTDB_CURRENT_DEBUGLEVEL=\"${_t:-0}\"" >"$_f"
-    fi
-
-    . "$_f"
-}
-
+# CTDB_SCRIPT_DEBUGLEVEL can be overwritten by setting it in a
+# configuration file.
 debug ()
 {
-    if [ $CTDB_CURRENT_DEBUGLEVEL -ge 4 ] ; then
+    if [ ${CTDB_SCRIPT_DEBUGLEVEL:-2} -ge 4 ] ; then
 	# If there are arguments then echo them.  Otherwise expect to
 	# use stdin, which allows us to pass lots of debug using a
 	# here document.
@@ -101,16 +86,8 @@ script_log ()
 {
     _tag="$1" ; shift
 
-    _using_syslog=false
-    if [ "$CTDB_SYSLOG" = "yes" -o -z "$CTDB_LOGFILE" ] ; then
-	_using_syslog=true
-    fi
-    case "$CTDB_OPTIONS" in
-	*--syslog*) _using_syslog=true ;;
-    esac
-
-    if $_using_syslog ; then
-	logger -t "$_tag" "$*"
+    if [ "$CTDB_SYSLOG" = "yes" ] ; then
+	logger -t "ctdbd: ${_tag}" $*
     else
 	{
 	    if [ -n "$*" ] ; then
@@ -128,7 +105,7 @@ background_with_logging ()
 {
     (
 	"$@" 2>&1 </dev/null |
-	script_log "ctdbd: ${script_name}&"
+	script_log "${script_name}&"
     )&
 
     return 0
@@ -156,9 +133,10 @@ ctdb_check_args ()
 
 ##############################################################
 # determine on what type of system (init style) we are running
-detect_init_style() {
+detect_init_style()
+{
     # only do detection if not already set:
-    test "x$CTDB_INIT_STYLE" != "x" && return
+    [ -z "$CTDB_INIT_STYLE" ] || return
 
     if [ -x /sbin/startproc ]; then
         CTDB_INIT_STYLE="suse"
@@ -250,46 +228,77 @@ nfs_check_rpc_service ()
 {
     _prog_name="$1" ; shift
 
-    _v=""
-    case "$1" in
-	-*) : ;;
-	*) _v="$1" ; shift ;;
+    if _nfs_check_rpc_common "$_prog_name" ; then
+	return
+    fi
+
+    while [ -n "$3" ] ; do
+	if _nfs_check_rpc_action "$1" "$2" "$3" ; then
+	    break
+	fi
+	shift 3
+    done
+}
+
+# The new way of doing things...
+nfs_check_rpc_services ()
+{
+    # Files must end with .check - avoids editor backups, RPM fu, ...
+    for _f in "${CTDB_BASE}/nfs-rpc-checks.d/"[0-9][0-9].*.check ; do
+	_t="${_f%.check}"
+	_prog_name="${_t##*/[0-9][0-9].}"
+
+	if _nfs_check_rpc_common "$_prog_name" ; then
+	    # This RPC service is up, check next service...
+	    continue
+	fi
+
+	# Check each line in the file in turn until one of the limit
+	# checks is hit...
+	while read _cmp _lim _rest ; do
+	    # Skip comments
+	    case "$_cmp" in
+		\#*) continue ;;
+	    esac
+
+	    if _nfs_check_rpc_action "$_cmp" "$_lim" "$_rest" ; then
+		# Limit was hit on this line, no further checking...
+		break
+	    fi
+	done <"$_f"
+    done
+}
+
+_nfs_check_rpc_common ()
+{
+    _prog_name="$1"
+
+    # Some platforms don't have separate programs for all services.
+    case "$_prog_name" in
+	statd)
+	    which "rpc.${_prog_name}" >/dev/null 2>&1 || return 0
     esac
 
-    _version=${_v:-1}
-    _rpc_prog="$_prog_name"
-    _restart=""
-    _opts=""
     case "$_prog_name" in
-	knfsd)
+	nfsd)
 	    _rpc_prog=nfs
-	    _version=${_v:-3}
-	    _restart="echo 'Trying to restart NFS service'"
-	    _restart="${_restart}; startstop_nfs restart"
-	    ;;
-	ganesha)
-	    _rpc_prog=nfs
-	    _version=${_v:-3}
-	    _restart="echo 'Trying to restart Ganesha NFS service'"
-	    _restart="${_restart}; startstop_ganesha restart"
+	    _version=3
 	    ;;
 	mountd)
-	    _opts="${MOUNTD_PORT:+ -p }${MOUNTD_PORT}"
+	    _rpc_prog=mountd
+	    _version=1
 	    ;;
 	rquotad)
-	    _opts="${RQUOTAD_PORT:+ -p }${RQUOTAD_PORT}"
+	    _rpc_prog=rquotad
+	    _version=1
 	    ;;
 	lockd)
 	    _rpc_prog=nlockmgr
-	    _version=${_v:-4}
-	    _restart="echo 'Trying to restart lock manager service'"
-	    _restart="${_restart}; startstop_nfslock restart"
+	    _version=4
 	    ;;
 	statd)
 	    _rpc_prog=status
-	    _opts="${STATD_HOSTNAME:+ -n }${STATD_HOSTNAME}"
-	    _opts="${_opts}${STATD_PORT:+ -p }${STATD_PORT}"
-	    _opts="${_opts}${STATD_OUTGOING_PORT:+ -o }${STATD_OUTGOING_PORT}"
+	    _version=1
 	    ;;
 	*)
 	    echo "Internal error: unknown RPC program \"$_prog_name\"."
@@ -305,56 +314,86 @@ nfs_check_rpc_service ()
 
     ctdb_counter_incr "$_service_name"
 
-    while [ -n "$3" ] ; do
-	ctdb_check_counter "quiet" "$1" "$2" "$_service_name" || {
-	    for _action in $3 ; do
-		case "$_action" in
-		    verbose)
-			echo "$ctdb_check_rpc_out"
-			;;
-		    restart|restart:*)
-			# No explicit command specified, construct rpc command.
-			if [ -z "$_restart" ] ; then
-			    _p="rpc.${_prog_name}"
-			    _restart="echo 'Trying to restart $_prog_name [${_p}${_opts}]'"
-			    _restart="${_restart}; killall -q -9 $_p"
-			    _restart="${_restart}; $_p $_opts"
-			fi
+    return 1
+}
 
-			# Process restart flags...
-			_flags="${_action#restart:}"
-			# There may not have been a colon...
-			[ "$_flags" != "$_action" ] || _flags=""
-			# q=quiet - everything to /dev/null
-			if [ "${_flags#*q}" != "$_flags" ] ; then
-			    _restart="{ ${_restart} ; } >/dev/null 2>&1"
-			fi
-			# s=stealthy - last command to /dev/null
-			if [ "${_flags#*s}" != "$_flags" ] ; then
-			    _restart="${_restart} >/dev/null 2>&1"
-			fi
-			# b=background - the whole thing, easy and reliable
-			if [ "${_flags#*b}" != "$_flags" ] ; then
-			    _restart="{ ${_restart} ; } &"
-			fi
+_nfs_check_rpc_action ()
+{
+    _cmp="$1"
+    _limit="$2"
+    _actions="$3"
 
-			# Do it!
-			eval "${_restart}"
-			;;
-		    unhealthy)
-			exit 1
-			;;
-		    *)
-			echo "Internal error: unknown action \"$_action\"."
-			exit 1
-		esac
-	    done
+    if ctdb_check_counter "quiet" "$_cmp" "$_limit" "$_service_name" ; then
+	return 1
+    fi
 
-	    # Only process the first action group.
-	    break
-	}
-	shift 3
+    for _action in $_actions ; do
+	case "$_action" in
+	    verbose)
+		echo "$ctdb_check_rpc_out"
+		;;
+	    restart)
+		_nfs_restart_rpc_service "$_prog_name"
+		;;
+	    restart:b)
+		_nfs_restart_rpc_service "$_prog_name" true
+		;;
+	    unhealthy)
+		exit 1
+		;;
+	    *)
+		echo "Internal error: unknown action \"$_action\"."
+		exit 1
+	esac
     done
+
+    return 0
+}
+
+_nfs_restart_rpc_service ()
+{
+    _prog_name="$1"
+    _background="${2:-false}"
+
+    if $_background ; then
+	_maybe_background="background_with_logging"
+    else
+	_maybe_background=""
+    fi
+
+    _p="rpc.${_prog_name}"
+
+    case "$_prog_name" in
+	nfsd)
+	    echo "Trying to restart NFS service"
+	    $_maybe_background startstop_nfs restart
+	    ;;
+	mountd)
+	    echo "Trying to restart $_prog_name [${_p}]"
+	    killall -q -9 "$_p"
+	    $_maybe_background $_p ${MOUNTD_PORT:+-p} $MOUNTD_PORT
+	    ;;
+	rquotad)
+	    echo "Trying to restart $_prog_name [${_p}]"
+	    killall -q -9 "$_p"
+	    $_maybe_background $_p ${RQUOTAD_PORT:+-p} $RQUOTAD_PORT
+	    ;;
+	lockd)
+	    echo "Trying to restart lock manager service"
+	    $_maybe_background startstop_nfslock restart
+	    ;;
+	statd)
+	    echo "Trying to restart $_prog_name [${_p}]"
+	    killall -q -9 "$_p"
+	    $_maybe_background $_p \
+		${STATD_HOSTNAME:+-n} $STATD_HOSTNAME \
+		${STATD_PORT:+-p} $STATD_PORT \
+		${STATD_OUTGOING_PORT:+-o} $STATD_OUTGOING_PORT
+	    ;;
+	*)
+	    echo "Internal error: unknown RPC program \"$_prog_name\"."
+	    exit 1
+    esac
 }
 
 ######################################################
@@ -367,7 +406,9 @@ ctdb_check_rpc ()
     progname="$1"
     version="$2"
 
-    if ! ctdb_check_rpc_out=$(rpcinfo -u localhost $progname $version 2>&1) ; then
+    _localhost="${CTDB_RPCINFO_LOCALHOST:-127.0.0.1}"
+
+    if ! ctdb_check_rpc_out=$(rpcinfo -u $_localhost $progname $version 2>&1) ; then
 	ctdb_check_rpc_out="ERROR: $progname failed RPC check:
 $ctdb_check_rpc_out"
 	echo "$ctdb_check_rpc_out"
@@ -376,11 +417,19 @@ $ctdb_check_rpc_out"
 }
 
 ######################################################
+# Ensure $service_name is set
+assert_service_name ()
+{
+    [ -n "$service_name" ] || die "INTERNAL ERROR: \$service_name not set"
+}
+
+######################################################
 # check a set of directories is available
 # return 1 on a missing directory
-# usage: ctdb_check_directories_probe SERVICE_NAME <directories...>
+# directories are read from stdin
 ######################################################
-ctdb_check_directories_probe() {
+ctdb_check_directories_probe()
+{
     while IFS="" read d ; do
 	case "$d" in
 	    *%*)
@@ -394,12 +443,12 @@ ctdb_check_directories_probe() {
 
 ######################################################
 # check a set of directories is available
-# usage: ctdb_check_directories SERVICE_NAME <directories...>
+# directories are read from stdin
 ######################################################
-ctdb_check_directories() {
-    n="${1:-${service_name}}"
+ctdb_check_directories()
+{
     ctdb_check_directories_probe || {
-	echo "ERROR: $n directory \"$d\" not available"
+	echo "ERROR: $service_name directory \"$d\" not available"
 	exit 1
     }
 }
@@ -415,6 +464,7 @@ ctdb_check_directories() {
 # message if a port check fails.
 _ctdb_check_tcp_common ()
 {
+    assert_service_name
     _ctdb_service_started_file="$ctdb_fail_dir/$service_name.started"
 }
 
@@ -425,6 +475,8 @@ ctdb_check_tcp_init ()
     touch "$_ctdb_service_started_file"
 }
 
+# Check whether something is listening on all of the given TCP ports
+# using the "ctdb checktcpport" command.
 ctdb_check_tcp_ports()
 {
     if [ -z "$1" ] ; then
@@ -432,129 +484,20 @@ ctdb_check_tcp_ports()
 	exit 1
     fi
 
-    # Set default value for CTDB_TCP_PORT_CHECKS if unset.
-    # If any of these defaults are unsupported then this variable can
-    # be overridden in /etc/sysconfig/ctdb or via a file in
-    # /etc/ctdb/rc.local.d/.
-    : ${CTDB_TCP_PORT_CHECKERS:=ctdb nmap netstat}
-
-    for _c in $CTDB_TCP_PORT_CHECKERS ; do
-	ctdb_check_tcp_ports_$_c "$@"
-	case "$?" in
-	    0)
-		_ctdb_check_tcp_common
-		rm -f "$_ctdb_service_started_file"
-		return 0
-		;;
-	    1)
-		_ctdb_check_tcp_common
-		if [ ! -f "$_ctdb_service_started_file" ] ; then
-		    echo "ERROR: $service_name tcp port $_p is not responding"
-		    debug <<EOF
-$ctdb_check_tcp_ports_debug
-EOF
-		else
-		    echo "INFO: $service_name tcp port $_p is not responding"
-		fi
-
-		return 1
-		;;
-	    127)
-		debug <<EOF
-ctdb_check_ports - checker $_c not implemented
-output from checker was:
-$ctdb_check_tcp_ports_debug
-EOF
-		;;
-	    *)
-		
-	esac
-    done
-
-    echo "INTERNAL ERROR: ctdb_check_ports - no working checkers in CTDB_TCP_PORT_CHECKERS=\"$CTDB_TCP_PORT_CHECKERS\""
-
-    return 127
-}
-
-ctdb_check_tcp_ports_netstat ()
-{
-    _cmd='netstat -l -t -n'
-    _ns=$($_cmd 2>&1)
-    if [ $? -eq 127 ] ; then
-	# netstat probably not installed - unlikely?
-	ctdb_check_tcp_ports_debug="$_ns"
-	return 127
-    fi
-
-    for _p ; do  # process each function argument (port)
-	for _a in '0\.0\.0\.0' '::' ; do
-	    _pat="[[:space:]]${_a}:${_p}[[:space:]]+[^[:space:]]+[[:space:]]+LISTEN"
-	    if echo "$_ns" | grep -E -q "$_pat" ; then
-		# We matched the port, so process next port
-		continue 2
-	    fi
-	done
-
-	# We didn't match the port, so flag an error.
-	ctdb_check_tcp_ports_debug="$_cmd shows this output:
-$_ns"
-	return 1
-    done
-
-    return 0
-}
-
-ctdb_check_tcp_ports_nmap ()
-{
-    # nmap wants a comma-separated list of ports
-    _ports=""
-    for _p ; do
-	_ports="${_ports}${_ports:+,}${_p}"
-    done
-
-    _cmd="nmap -n -oG - -PS 127.0.0.1 -p $_ports"
-
-    _nmap_out=$($_cmd 2>&1)
-    if [ $? -eq 127 ] ; then
-	# nmap probably not installed
-	ctdb_check_tcp_ports_debug="$_nmap_out"
-	return 127
-    fi
-
-    # get the port-related output
-    _port_info=$(echo "$_nmap_out" | sed -n -r -e 's@^.*Ports:[[:space:]]@@p')
-
-    for _p ; do
-	# looking for something like this:
-	#  445/open/tcp//microsoft-ds///
-	# possibly followed by a comma
-	_t="$_p/open/tcp//"
-	case "$_port_info" in
-	    # The info we're after must be either at the beginning of
-	    # the string or it must follow a space.
-            $_t*|*\ $_t*) : ;;
-	    *)
-		# Nope, flag an error...
-		ctdb_check_tcp_ports_debug="$_cmd shows this output:
-$_nmap_out"
-		return 1
-	esac
-    done
-
-    return 0
-}
-
-# Use the new "ctdb checktcpport" command to check the port.
-# This is very cheap.
-ctdb_check_tcp_ports_ctdb ()
-{
     for _p ; do  # process each function argument (port)
 	_cmd="ctdb checktcpport $_p"
 	_out=$($_cmd 2>&1)
 	_ret=$?
 	case "$_ret" in
 	    0)
-		ctdb_check_tcp_ports_debug="\"$_cmd\" was able to bind to port"
+		_ctdb_check_tcp_common
+		if [ ! -f "$_ctdb_service_started_file" ] ; then
+		    echo "ERROR: $service_name tcp port $_p is not responding"
+		    debug "\"ctdb checktcpport $_p\" was able to bind to port"
+		else
+		    echo "INFO: $service_name tcp port $_p is not responding"
+		fi
+
 		return 1
 		;;
 	    98)
@@ -562,13 +505,18 @@ ctdb_check_tcp_ports_ctdb ()
 		continue
 		;;
 	    *)
-		ctdb_check_tcp_ports_debug="$_cmd (exited with $_ret) with output:
+		echo "ERROR: unexpected error running \"ctdb checktcpport\""
+		debug <<EOF
+ctdb checktcpport (exited with $_ret) with output:
 $_out"
-		# assume not implemented
-		return 127
+EOF
+		return $_ret
 	esac
     done
 
+    # All ports listening
+    _ctdb_check_tcp_common
+    rm -f "$_ctdb_service_started_file"
     return 0
 }
 
@@ -588,138 +536,122 @@ ctdb_check_unix_socket() {
 
 ######################################################
 # check a command returns zero status
-# usage: ctdb_check_command SERVICE_NAME <command>
+# usage: ctdb_check_command <command>
 ######################################################
-ctdb_check_command() {
-  service_name="$1"
-  wait_cmd="$2"
-  [ -z "$wait_cmd" ] && return;
-  $wait_cmd > /dev/null 2>&1 || {
-      echo "ERROR: $service_name - $wait_cmd returned error"
-      exit 1
-  }
+ctdb_check_command ()
+{
+    _out=$("$@" 2>&1) || {
+	echo "ERROR: $* returned error"
+	echo "$_out" | debug
+	exit 1
+    }
 }
 
 ################################################
 # kill off any TCP connections with the given IP
 ################################################
-kill_tcp_connections() {
-    _IP="$1"    
-    _failed=0
+kill_tcp_connections ()
+{
+    _ip="$1"
 
-    _killcount=0
-    connfile="$CTDB_VARDIR/state/connections.$_IP"
-    netstat -tn |egrep "^tcp.*[[:space:]]+$_IP:.*ESTABLISHED" | awk '{print $4" "$5}' > $connfile
-    netstat -tn |egrep "^tcp.*[[:space:]]+::ffff:$_IP:.*ESTABLISHED" | awk '{print $4" "$5}' >> $connfile
+    _oneway=false
+    if [ "$2" = "oneway" ] ; then
+	_oneway=true
+    fi
 
-    while read dest src; do
-	srcip=`echo $src | sed -e "s/:[^:]*$//"`
-	srcport=`echo $src | sed -e "s/^.*://"`
-	destip=`echo $dest | sed -e "s/:[^:]*$//"`
-	destport=`echo $dest | sed -e "s/^.*://"`
-	echo "Killing TCP connection $srcip:$srcport $destip:$destport"
-	ctdb killtcp $srcip:$srcport $destip:$destport >/dev/null 2>&1 || _failed=1
-	case $destport in
-	  # we only do one-way killtcp for CIFS
-	  139|445) : ;;
-	  # for all others we do 2-way
-	  *) 
-	  	ctdb killtcp $destip:$destport $srcip:$srcport >/dev/null 2>&1 || _failed=1
-		;;
-	esac
-	_killcount=`expr $_killcount + 1`
-     done < $connfile
-    rm -f $connfile
+    get_tcp_connections_for_ip "$_ip" | {
+	_killcount=0
+	_connections=""
+	_nl="
+"
+	while read _dst _src; do
+	    _destport="${_dst##*:}"
+	    __oneway=$_oneway
+	    case $_destport in
+		# we only do one-way killtcp for CIFS
+		139|445) __oneway=true ;;
+	    esac
 
-    [ $_failed = 0 ] || {
-	echo "Failed to send killtcp control"
-	return;
-    }
-    [ $_killcount -gt 0 ] || {
-	return;
-    }
-    _count=0
-    while netstat -tn |egrep "^tcp.*[[:space:]]+$_IP:.*ESTABLISHED" > /dev/null; do
-	sleep 1
-	_count=`expr $_count + 1`
-	[ $_count -gt 3 ] && {
-	    echo "Timed out killing tcp connections for IP $_IP"
-	    return;
+	    echo "Killing TCP connection $_src $_dst"
+	    _connections="${_connections}${_nl}${_src} ${_dst}"
+	    if ! $__oneway ; then
+		_connections="${_connections}${_nl}${_dst} ${_src}"
+	    fi
+
+	    _killcount=$(($_killcount + 1))
+	done
+
+	if [ $_killcount -eq 0 ] ; then
+	    return
+	fi
+
+	echo "$_connections" | ctdb killtcp || {
+	    echo "Failed to send killtcp control"
+	    return
 	}
-    done
-    echo "killed $_killcount TCP connections to released IP $_IP"
+
+	_count=0
+	while : ; do
+	    _remaining=$(get_tcp_connections_for_ip $_ip | wc -l)
+
+	    if [ $_remaining -eq 0 ] ; then
+		echo "Killed $_killcount TCP connections to released IP $_ip"
+		return
+	    fi
+
+	    _count=$(($_count + 1))
+	    if [ $_count -gt 3 ] ; then
+		echo "Timed out killing tcp connections for IP $_ip"
+		return
+	    fi
+
+	    echo "Waiting for $_remaining connections to be killed for IP $_ip"
+	    sleep 1
+	done
+    }
 }
 
 ##################################################################
 # kill off the local end for any TCP connections with the given IP
 ##################################################################
-kill_tcp_connections_local_only() {
-    _IP="$1"    
-    _failed=0
-
-    _killcount=0
-    connfile="$CTDB_VARDIR/state/connections.$_IP"
-    netstat -tn |egrep "^tcp.*[[:space:]]+$_IP:.*ESTABLISHED" | awk '{print $4" "$5}' > $connfile
-    netstat -tn |egrep "^tcp.*[[:space:]]+::ffff:$_IP:.*ESTABLISHED" | awk '{print $4" "$5}' >> $connfile
-
-    while read dest src; do
-	srcip=`echo $src | sed -e "s/:[^:]*$//"`
-	srcport=`echo $src | sed -e "s/^.*://"`
-	destip=`echo $dest | sed -e "s/:[^:]*$//"`
-	destport=`echo $dest | sed -e "s/^.*://"`
-	echo "Killing TCP connection $srcip:$srcport $destip:$destport"
-	ctdb killtcp $srcip:$srcport $destip:$destport >/dev/null 2>&1 || _failed=1
-	_killcount=`expr $_killcount + 1`
-     done < $connfile
-    rm -f $connfile
-
-    [ $_failed = 0 ] || {
-	echo "Failed to send killtcp control"
-	return;
-    }
-    [ $_killcount -gt 0 ] || {
-	return;
-    }
-    _count=0
-    while netstat -tn |egrep "^tcp.*[[:space:]]+$_IP:.*ESTABLISHED" > /dev/null; do
-	sleep 1
-	_count=`expr $_count + 1`
-	[ $_count -gt 3 ] && {
-	    echo "Timed out killing tcp connections for IP $_IP"
-	    return;
-	}
-    done
-    echo "killed $_killcount TCP connections to released IP $_IP"
+kill_tcp_connections_local_only ()
+{
+    kill_tcp_connections "$1" "oneway"
 }
 
 ##################################################################
 # tickle any TCP connections with the given IP
 ##################################################################
-tickle_tcp_connections() {
-    _IP="$1"
-    _failed=0
+tickle_tcp_connections ()
+{
+    _ip="$1"
 
-    _killcount=0
-    connfile="$CTDB_VARDIR/state/connections.$_IP"
-    netstat -tn |egrep "^tcp.*[[:space:]]+$_IP:.*ESTABLISHED" | awk '{print $4" "$5}' > $connfile
-    netstat -tn |egrep "^tcp.*[[:space:]]+::ffff:$_IP:.*ESTABLISHED" | awk '{print $4" "$5}' >> $connfile
+    get_tcp_connections_for_ip "$_ip" |
+    {
+	_failed=false
 
-    while read dest src; do
-	srcip=`echo $src | sed -e "s/:[^:]*$//"`
-	srcport=`echo $src | sed -e "s/^.*://"`
-	destip=`echo $dest | sed -e "s/:[^:]*$//"`
-	destport=`echo $dest | sed -e "s/^.*://"`
-	echo "Tickle TCP connection $srcip:$srcport $destip:$destport"
-	ctdb tickle $srcip:$srcport $destip:$destport >/dev/null 2>&1 || _failed=1
-	echo "Tickle TCP connection $destip:$destport $srcip:$srcport"
-	ctdb tickle $destip:$destport $srcip:$srcport >/dev/null 2>&1 || _failed=1
-     done < $connfile
-    rm -f $connfile
+	while read dest src; do
+	    echo "Tickle TCP connection $src $dest"
+	    ctdb tickle $src $dest >/dev/null 2>&1 || _failed=true
+	    echo "Tickle TCP connection $dest $src"
+	    ctdb tickle $dest $src >/dev/null 2>&1 || _failed=true
+	done
 
-    [ $_failed = 0 ] || {
-	echo "Failed to send tickle control"
-	return;
+	if $_failed ; then
+	    echo "Failed to send tickle control"
+	fi
     }
+}
+
+get_tcp_connections_for_ip ()
+{
+    _ip="$1"
+
+    netstat -tn | awk -v ip=$_ip \
+	'index($1, "tcp") == 1 && \
+	 (index($4, ip ":") == 1 || index($4, "::ffff:" ip ":") == 1) \
+	 && $6 == "ESTABLISHED" \
+	 {print $4" "$5}'
 }
 
 ########################################################
@@ -727,13 +659,7 @@ tickle_tcp_connections() {
 ########################################################
 startstop_ganesha()
 {
-    _ganesha_fsal_list="gpfs"
-    for _fsal in $_ganesha_fsal_list ; do
-        _service_name="nfs-ganesha-${_fsal}"
-	if [ -x /etc/init.d/$_service_name ] ; then
-	    break
-	fi
-    done
+    _service_name="nfs-ganesha-$CTDB_CLUSTER_FILESYSTEM_TYPE"
     case "$1" in
 	start)
 	    service "$_service_name" start
@@ -772,6 +698,7 @@ startstop_nfs() {
 			set_proc "fs/nfsd/threads" 0
 			service nfsserver stop > /dev/null 2>&1
 			pkill -9 nfsd
+			nfs_dump_some_threads
 			service nfsserver start
 			;;
 		esac
@@ -791,6 +718,7 @@ startstop_nfs() {
 			service nfs stop > /dev/null 2>&1
 			service nfslock stop > /dev/null 2>&1
 			pkill -9 nfsd
+			nfs_dump_some_threads
 			service nfslock start
 			service nfs start
 			;;
@@ -801,6 +729,28 @@ startstop_nfs() {
 		exit 1
 		;;
 	esac
+}
+
+# Dump up to the configured number of nfsd thread backtraces.
+nfs_dump_some_threads ()
+{
+    [ -n "$CTDB_NFS_DUMP_STUCK_THREADS" ] || return 0
+
+    # Optimisation to avoid running an unnecessary pidof
+    [ $CTDB_NFS_DUMP_STUCK_THREADS -gt 0 ] || return 0
+
+    _count=0
+    for _pid in $(pidof nfsd) ; do
+	[ $_count -le $CTDB_NFS_DUMP_STUCK_THREADS ] || break
+
+	# Do this first to avoid racing with thread exit
+	_stack=$(get_proc "${_pid}/stack" 2>/dev/null)
+	if [ -n "$_stack" ] ; then
+	    echo "Stack trace for stuck nfsd thread [${_pid}]:"
+	    echo "$_stack"
+	    _count=$(($_count + 1))
+	fi
+    done
 }
 
 ########################################################
@@ -827,7 +777,7 @@ startstop_nfslock() {
 			service nfsserver stop > /dev/null 2>&1
 			;;
 		restart)
-			service nfsserver stop
+			service nfsserver stop > /dev/null 2>&1
 			service nfsserver start
 			;;
 		esac
@@ -841,7 +791,7 @@ startstop_nfslock() {
 			service nfslock stop > /dev/null 2>&1
 			;;
 		restart)
-			service nfslock stop
+			service nfslock stop > /dev/null 2>&1
 			service nfslock start
 			;;
 		esac
@@ -853,6 +803,23 @@ startstop_nfslock() {
 	esac
 }
 
+# Periodically update the statd database
+nfs_statd_update ()
+{
+    _update_period="$1"
+
+    _statd_update_trigger="$service_state_dir/update-trigger"
+    [ -f "$_statd_update_trigger" ] || touch "$_statd_update_trigger"
+
+    _last_update=$(stat --printf="%Y" "$_statd_update_trigger")
+    _current_time=$(date +"%s")
+    if [ $(( $_current_time - $_last_update)) -ge $_update_period ] ; then
+	touch "$_statd_update_trigger"
+	$CTDB_BASE/statd-callout updatelocal &
+	$CTDB_BASE/statd-callout updateremote &
+    fi
+}
+
 add_ip_to_iface()
 {
     _iface=$1
@@ -860,6 +827,7 @@ add_ip_to_iface()
     _maskbits=$3
 
     _lockfile="${CTDB_VARDIR}/state/interface_modify_${_iface}.flock"
+    mkdir -p "${_lockfile%/*}" # dirname
     [ -f "$_lockfile" ] || touch "$_lockfile"
 
     (
@@ -889,6 +857,7 @@ delete_ip_from_iface()
     _maskbits=$3
 
     _lockfile="${CTDB_VARDIR}/state/interface_modify_${_iface}.flock"
+    mkdir -p "${_lockfile%/*}" # dirname
     [ -f "$_lockfile" ] || touch "$_lockfile"
 
     (
@@ -951,38 +920,27 @@ ip_maskbits_iface ()
 drop_ip ()
 {
     _addr="${1%/*}"  # Remove optional maskbits
-    _log_tag="$2"
 
     set -- $(ip_maskbits_iface $_addr)
     if [ -n "$1" ] ; then
 	_maskbits="$1"
 	_iface="$2"
-	if [ -n "$_log_tag" ] ; then
-	    script_log "$_log_tag" \
-		"Removing public address $_addr/$_maskbits from device $_iface"
-	fi
-	ip addr del $_addr/$_maskbits dev $_iface >/dev/null 2>&1
+	echo "Removing public address $_addr/$_maskbits from device $_iface"
+	delete_ip_from_iface $_iface $_addr $_maskbits >/dev/null 2>&1
     fi
 }
 
 drop_all_public_ips ()
 {
-    _log_tag="$1"
-
     while read _ip _x ; do
-	drop_ip "$_ip" "$_log_tag"
+	drop_ip "$_ip"
     done <"${CTDB_PUBLIC_ADDRESSES:-/dev/null}"
 }
 
 ########################################################
-# some simple logic for counting events - per eventscript
-# usage: ctdb_counter_init
-#        ctdb_counter_incr
-#        ctdb_check_counter_limit <limit>
-# ctdb_check_counter_limit fails when count >= <limit>
-########################################################
+# Simple counters
 _ctdb_counter_common () {
-    _service_name="${1:-${service_name}}"
+    _service_name="${1:-${service_name:-${script_name}}}"
     _counter_file="$ctdb_fail_dir/$_service_name"
     mkdir -p "${_counter_file%/*}" # dirname
 }
@@ -997,33 +955,6 @@ ctdb_counter_incr () {
     # unary counting!
     echo -n 1 >> "$_counter_file"
 }
-ctdb_check_counter_limit () {
-    _ctdb_counter_common
-
-    _limit="${1:-${service_fail_limit}}"
-    _quiet="$2"
-
-    # unary counting!
-    _size=$(stat -c "%s" "$_counter_file" 2>/dev/null || echo 0)
-    if [ $_size -ge $_limit ] ; then
-	echo "ERROR: more than $_limit consecutive failures for $service_name, marking cluster unhealthy"
-	exit 1
-    elif [ $_size -gt 0 -a -z "$_quiet" ] ; then
-	echo "WARNING: less than $_limit consecutive failures ($_size) for $service_name, not unhealthy yet"
-    fi
-}
-ctdb_check_counter_equal () {
-    _ctdb_counter_common
-
-    _limit=$1
-
-    # unary counting!
-    _size=$(stat -c "%s" "$_counter_file" 2>/dev/null || echo 0)
-    if [ $_size -eq $_limit ] ; then
-	return 1
-    fi
-    return 0
-}
 ctdb_check_counter () {
     _msg="${1:-error}"  # "error"  - anything else is silent on fail
     _op="${2:--ge}"  # an integer operator supported by test
@@ -1033,9 +964,19 @@ ctdb_check_counter () {
 
     # unary counting!
     _size=$(stat -c "%s" "$_counter_file" 2>/dev/null || echo 0)
-    if [ $_size $_op $_limit ] ; then
+    _hit=false
+    if [ "$_op" != "%" ] ; then
+	if [ $_size $_op $_limit ] ; then
+	    _hit=true
+	fi
+    else
+	if [ $(($_size $_op $_limit)) -eq 0 ] ; then
+	    _hit=true
+	fi
+    fi
+    if $_hit ; then
 	if [ "$_msg" = "error" ] ; then
-	    echo "ERROR: $_limit consecutive failures for $_service_name, marking node unhealthy"
+	    echo "ERROR: $_size consecutive failures for $_service_name, marking node unhealthy"
 	    exit 1		
 	else
 	    return 1
@@ -1064,26 +1005,25 @@ ctdb_managed_dir="$CTDB_VARDIR/managed_history"
 
 _ctdb_managed_common ()
 {
-    _service_name="${1:-${service_name}}"
-    _ctdb_managed_file="$ctdb_managed_dir/$_service_name"
+    _ctdb_managed_file="$ctdb_managed_dir/$service_name"
 }
 
 ctdb_service_managed ()
 {
-    _ctdb_managed_common "$@"
+    _ctdb_managed_common
     mkdir -p "$ctdb_managed_dir"
     touch "$_ctdb_managed_file"
 }
 
 ctdb_service_unmanaged ()
 {
-    _ctdb_managed_common "$@"
+    _ctdb_managed_common
     rm -f "$_ctdb_managed_file"
 }
 
 is_ctdb_previously_managed_service ()
 {
-    _ctdb_managed_common "$@"
+    _ctdb_managed_common
     [ -f "$_ctdb_managed_file" ]
 }
 
@@ -1129,35 +1069,35 @@ ctdb_setstatus ()
 
 _ctdb_service_reconfigure_common ()
 {
-    _d="$ctdb_status_dir/${1:-${service_name}}"
+    _d="$ctdb_status_dir/${service_name}"
     mkdir -p "$_d"
     _ctdb_service_reconfigure_flag="$_d/reconfigure"
 }
 
 ctdb_service_needs_reconfigure ()
 {
-    _ctdb_service_reconfigure_common "$@"
+    _ctdb_service_reconfigure_common
     [ -e "$_ctdb_service_reconfigure_flag" ]
 }
 
 ctdb_service_set_reconfigure ()
 {
-    _ctdb_service_reconfigure_common "$@"
+    _ctdb_service_reconfigure_common
     >"$_ctdb_service_reconfigure_flag"
 }
 
 ctdb_service_unset_reconfigure ()
 {
-    _ctdb_service_reconfigure_common "$@"
+    _ctdb_service_reconfigure_common
     rm -f "$_ctdb_service_reconfigure_flag"
 }
 
 ctdb_service_reconfigure ()
 {
-    echo "Reconfiguring service \"$@\"..."
-    ctdb_service_unset_reconfigure "$@"
-    service_reconfigure "$@" || return $?
-    ctdb_counter_init "$@"
+    echo "Reconfiguring service \"${service_name}\"..."
+    ctdb_service_unset_reconfigure
+    service_reconfigure || return $?
+    ctdb_counter_init
 }
 
 # Default service_reconfigure() function does nothing.
@@ -1168,9 +1108,9 @@ service_reconfigure ()
 
 ctdb_reconfigure_try_lock ()
 {
-    
-    _ctdb_service_reconfigure_common "$@"
+    _ctdb_service_reconfigure_common
     _lock="${_d}/reconfigure_lock"
+    mkdir -p "${_lock%/*}" # dirname
     touch "$_lock"
 
     (
@@ -1225,13 +1165,15 @@ ctdb_replay_monitor_status ()
 	    ;;
 	*) : ;;  # Must be ERROR, do nothing special.
     esac
-    echo "$_err_out"
+    if [ -n "$_err_out" ] ; then
+	echo "$_err_out"
+    fi
     exit $_code
 }
 
 ctdb_service_check_reconfigure ()
 {
-    [ -n "$1" ] || set -- "$service_name"
+    assert_service_name
 
     # We only care about some events in this function.  For others we
     # return now.
@@ -1240,22 +1182,22 @@ ctdb_service_check_reconfigure ()
 	*) return 0 ;;
     esac
 
-    if ctdb_reconfigure_try_lock "$@" ; then
+    if ctdb_reconfigure_try_lock ; then
 	# No events covered by this function are running, so proceed
 	# with gay abandon.
 	case "$event_name" in
 	    reconfigure)
-		(ctdb_service_reconfigure "$@")
+		(ctdb_service_reconfigure)
 		exit $?
 		;;
 	    ipreallocated)
-		if ctdb_service_needs_reconfigure "$@" ; then
-		    ctdb_service_reconfigure "$@"
+		if ctdb_service_needs_reconfigure ; then
+		    ctdb_service_reconfigure
 		fi
 		;;
 	    monitor)
-		if ctdb_service_needs_reconfigure "$@" ; then
-		    ctdb_service_reconfigure "$@"
+		if ctdb_service_needs_reconfigure ; then
+		    ctdb_service_reconfigure
 		    # Given that the reconfigure might not have
 		    # resulted in the service being stable yet, we
 		    # replay the previous status since that's the best
@@ -1297,21 +1239,21 @@ ctdb_service_check_reconfigure ()
 
 ctdb_compat_managed_service ()
 {
-    if [ "$1" = "yes" -a "$2" = "$_service_name" ] ; then
+    if [ "$1" = "yes" -a "$2" = "$service_name" ] ; then
 	CTDB_MANAGED_SERVICES="$CTDB_MANAGED_SERVICES $2"
     fi
 }
 
 is_ctdb_managed_service ()
 {
-    _service_name="${1:-${service_name}}"
+    assert_service_name
 
     # $t is used just for readability and to allow better accurate
     # matching via leading/trailing spaces
     t=" $CTDB_MANAGED_SERVICES "
 
-    # Return 0 if "<space>$_service_name<space>" appears in $t
-    if [ "${t#* ${_service_name} }" != "${t}" ] ; then
+    # Return 0 if "<space>$service_name<space>" appears in $t
+    if [ "${t#* ${service_name} }" != "${t}" ] ; then
 	return 0
     fi
 
@@ -1319,7 +1261,6 @@ is_ctdb_managed_service ()
     # backward compatibility and try again.
     ctdb_compat_managed_service "$CTDB_MANAGES_VSFTPD"   "vsftpd"
     ctdb_compat_managed_service "$CTDB_MANAGES_SAMBA"    "samba"
-    ctdb_compat_managed_service "$CTDB_MANAGES_SCP"      "scp"
     ctdb_compat_managed_service "$CTDB_MANAGES_WINBIND"  "winbind"
     ctdb_compat_managed_service "$CTDB_MANAGES_HTTPD"    "apache2"
     ctdb_compat_managed_service "$CTDB_MANAGES_HTTPD"    "httpd"
@@ -1330,36 +1271,36 @@ is_ctdb_managed_service ()
 
     t=" $CTDB_MANAGED_SERVICES "
 
-    # Return 0 if "<space>$_service_name<space>" appears in $t
-    [ "${t#* ${_service_name} }" != "${t}" ]
+    # Return 0 if "<space>$service_name<space>" appears in $t
+    [ "${t#* ${service_name} }" != "${t}" ]
 }
 
 ctdb_start_stop_service ()
 {
-    _service_name="${1:-${service_name}}"
+    assert_service_name
 
     # Allow service-start/service-stop pseudo-events to start/stop
     # services when we're not auto-starting/stopping and we're not
     # monitoring.
     case "$event_name" in
 	service-start)
-	    if is_ctdb_managed_service "$_service_name" ; then
+	    if is_ctdb_managed_service ; then
 		die 'service-start event not permitted when service is managed'
 	    fi
 	    if [ "$CTDB_SERVICE_AUTOSTARTSTOP" = "yes" ] ; then
 		die 'service-start event not permitted with $CTDB_SERVICE_AUTOSTARTSTOP = yes'
 	    fi
-	    ctdb_service_start "$_service_name"
+	    ctdb_service_start
 	    exit $?
 	    ;;
 	service-stop)
-	    if is_ctdb_managed_service "$_service_name" ; then
+	    if is_ctdb_managed_service ; then
 		die 'service-stop event not permitted when service is managed'
 	    fi
 	    if [ "$CTDB_SERVICE_AUTOSTARTSTOP" = "yes" ] ; then
 		die 'service-stop event not permitted with $CTDB_SERVICE_AUTOSTARTSTOP = yes'
 	    fi
-	    ctdb_service_stop "$_service_name"
+	    ctdb_service_stop
 	    exit $?
 	    ;;
     esac
@@ -1369,16 +1310,16 @@ ctdb_start_stop_service ()
 
     [ "$event_name" = "monitor" ] || return 0
 
-    if is_ctdb_managed_service "$_service_name" ; then
-	if ! is_ctdb_previously_managed_service "$_service_name" ; then
-	    echo "Starting service \"$_service_name\" - now managed"
-	    background_with_logging ctdb_service_start "$_service_name"
+    if is_ctdb_managed_service ; then
+	if ! is_ctdb_previously_managed_service ; then
+	    echo "Starting service \"$service_name\" - now managed"
+	    background_with_logging ctdb_service_start
 	    exit $?
 	fi
     else
-	if is_ctdb_previously_managed_service "$_service_name" ; then
-	    echo "Stopping service \"$_service_name\" - no longer managed"
-	    background_with_logging ctdb_service_stop "$_service_name"
+	if is_ctdb_previously_managed_service ; then
+	    echo "Stopping service \"$service_name\" - no longer managed"
+	    background_with_logging ctdb_service_stop
 	    exit $?
 	fi
     fi
@@ -1387,20 +1328,18 @@ ctdb_start_stop_service ()
 ctdb_service_start ()
 {
     # The service is marked managed if we've ever tried to start it.
-    ctdb_service_managed "$@"
+    ctdb_service_managed
 
-    # Here we only want $1.  If no argument is passed then
-    # service_start needs to know.
-    service_start "$@" || return $?
+    service_start || return $?
 
-    ctdb_counter_init "$@"
+    ctdb_counter_init
     ctdb_check_tcp_init
 }
 
 ctdb_service_stop ()
 {
-    ctdb_service_unmanaged "$@"
-    service_stop "$@"
+    ctdb_service_unmanaged
+    service_stop
 }
 
 # Default service_start() and service_stop() functions.
@@ -1415,12 +1354,12 @@ ctdb_service_stop ()
 # them with the service name as an argument.
 service_start ()
 {
-    service "${1:-${service_name}}" start
+    service "$service_name" start
 }
 
 service_stop ()
 {
-    service "${1:-${service_name}}" stop
+    service "$service_name" stop
 }
 
 ##################################################################
@@ -1446,19 +1385,42 @@ iptables()
 	flock -w 30 $CTDB_VARDIR/iptables-ctdb.flock /sbin/iptables "$@"
 }
 
+# AIX (and perhaps others?) doesn't have mktemp
+if ! which mktemp >/dev/null 2>&1 ; then
+    mktemp ()
+    {
+	_dir=false
+	if [ "$1" = "-d" ] ; then
+	    _dir=true
+	    shift
+	fi
+	_d="${TMPDIR:-/tmp}"
+	_hex10=$(dd if=/dev/urandom count=20 2>/dev/null | \
+	    md5sum | \
+	    sed -e 's@\(..........\).*@\1@')
+	_t="${_d}/tmp.${_hex10}"
+	(
+	    umask 077
+	    if $_dir ; then
+		mkdir "$_t"
+	    else
+		>"$_t"
+	    fi
+	)
+	echo "$_t"
+    }
+fi
+
 ########################################################
 # tickle handling
 ########################################################
-
-# Temporary directory for tickles.
-tickledir="$CTDB_VARDIR/state/tickles"
-mkdir -p "$tickledir"
 
 update_tickles ()
 {
 	_port="$1"
 
-	mkdir -p "$tickledir" # Just in case
+	tickledir="$CTDB_VARDIR/state/tickles"
+	mkdir -p "$tickledir"
 
 	# Who am I?
 	_pnn=$(ctdb pnn) ; _pnn=${_pnn#PNN:}
@@ -1519,12 +1481,6 @@ update_tickles ()
 	done
 }
 
-# We'll call this here to ensure $CTDB_CURRENT_DEBUGLEVEL is set.
-# This gives us a chance to override the debug level using a file in
-# $CTDB_BASE/rc.local.d/.
-ctdb_set_current_debuglevel
-
 script_name="${0##*/}"       # basename
-service_name="$script_name"  # default is just the script name
 service_fail_limit=1
 event_name="$1"

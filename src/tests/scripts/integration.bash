@@ -14,6 +14,7 @@ if [ -n "$TEST_LOCAL_DAEMONS" ] ; then
     # Otherwise CTDB need to be installed on all nodes.
     if [ -n "$ctdb_dir" -a -d "${ctdb_dir}/bin" ] ; then
 	PATH="${ctdb_dir}/bin:${PATH}"
+        export CTDB_LOCK_HELPER="${ctdb_dir}/bin/ctdb_lock_helper"
     fi
 
     export CTDB_NODES="${TEST_VAR_DIR}/nodes.txt"
@@ -154,7 +155,7 @@ try_command_on_node ()
 	if [ "$nodespec" = "-v" ] ; then
 	    verbose=true
 	else
-	    onnode_opts="$nodespec"
+	    onnode_opts="${onnode_opts}${onnode_opts:+ }${nodespec}"
 	fi
 	nodespec="$1" ; shift
     done
@@ -319,21 +320,8 @@ sleep_for ()
 
 _cluster_is_healthy ()
 {
-    local out x count line
-
-    out=$($CTDB -Y status 2>/dev/null) || return 1
-
-    {
-        read x
-	count=0
-        while read line ; do
-	    # We need to see valid lines if we're going to be healthy.
-	    [ "${line#:[0-9]}" != "$line" ] && count=$(($count + 1))
-	    # A line indicating a node is unhealthy causes failure.
-	    [ "${line##:*:*:*1:}" != "$line" ] && return 1
-        done
-	[ $count -gt 0 ] && return $?
-    } <<<"$out" # Yay bash!
+    $CTDB nodestatus all >/dev/null && \
+	node_has_status 0 recovered
 }
 
 cluster_is_healthy ()
@@ -370,7 +358,7 @@ node_has_status ()
     local pnn="$1"
     local status="$2"
 
-    local bits fpat mpat
+    local bits fpat mpat rpat
     case "$status" in
 	(unhealthy)    bits="?:?:?:1:*" ;;
 	(healthy)      bits="?:?:?:0:*" ;;
@@ -386,6 +374,7 @@ node_has_status ()
 	(unfrozen)     fpat='^[[:space:]]+frozen[[:space:]]+0$' ;;
 	(monon)        mpat='^Monitoring mode:ACTIVE \(0\)$' ;;
 	(monoff)       mpat='^Monitoring mode:DISABLED \(1\)$' ;;
+	(recovered)    rpat='^Recovery mode:NORMAL \(0\)$' ;;
 	*)
 	    echo "node_has_status: unknown status \"$status\""
 	    return 1
@@ -410,6 +399,8 @@ node_has_status ()
 	$CTDB statistics -n "$pnn" | egrep -q "$fpat"
     elif [ -n "$mpat" ] ; then
 	$CTDB getmonmode -n "$pnn" | egrep -q "$mpat"
+    elif [ -n "$rpat" ] ; then
+        $CTDB status -n "$pnn" | egrep -q "$rpat"
     else
 	echo 'node_has_status: unknown mode, neither $bits nor $fpat is set'
 	return 1
@@ -570,8 +561,8 @@ daemons_setup ()
 	    echo 127.0.0.$i >>"$CTDB_NODES"
 	    # 2 public addresses on most nodes, just to make things interesting.
 	    if [ $(($i - 1)) -ne $no_public_ips ] ; then
-		echo "192.0.2.$i/24 lo" >>"$public_addresses_all"
-		echo "192.0.2.$(($i + $TEST_LOCAL_DAEMONS))/24 lo" >>"$public_addresses_all"
+		echo "192.168.234.$i/24 lo" >>"$public_addresses_all"
+		echo "192.168.234.$(($i + $TEST_LOCAL_DAEMONS))/24 lo" >>"$public_addresses_all"
 	    fi
 	fi
     done
@@ -594,11 +585,7 @@ daemons_start_1 ()
     fi
 
     local node_ip=$(sed -n -e "$(($pnn + 1))p" "$CTDB_NODES")
-    local ctdb_options="--reclock=${TEST_VAR_DIR}/rec.lock --nlist $CTDB_NODES --nopublicipcheck --listen=${node_ip} --event-script-dir=${TEST_VAR_DIR}/events.d --logfile=${TEST_VAR_DIR}/daemon.${pnn}.log -d 3 --log-ringbuf-size=10000 --dbdir=${TEST_VAR_DIR}/test.db --dbdir-persistent=${TEST_VAR_DIR}/test.db/persistent --dbdir-state=${TEST_VAR_DIR}/test.db/state"
-
-    if [ -n "$TEST_LOCAL_DAEMONS" ] ; then
-        ctdb_options="$ctdb_options --public-interface=lo"
-    fi
+    local ctdb_options="--sloppy-start --reclock=${TEST_VAR_DIR}/rec.lock --nlist $CTDB_NODES --nopublicipcheck --listen=${node_ip} --event-script-dir=${TEST_VAR_DIR}/events.d --logfile=${TEST_VAR_DIR}/daemon.${pnn}.log -d 3 --log-ringbuf-size=10000 --dbdir=${TEST_VAR_DIR}/test.db --dbdir-persistent=${TEST_VAR_DIR}/test.db/persistent --dbdir-state=${TEST_VAR_DIR}/test.db/state"
 
     if [ $pnn -eq $no_public_ips ] ; then
 	ctdb_options="$ctdb_options --public-addresses=/dev/null"
@@ -621,10 +608,6 @@ daemons_start ()
     for i in $(seq 0 $(($TEST_LOCAL_DAEMONS - 1))) ; do
 	daemons_start_1 $i "$@"
     done
-
-    if [ -L /tmp/ctdb.socket -o ! -S /tmp/ctdb.socket ] ; then 
-	ln -sf "${TEST_VAR_DIR}/sock.0" /tmp/ctdb.socket || return 1
-    fi
 }
 
 #######################################
@@ -632,12 +615,6 @@ daemons_start ()
 _ctdb_hack_options ()
 {
     local ctdb_options="$*"
-
-    # We really just want to pass CTDB_OPTIONS but on RH
-    # /etc/sysconfig/ctdb can, and frequently does, set that variable.
-    # So instead, we hack badly.  We'll add these as we use them.
-    # Note that these may still be overridden by the above file... but
-    # we tend to use the exotic options here... so that is unlikely.
 
     case "$ctdb_options" in
 	*--start-as-stopped*)
@@ -684,8 +661,6 @@ _ctdb_start_post ()
     echo "Forcing a recovery..."
     onnode -q 0 $CTDB recover
     sleep_for 1
-    echo "Forcing a recovery..."
-    onnode -q 0 $CTDB recover
 
     echo "ctdb is ready"
 }
@@ -736,8 +711,6 @@ restart_ctdb ()
 	    continue
 	}
 
-	local debug_out=$(onnode -p all ctdb status -Y 2>&1; onnode -p all ctdb scriptstatus 2>&1)
-
 	echo "Setting RerecoveryTimeout to 1"
 	onnode -pq all "$CTDB setvar RerecoveryTimeout 1"
 
@@ -747,12 +720,13 @@ restart_ctdb ()
 	echo "Forcing a recovery..."
 	onnode -q 0 $CTDB recover
 	sleep_for 1
-	echo "Forcing a recovery..."
-	onnode -q 0 $CTDB recover
 
 	# Cluster is still healthy.  Good, we're done!
 	if ! onnode 0 $CTDB_TEST_WRAPPER _cluster_is_healthy ; then
-	    echo "Cluster become UNHEALTHY again.  Restarting..."
+	    echo "Cluster became UNHEALTHY again [$(date)]"
+	    onnode -p all ctdb status -Y 2>&1
+	    onnode -p all ctdb scriptstatus 2>&1
+	    echo "Restarting..."
 	    continue
 	fi
 
@@ -764,7 +738,9 @@ restart_ctdb ()
     done
 
     echo "Cluster UNHEALTHY...  too many attempts..."
-    echo "$debug_out"
+    onnode -p all ctdb status -Y 2>&1
+    onnode -p all ctdb scriptstatus 2>&1
+
     # Try to make the calling test fail
     status=1
     return 1
@@ -958,6 +934,78 @@ wait_for_monitor_event ()
     wait_until 120 ! ctdb_test_eventscript_flag exists $pnn "monitor"
 
 }
+
+#######################################
+
+nfs_test_setup ()
+{
+    select_test_node_and_ips
+
+    nfs_first_export=$(showmount -e $test_ip | sed -n -e '2s/ .*//p')
+
+    echo "Creating test subdirectory..."
+    try_command_on_node $test_node "mktemp -d --tmpdir=$nfs_first_export"
+    nfs_test_dir="$out"
+    try_command_on_node $test_node "chmod 777 $nfs_test_dir"
+
+    nfs_mnt_d=$(mktemp -d)
+    nfs_local_file="${nfs_mnt_d}/${nfs_test_dir##*/}/TEST_FILE"
+    nfs_remote_file="${nfs_test_dir}/TEST_FILE"
+
+    ctdb_test_exit_hook_add nfs_test_cleanup
+
+    echo "Mounting ${test_ip}:${nfs_first_export} on ${nfs_mnt_d} ..."
+    mount -o timeo=1,hard,intr,vers=3 \
+	${test_ip}:${nfs_first_export} ${nfs_mnt_d}
+}
+
+nfs_test_cleanup ()
+{
+    rm -f "$nfs_local_file"
+    umount -f "$nfs_mnt_d"
+    rmdir "$nfs_mnt_d"
+    onnode -q $test_node rmdir "$nfs_test_dir"
+}
+
+#######################################
+
+# $1: pnn, $2: DB name
+db_get_path ()
+{
+    try_command_on_node -v $1 $CTDB getdbstatus "$2" |
+    sed -n -e "s@^path: @@p"
+}
+
+# $1: pnn, $2: DB name
+db_ctdb_cattdb_count_records ()
+{
+    try_command_on_node -v $1 $CTDB cattdb "$2" |
+    grep '^key' | grep -v '__db_sequence_number__' |
+    wc -l
+}
+
+# $1: pnn, $2: DB name, $3: key string, $4: value string, $5: RSN (default 7)
+db_ctdb_tstore ()
+{
+    _tdb=$(db_get_path $1 "$2")
+    _rsn="${5:-7}"
+    try_command_on_node $1 $CTDB tstore "$_tdb" "$3" "$4" "$_rsn"
+}
+
+# $1: pnn, $2: DB name, $3: dbseqnum (must be < 255!!!!!)
+db_ctdb_tstore_dbseqnum ()
+{
+    # "__db_sequence_number__" + trailing 0x00
+    _key='0x5f5f64625f73657175656e63655f6e756d6265725f5f00'
+
+    # Construct 8 byte (unit64_t) database sequence number.  This
+    # probably breaks if $3 > 255
+    _value=$(printf "0x%02x%014x" $3 0)
+
+    db_ctdb_tstore $1 "$2" "$_key" "$_value"
+}
+
+#######################################
 
 # Make sure that $CTDB is set.
 : ${CTDB:=ctdb}

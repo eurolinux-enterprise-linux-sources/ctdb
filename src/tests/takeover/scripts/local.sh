@@ -18,13 +18,9 @@ define_test ()
 simple_test ()
 {
     # Do some filtering of the output to replace date/time.
-    if [ \( "$CTDB_IP_ALGORITHM" = "lcp2" -a -n "$CTDB_TEST_LOGLEVEL" \) -o \
-	"$CTDB_IP_ALGORITHM" = "det" ] ; then
-	OUT_FILTER='s@^.*:@DATE\ TIME\ \[PID\]:@'
-    fi
+    OUT_FILTER='s@^[^\]]*\]:@DATE\ TIME\ \[PID\]:@'
 
-    _states="$1"
-    _out=$($VALGRIND $test_prog $_states 2>&1)
+    _out=$($VALGRIND $test_prog "$@" 2>&1)
 
     result_check "Algorithm: $CTDB_IP_ALGORITHM"
 }

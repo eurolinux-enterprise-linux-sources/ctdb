@@ -24,7 +24,7 @@
 #ifdef SOCKPATH
 #define CTDB_PATH 	SOCKPATH
 #else
-#define CTDB_PATH 	"/tmp/ctdb.socket"
+#define CTDB_PATH 	"/var/run/ctdb/ctdbd.socket"
 #endif
 
 /* default ctdb port number */
@@ -147,10 +147,8 @@ struct ctdb_call_info {
 */
 #define CTDB_SRVID_REBALANCE_NODE 0xFB01000000000000LL
 
-/*
-   a message handler ID meaning to ask recovery master to reload all ips
- */
-#define CTDB_SRVID_RELOAD_ALL_IPS 0xFB02000000000000LL
+/* A message handler ID to stop takeover runs from occurring */
+#define CTDB_SRVID_DISABLE_TAKEOVER_RUNS 0xFB03000000000000LL
 
 /* A message id to ask the recovery daemon to temporarily disable the
    public ip checks
@@ -240,7 +238,7 @@ enum ctdb_eventscript_call {
 	CTDB_EVENT_RECOVERED,		/* CTDB recovery finished: no args. */
 	CTDB_EVENT_TAKE_IP,		/* IP taken: interface, IP address, netmask bits. */
 	CTDB_EVENT_RELEASE_IP,		/* IP released: interface, IP address, netmask bits. */
-	CTDB_EVENT_STOPPED,		/* This node is stopped: no args. */
+	CTDB_EVENT_STOPPED,		/* Deprecated, do not use. */
 	CTDB_EVENT_MONITOR,		/* Please check if service is healthy: no args. */
 	CTDB_EVENT_STATUS,		/* Report service status: no args. */
 	CTDB_EVENT_SHUTDOWN,		/* CTDB shutting down: no args. */
@@ -283,7 +281,7 @@ enum ctdb_controls {CTDB_CONTROL_PROCESS_EXISTS          = 0,
 		    CTDB_CONTROL_SET_DEBUG               = 8,
 		    CTDB_CONTROL_GET_DBMAP               = 9,
 		    CTDB_CONTROL_GET_NODEMAPv4           = 10, /* obsolete */
-		    CTDB_CONTROL_SET_DMASTER             = 11,
+		    CTDB_CONTROL_SET_DMASTER             = 11, /* obsolete */
 		    /* #12 removed */
 		    CTDB_CONTROL_PULL_DB                 = 13,
 		    CTDB_CONTROL_PUSH_DB                 = 14,
@@ -334,7 +332,7 @@ enum ctdb_controls {CTDB_CONTROL_PROCESS_EXISTS          = 0,
 		    CTDB_CONTROL_CHECK_SERVER_ID	 = 59,
 		    CTDB_CONTROL_GET_SERVER_ID_LIST	 = 60,
 		    CTDB_CONTROL_DB_ATTACH_PERSISTENT    = 61,
-		    CTDB_CONTROL_PERSISTENT_STORE        = 62,
+		    CTDB_CONTROL_PERSISTENT_STORE        = 62, /* obsolete */
 		    CTDB_CONTROL_UPDATE_RECORD           = 63,
 		    CTDB_CONTROL_SEND_GRATIOUS_ARP       = 64,
 		    CTDB_CONTROL_TRANSACTION_START       = 65,
@@ -355,10 +353,10 @@ enum ctdb_controls {CTDB_CONTROL_PROCESS_EXISTS          = 0,
 		    CTDB_CONTROL_GET_CAPABILITIES	 = 80,
 		    CTDB_CONTROL_START_PERSISTENT_UPDATE = 81,
 		    CTDB_CONTROL_CANCEL_PERSISTENT_UPDATE= 82,
-		    CTDB_CONTROL_TRANS2_COMMIT           = 83,
-		    CTDB_CONTROL_TRANS2_FINISHED         = 84,
-		    CTDB_CONTROL_TRANS2_ERROR            = 85,
-		    CTDB_CONTROL_TRANS2_COMMIT_RETRY     = 86,
+		    CTDB_CONTROL_TRANS2_COMMIT           = 83, /* obsolete */
+		    CTDB_CONTROL_TRANS2_FINISHED         = 84, /* obsolete */
+		    CTDB_CONTROL_TRANS2_ERROR            = 85, /* obsolete */
+		    CTDB_CONTROL_TRANS2_COMMIT_RETRY     = 86, /* obsolete */
 		    CTDB_CONTROL_RECD_PING		 = 87,
 		    CTDB_CONTROL_RELEASE_IP              = 88,
 		    CTDB_CONTROL_TAKEOVER_IP             = 89,
@@ -383,7 +381,7 @@ enum ctdb_controls {CTDB_CONTROL_PROCESS_EXISTS          = 0,
 		    CTDB_CONTROL_TRANSACTION_CANCEL      = 113,
 		    CTDB_CONTROL_REGISTER_NOTIFY         = 114,
 		    CTDB_CONTROL_DEREGISTER_NOTIFY       = 115,
-		    CTDB_CONTROL_TRANS2_ACTIVE           = 116,
+		    CTDB_CONTROL_TRANS2_ACTIVE           = 116, /* obsolete */
 		    CTDB_CONTROL_GET_LOG		 = 117,
 		    CTDB_CONTROL_CLEAR_LOG		 = 118,
 		    CTDB_CONTROL_TRANS3_COMMIT           = 119,
@@ -402,6 +400,10 @@ enum ctdb_controls {CTDB_CONTROL_PROCESS_EXISTS          = 0,
 		    CTDB_CONTROL_GET_DB_STATISTICS	 = 132,
 		    CTDB_CONTROL_SET_DB_STICKY		 = 133,
 		    CTDB_CONTROL_RELOAD_PUBLIC_IPS	 = 134,
+		    CTDB_CONTROL_TRAVERSE_ALL_EXT	 = 135,
+		    CTDB_CONTROL_RECEIVE_RECORDS	 = 136,
+		    CTDB_CONTROL_IPREALLOCATED		 = 137,
+		    CTDB_CONTROL_GET_RUNSTATE		 = 138,
 };
 
 /*
@@ -506,22 +508,13 @@ struct ctdb_req_keepalive {
 };
 
 
-/* types of failures possible from TRANS2_COMMIT */
-enum ctdb_trans2_commit_error {
-	CTDB_TRANS2_COMMIT_SUCCESS=0, /* all nodes committed successfully */
-	CTDB_TRANS2_COMMIT_TIMEOUT=1, /* at least one node timed out */
-	CTDB_TRANS2_COMMIT_ALLFAIL=2, /* all nodes failed the commit */
-	CTDB_TRANS2_COMMIT_SOMEFAIL=3 /* some nodes failed the commit, some allowed it */
-};
-
 /*
   the extended header for records in the ltdb
 */
 struct ctdb_ltdb_header {
 	uint64_t rsn;
 	uint32_t dmaster;
-	uint16_t laccessor;
-	uint16_t lacount;
+	uint32_t reserved1;
 #define CTDB_REC_FLAG_DEFAULT			0x00000000
 #define CTDB_REC_FLAG_MIGRATED_WITH_DATA	0x00010000
 #define CTDB_REC_FLAG_VACUUM_MIGRATED		0x00020000
@@ -530,6 +523,10 @@ struct ctdb_ltdb_header {
 #define CTDB_REC_RO_HAVE_READONLY		0x02000000
 #define CTDB_REC_RO_REVOKING_READONLY		0x04000000
 #define CTDB_REC_RO_REVOKE_COMPLETE		0x08000000
+#define CTDB_REC_RO_FLAGS			(CTDB_REC_RO_HAVE_DELEGATIONS|\
+						 CTDB_REC_RO_HAVE_READONLY|\
+						 CTDB_REC_RO_REVOKING_READONLY|\
+						 CTDB_REC_RO_REVOKE_COMPLETE)
 	uint32_t flags;
 };
 
@@ -576,9 +573,6 @@ struct ctdb_node_map {
 #define NODE_FLAGS_STOPPED		0x00000020 /* this node has been stopped */
 #define NODE_FLAGS_DISABLED		(NODE_FLAGS_UNHEALTHY|NODE_FLAGS_PERMANENTLY_DISABLED)
 #define NODE_FLAGS_INACTIVE		(NODE_FLAGS_DELETED|NODE_FLAGS_DISCONNECTED|NODE_FLAGS_BANNED|NODE_FLAGS_STOPPED)
-
-#define NODE_FLAGS_NOIPTAKEOVER		0x01000000 /* this node can takeover any new ip addresses, this flag is ONLY valid within the recovery daemon */
-
 
 /*
  * Node capabilities
@@ -709,10 +703,6 @@ struct ctdb_statistics_wire {
 /*
  * db statistics
  */
-struct ctdb_db_hot_key {
-	uint32_t count;
-	TDB_DATA key;
-};
 struct ctdb_db_statistics {
 	struct {
 		uint32_t num_calls;
@@ -726,14 +716,11 @@ struct ctdb_db_statistics {
 	uint32_t db_ro_revokes;
 	uint32_t hop_count_bucket[MAX_COUNT_BUCKETS];
 	uint32_t num_hot_keys;
-	struct ctdb_db_hot_key hot_keys[MAX_HOT_KEYS];
-};
-struct ctdb_db_statistics_wire {
-	uint32_t db_ro_delegations;
-	uint32_t db_ro_revokes;
-	uint32_t hop_count_bucket[MAX_COUNT_BUCKETS];
-	uint32_t num_hot_keys;
-	char hot_keys[1];
+	struct {
+		uint32_t count;
+		TDB_DATA key;
+	} hot_keys[MAX_HOT_KEYS];
+	char hot_keys_wire[1];
 };
 
 /*

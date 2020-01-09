@@ -59,12 +59,9 @@ static const struct {
 	{ "RecoveryDropAllIPs", 120,  offsetof(struct ctdb_tunable, recovery_drop_all_ips), false },
 	{ "VerifyRecoveryLock",   1,  offsetof(struct ctdb_tunable, verify_recovery_lock), false },
 	{ "VacuumInterval",   10,  offsetof(struct ctdb_tunable, vacuum_interval), false },
-	{ "VacuumDefaultInterval", 10,  offsetof(struct ctdb_tunable, vacuum_default_interval), true },
 	{ "VacuumMaxRunTime",     120,  offsetof(struct ctdb_tunable, vacuum_max_run_time), false },
 	{ "RepackLimit",      10000,  offsetof(struct ctdb_tunable, repack_limit), false },
 	{ "VacuumLimit",       5000,  offsetof(struct ctdb_tunable, vacuum_limit), false },
-	{ "VacuumMinInterval",   10,  offsetof(struct ctdb_tunable, vacuum_min_interval), true },
-	{ "VacuumMaxInterval",   10,  offsetof(struct ctdb_tunable, vacuum_max_interval), true },
 	{ "VacuumFastPathCount", 60, offsetof(struct ctdb_tunable, vacuum_fast_path_count), false },
 	{ "MaxQueueDropMsg",  1000000, offsetof(struct ctdb_tunable, max_queue_depth_drop_msg), false },
 	{ "UseStatusEvents",     0,  offsetof(struct ctdb_tunable, use_status_events_for_monitoring), false },
@@ -72,10 +69,9 @@ static const struct {
 	{ "StatHistoryInterval",  1,  offsetof(struct ctdb_tunable, stat_history_interval), false },
 	{ "DeferredAttachTO",  120,  offsetof(struct ctdb_tunable, deferred_attach_timeout), false },
 	{ "AllowClientDBAttach", 1, offsetof(struct ctdb_tunable, allow_client_db_attach), false },
-	{ "RecoverPDBBySeqNum",  0, offsetof(struct ctdb_tunable, recover_pdb_by_seqnum), false },
+	{ "RecoverPDBBySeqNum",  1, offsetof(struct ctdb_tunable, recover_pdb_by_seqnum), false },
 	{ "DeferredRebalanceOnNodeAdd", 300, offsetof(struct ctdb_tunable, deferred_rebalance_on_node_add) },
 	{ "FetchCollapse",       1, offsetof(struct ctdb_tunable, fetch_collapse) },
-	{ "MaxLACount",         20,  offsetof(struct ctdb_tunable, max_lacount) },
 	{ "HopcountMakeSticky",   50,  offsetof(struct ctdb_tunable, hopcount_make_sticky) },
 	{ "StickyDuration",      600,  offsetof(struct ctdb_tunable, sticky_duration) },
 	{ "StickyPindown",       200,  offsetof(struct ctdb_tunable, sticky_pindown) },
@@ -83,9 +79,8 @@ static const struct {
 	{ "DBRecordCountWarn",    100000,  offsetof(struct ctdb_tunable, db_record_count_warn), false },
 	{ "DBRecordSizeWarn",   10000000,  offsetof(struct ctdb_tunable, db_record_size_warn), false },
 	{ "DBSizeWarn",        100000000,  offsetof(struct ctdb_tunable, db_size_warn), false },
-	{ "PullDBPreallocation", 10*1024*10240,  offsetof(struct ctdb_tunable, pulldb_preallocation_size), false },
-	{ "NoIPTakeoverOnDisabled",    0,  offsetof(struct ctdb_tunable, no_ip_takeover_on_disabled), false },
-	{ "DeadlockTimeout",	300, offsetof(struct ctdb_tunable, deadlock_timeout), false },
+	{ "PullDBPreallocation", 10*1024*1024,  offsetof(struct ctdb_tunable, pulldb_preallocation_size), false },
+	{ "NoIPHostOnAllDisabled",    0,  offsetof(struct ctdb_tunable, no_ip_host_on_all_disabled), false },
 	{ "Samba3AvoidDeadlocks", 0, offsetof(struct ctdb_tunable, samba3_hack), false },
 };
 
@@ -128,7 +123,7 @@ int32_t ctdb_control_get_tunable(struct ctdb_context *ctdb, TDB_DATA indata,
 	talloc_free(name);
 	
 	if (i == ARRAY_SIZE(tunable_map)) {
-		return -1;
+		return -EINVAL;
 	}
 
 	val = *(uint32_t *)(tunable_map[i].offset + (uint8_t*)&ctdb->tunable);

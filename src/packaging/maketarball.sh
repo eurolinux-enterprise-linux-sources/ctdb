@@ -24,18 +24,21 @@
 # Optional argument is the directory to which tarball is copied.
 #
 
-DIRNAME=$(dirname $0)
-TOPDIR=${DIRNAME}/..
+TARGETDIR="${1:-${PWD}}"  # Default target directory is .
 
-TARGETDIR="$1"
-if [ -z "${TARGETDIR}" ]; then
-    TARGETDIR="."
-fi
+DIRNAME=$(dirname "$0")
+cd -P "${DIRNAME}/.."
+TOPDIR="$PWD"
+
+tmpd=$(mktemp -d) || {
+    echo "Failed to create temporary directory"
+    exit 1
+}
 
 TAR_PREFIX_TMP="ctdb-tmp"
-SPECFILE=/tmp/${TAR_PREFIX_TMP}/packaging/RPM/ctdb.spec
-SPECFILE_IN=${SPECFILE}.in
-VERSION_H=/tmp/${TAR_PREFIX_TMP}/include/version.h
+SPECFILE="${tmpd}/${TAR_PREFIX_TMP}/packaging/RPM/ctdb.spec"
+SPECFILE_IN="${SPECFILE}.in"
+VERSION_H="${tmpd}/${TAR_PREFIX_TMP}/include/ctdb_version.h"
 
 if echo | gzip -c --rsyncable - > /dev/null 2>&1 ; then
 	GZIP="gzip -9 --rsyncable"
@@ -43,77 +46,66 @@ else
 	GZIP="gzip -9"
 fi
 
-pushd ${TOPDIR}
 echo "Creating tarball ... "
-git archive --prefix=${TAR_PREFIX_TMP}/ HEAD | ( cd /tmp ; tar xf - )
-RC=$?
-popd
-if [ $RC -ne 0 ]; then
+git archive --prefix="${TAR_PREFIX_TMP}/" HEAD | ( cd "$tmpd" ; tar xf - )
+if [ $? -ne 0 ]; then
 	echo "Error calling git archive."
 	exit 1
 fi
 
-VERSION=$(${TOPDIR}/packaging/mkversion.sh ${VERSION_H})
-if [ -z "$VERSION" ]; then
+set -- $("${TOPDIR}/packaging/mkversion.sh" "$VERSION_H")
+VERSION=$1
+RELEASE=$2
+if [ -z "$VERSION" -o -z "$RELEASE" ]; then
     exit 1
 fi
 
-sed -e s/@VERSION@/${VERSION}/g \
+sed -e "s/@VERSION@/${VERSION}/g" \
+    -e "s/@RELEASE@/$RELEASE/g" \
 	< ${SPECFILE_IN} \
 	> ${SPECFILE}
 
 TAR_PREFIX="ctdb-${VERSION}"
 TAR_BASE="ctdb-${VERSION}"
 
-pushd /tmp/${TAR_PREFIX_TMP}
-./autogen.sh
-RC=$?
-if [ $RC -ne 0 ]; then
+cd "${tmpd}/${TAR_PREFIX_TMP}"
+./autogen.sh || {
 	echo "Error calling autogen.sh."
 	exit 1
-fi
+}
 
-make -C doc
-RC=$?
-if [ $RC -ne 0 ]; then
+make -C doc || {
     echo "Error building docs."
     exit 1
-fi
-popd
+}
 
-if test "x${DEBIAN_MODE}" = "xyes" ; then
+if [ "$DEBIAN_MODE" = "yes" ] ; then
 	TAR_PREFIX="ctdb-${VERSION}.orig"
 	TAR_BASE="ctdb_${VERSION}.orig"
-	rm -rf /tmp/${TAR_PREFIX_TMP}/lib/popt
+	rm -rf "${tmpd}/${TAR_PREFIX_TMP}/lib/popt"
 fi
 
-TAR_BALL=${TAR_BASE}.tar
-TAR_GZ_BALL=${TAR_BALL}.gz
+TAR_BALL="${TAR_BASE}.tar"
+TAR_GZ_BALL="${TAR_BALL}.gz"
 
-mv /tmp/${TAR_PREFIX_TMP} /tmp/${TAR_PREFIX}
+mv "${tmpd}/${TAR_PREFIX_TMP}" "${tmpd}/${TAR_PREFIX}"
 
-pushd /tmp
-tar cf ${TAR_BALL} ${TAR_PREFIX}
-RC=$?
-if [ $RC -ne 0 ]; then
-	popd
+cd "$tmpd"
+tar cf "$TAR_BALL" "$TAR_PREFIX" || {
         echo "Creation of tarball failed."
         exit 1
-fi
+}
 
-${GZIP} ${TAR_BALL}
-RC=$?
-if [ $RC -ne 0 ]; then
-	popd
+$GZIP "$TAR_BALL" || {
         echo "Zipping tarball failed."
         exit 1
-fi
+}
 
-rm -rf ${TAR_PREFIX}
+rm -rf "$TAR_PREFIX"
 
-popd
+mv "${tmpd}/${TAR_GZ_BALL}" "${TARGETDIR}/"
 
-mv /tmp/${TAR_GZ_BALL} ${TARGETDIR}/
+rmdir "$tmpd"
 
 echo "Done."
 exit 0

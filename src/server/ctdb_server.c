@@ -18,7 +18,7 @@
 */
 
 #include "includes.h"
-#include "lib/tdb/include/tdb.h"
+#include "tdb.h"
 #include "lib/util/dlinklist.h"
 #include "system/network.h"
 #include "system/filesys.h"
@@ -74,42 +74,6 @@ int ctdb_set_recovery_lock_file(struct ctdb_context *ctdb, const char *file)
 	ctdb->recovery_lock_file = talloc_strdup(ctdb, file);
 	CTDB_NO_MEMORY(ctdb, ctdb->recovery_lock_file);
 
-	return 0;
-}
-
-/*
-  set the directory for the local databases
-*/
-int ctdb_set_tdb_dir(struct ctdb_context *ctdb, const char *dir)
-{
-	ctdb->db_directory = talloc_strdup(ctdb, dir);
-	if (ctdb->db_directory == NULL) {
-		return -1;
-	}
-	return 0;
-}
-
-/*
-  set the directory for the persistent databases
-*/
-int ctdb_set_tdb_dir_persistent(struct ctdb_context *ctdb, const char *dir)
-{
-	ctdb->db_directory_persistent = talloc_strdup(ctdb, dir);
-	if (ctdb->db_directory_persistent == NULL) {
-		return -1;
-	}
-	return 0;
-}
-
-/*
-  set the directory for internal state databases
-*/
-int ctdb_set_tdb_dir_state(struct ctdb_context *ctdb, const char *dir)
-{
-	ctdb->db_directory_state = talloc_strdup(ctdb, dir);
-	if (ctdb->db_directory_state == NULL) {
-		return -1;
-	}
 	return 0;
 }
 
@@ -197,7 +161,7 @@ static int ctdb_add_deleted_node(struct ctdb_context *ctdb)
 /*
   setup the node list from a file
 */
-int ctdb_set_nlist(struct ctdb_context *ctdb, const char *nlist)
+static int ctdb_set_nlist(struct ctdb_context *ctdb, const char *nlist)
 {
 	char **lines;
 	int nlines;
@@ -265,6 +229,16 @@ int ctdb_set_nlist(struct ctdb_context *ctdb, const char *nlist)
 	return 0;
 }
 
+void ctdb_load_nodes_file(struct ctdb_context *ctdb)
+{
+	int ret;
+
+	ret = ctdb_set_nlist(ctdb, ctdb->nodes_file);
+	if (ret == -1) {
+		DEBUG(DEBUG_ALERT,("ctdb_set_nlist failed - %s\n", ctdb_errstr(ctdb)));
+		exit(1);
+	}
+}
 
 /*
   setup the local node address
@@ -451,8 +425,9 @@ void ctdb_node_connected(struct ctdb_node *node)
 	node->dead_count = 0;
 	node->flags &= ~NODE_FLAGS_DISCONNECTED;
 	node->flags |= NODE_FLAGS_UNHEALTHY;
-	DEBUG(DEBUG_INFO,("%s: connected to %s - %u connected\n", 
-		 node->ctdb->name, node->name, node->ctdb->num_connected));
+	DEBUG(DEBUG_NOTICE,
+	      ("%s: connected to %s - %u connected\n", 
+	       node->ctdb->name, node->name, node->ctdb->num_connected));
 }
 
 struct queue_next {

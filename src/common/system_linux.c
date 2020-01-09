@@ -28,6 +28,7 @@
 #include <netinet/icmp6.h>
 #include <net/if_arp.h>
 #include <netpacket/packet.h>
+#include <sys/prctl.h>
 
 #ifndef ETHERTYPE_IP6
 #define ETHERTYPE_IP6 0x86dd
@@ -74,7 +75,7 @@ int ctdb_sys_send_arp(const ctdb_sock_addr *addr, const char *iface)
 	struct ether_header *eh;
 	struct arphdr *ah;
 	struct ip6_hdr *ip6;
-	struct icmp6_hdr *icmp6;
+	struct nd_neighbor_solicit *nd_ns;
 	struct ifreq if_hwaddr;
 	unsigned char buffer[78]; /* ipv6 neigh solicitation size */
 	char *ptr;
@@ -82,6 +83,8 @@ int ctdb_sys_send_arp(const ctdb_sock_addr *addr, const char *iface)
 	struct ifreq ifr;
 
 	ZERO_STRUCT(sall);
+	ZERO_STRUCT(ifr);
+	ZERO_STRUCT(if_hwaddr);
 
 	switch (addr->ip.sin_family) {
 	case AF_INET:
@@ -92,7 +95,7 @@ int ctdb_sys_send_arp(const ctdb_sock_addr *addr, const char *iface)
 		}
 
 		DEBUG(DEBUG_DEBUG, (__location__ " Created SOCKET FD:%d for sending arp\n", s));
-		strncpy(ifr.ifr_name, iface, sizeof(ifr.ifr_name));
+		strncpy(ifr.ifr_name, iface, sizeof(ifr.ifr_name)-1);
 		if (ioctl(s, SIOCGIFINDEX, &ifr) < 0) {
 			DEBUG(DEBUG_CRIT,(__location__ " interface '%s' not found\n", iface));
 			close(s);
@@ -100,7 +103,7 @@ int ctdb_sys_send_arp(const ctdb_sock_addr *addr, const char *iface)
 		}
 
 		/* get the mac address */
-		strcpy(if_hwaddr.ifr_name, iface);
+		strncpy(if_hwaddr.ifr_name, iface, sizeof(if_hwaddr.ifr_name)-1);
 		ret = ioctl(s, SIOCGIFHWADDR, &if_hwaddr);
 		if ( ret < 0 ) {
 			close(s);
@@ -194,7 +197,7 @@ int ctdb_sys_send_arp(const ctdb_sock_addr *addr, const char *iface)
 		}
 
 		/* get the mac address */
-		strcpy(if_hwaddr.ifr_name, iface);
+		strncpy(if_hwaddr.ifr_name, iface, sizeof(if_hwaddr.ifr_name)-1);
 		ret = ioctl(s, SIOCGIFHWADDR, &if_hwaddr);
 		if ( ret < 0 ) {
 			close(s);
@@ -222,17 +225,18 @@ int ctdb_sys_send_arp(const ctdb_sock_addr *addr, const char *iface)
 
 		ip6 = (struct ip6_hdr *)(eh+1);
 		ip6->ip6_vfc  = 0x60;
-		ip6->ip6_plen = htons(24);
+		ip6->ip6_plen = htons(sizeof(*nd_ns));
 		ip6->ip6_nxt  = IPPROTO_ICMPV6;
 		ip6->ip6_hlim = 255;
 		ip6->ip6_dst  = addr->ip6.sin6_addr;
 
-		icmp6 = (struct icmp6_hdr *)(ip6+1);
-		icmp6->icmp6_type = ND_NEIGHBOR_SOLICIT;
-		icmp6->icmp6_code = 0;
-		memcpy(&icmp6->icmp6_data32[1], &addr->ip6.sin6_addr, 16);
+		nd_ns = (struct nd_neighbor_solicit *)(ip6+1);
+		nd_ns->nd_ns_type = ND_NEIGHBOR_SOLICIT;
+		nd_ns->nd_ns_code = 0;
+		nd_ns->nd_ns_reserved = 0;
+		nd_ns->nd_ns_target = addr->ip6.sin6_addr;
 
-		icmp6->icmp6_cksum = tcp_checksum6((uint16_t *)icmp6, ntohs(ip6->ip6_plen), ip6);
+		nd_ns->nd_ns_cksum = tcp_checksum6((uint16_t *)nd_ns, ntohs(ip6->ip6_plen), ip6);
 
 		sall.sll_family = AF_PACKET;
 		sall.sll_halen = 6;
@@ -552,7 +556,7 @@ bool ctdb_sys_check_iface_exists(const char *iface)
 		return true;
 	}
 
-	strncpy(ifr.ifr_name, iface, sizeof(ifr.ifr_name));
+	strncpy(ifr.ifr_name, iface, sizeof(ifr.ifr_name)-1);
 	if (ioctl(s, SIOCGIFINDEX, &ifr) < 0 && errno == ENODEV) {
 		DEBUG(DEBUG_CRIT,(__location__ " interface '%s' not found\n", iface));
 		close(s);
@@ -585,7 +589,7 @@ char *ctdb_get_process_name(pid_t pid)
 	int n;
 
 	snprintf(path, sizeof(path), "/proc/%d/exe", pid);
-	n = readlink(path, buf, sizeof(buf));
+	n = readlink(path, buf, sizeof(buf)-1);
 	if (n < 0) {
 		return NULL;
 	}
@@ -593,9 +597,20 @@ char *ctdb_get_process_name(pid_t pid)
 	/* Remove any extra fields */
 	buf[n] = '\0';
 	ptr = strtok(buf, " ");
-	return strdup(ptr);
+	return (ptr == NULL ? ptr : strdup(ptr));
 }
 
+/*
+ * Set process name
+ */
+int ctdb_set_process_name(const char *name)
+{
+	char procname[16];
+
+	strncpy(procname, name, 15);
+	procname[15] = '\0';
+	return prctl(PR_SET_NAME, (unsigned long)procname, 0, 0, 0);
+}
 
 /*
  * Parsing a line from /proc/locks,
@@ -688,14 +703,13 @@ bool ctdb_get_lock_info(pid_t req_pid, struct ctdb_lock_info *lock_info)
 	struct ctdb_lock_info curlock;
 	pid_t pid;
 	char buf[1024];
-	char *ptr;
 	bool status = false;
 
 	if ((fp = fopen("/proc/locks", "r")) == NULL) {
 		DEBUG(DEBUG_ERR, ("Failed to read locks information"));
 		return false;
 	}
-	while ((ptr = fgets(buf, sizeof(buf), fp)) != NULL) {
+	while (fgets(buf, sizeof(buf), fp) != NULL) {
 		if (! parse_proc_locks_line(buf, &pid, &curlock)) {
 			continue;
 		}
@@ -720,14 +734,13 @@ bool ctdb_get_blocker_pid(struct ctdb_lock_info *reqlock, pid_t *blocker_pid)
 	struct ctdb_lock_info curlock;
 	pid_t pid;
 	char buf[1024];
-	char *ptr;
 	bool status = false;
 
 	if ((fp = fopen("/proc/locks", "r")) == NULL) {
 		DEBUG(DEBUG_ERR, ("Failed to read locks information"));
 		return false;
 	}
-	while ((ptr = fgets(buf, sizeof(buf), fp)) != NULL) {
+	while (fgets(buf, sizeof(buf), fp) != NULL) {
 		if (! parse_proc_locks_line(buf, &pid, &curlock)) {
 			continue;
 		}

@@ -23,20 +23,56 @@
 #include "../include/ctdb_private.h"
 #include "../common/rb_tree.h"
 
+static bool is_child = false;
+
+void ctdb_set_child_info(TALLOC_CTX *mem_ctx, const char *child_name_fmt, ...)
+{
+	is_child = true;
+	if (child_name_fmt != NULL) {
+		va_list ap;
+		char *t;
+
+		va_start(ap, child_name_fmt);
+		t = talloc_vasprintf(mem_ctx, child_name_fmt, ap);
+		debug_extra = talloc_asprintf(mem_ctx, "%s:", t);
+		talloc_free(t);
+		va_end(ap);
+	}
+}
+
+bool ctdb_is_child_process(void)
+{
+	return is_child;
+}
+
+void ctdb_track_child(struct ctdb_context *ctdb, pid_t pid)
+{
+	char *process;
+
+	/* Only CTDB main daemon should track child processes */
+	if (getpid() != ctdb->ctdbd_pid) {
+		return;
+	}
+
+	process = talloc_asprintf(ctdb->child_processes, "process:%d", (int)pid);
+	trbt_insert32(ctdb->child_processes, pid, process);
+}
+
 /*
  * This function forks a child process and drops the realtime 
  * scheduler for the child process.
  */
-pid_t ctdb_fork(struct ctdb_context *ctdb)
+pid_t ctdb_fork_no_free_ringbuffer(struct ctdb_context *ctdb)
 {
 	pid_t pid;
-	char *process;
 
 	pid = fork();
 	if (pid == -1) {
 		return -1;
 	}
 	if (pid == 0) {
+		ctdb_set_child_info(ctdb, NULL);
+
 		/* Close the Unix Domain socket and the TCP socket.
 		 * This ensures that none of the child processes will
 		 * look like the main daemon when it is not running.
@@ -59,19 +95,25 @@ pid_t ctdb_fork(struct ctdb_context *ctdb)
 			ctdb_restore_scheduler(ctdb);
 		}
 		ctdb->can_send_controls = false;
+
 		return 0;
 	}
 
-	if (getpid() != ctdb->ctdbd_pid) {
-		return pid;
-	}
-
-	process = talloc_asprintf(ctdb->child_processes, "process:%d", (int)pid);
-	trbt_insert32(ctdb->child_processes, pid, process);
-
+	ctdb_track_child(ctdb, pid);
 	return pid;
 }
 
+pid_t ctdb_fork(struct ctdb_context *ctdb)
+{
+	pid_t pid;
+
+	pid = ctdb_fork_no_free_ringbuffer(ctdb);
+	if (pid == 0) {
+		ctdb_log_ringbuffer_free();
+	}
+
+	return pid;
+}
 
 
 static void ctdb_sigchld_handler(struct tevent_context *ev,

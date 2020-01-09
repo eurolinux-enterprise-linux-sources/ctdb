@@ -1,13 +1,22 @@
 '\" t
 .\"     Title: ping_pong
-.\"    Author: [FIXME: author] [see http://docbook.sf.net/el/author]
-.\" Generator: DocBook XSL Stylesheets v1.75.2 <http://docbook.sf.net/>
-.\"      Date: 01/09/2013
-.\"    Manual:  
-.\"    Source:  
+.\"    Author: 
+.\" Generator: DocBook XSL Stylesheets v1.78.1 <http://docbook.sf.net/>
+.\"      Date: 11/27/2013
+.\"    Manual: CTDB - clustered TDB database
+.\"    Source: ctdb
 .\"  Language: English
 .\"
-.TH "PING_PONG" "1" "01/09/2013" "" ""
+.TH "PING_PONG" "1" "11/27/2013" "ctdb" "CTDB \- clustered TDB database"
+.\" -----------------------------------------------------------------
+.\" * Define some portability stuff
+.\" -----------------------------------------------------------------
+.\" ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+.\" http://bugs.debian.org/507673
+.\" http://lists.gnu.org/archive/html/groff/2009-02/msg00013.html
+.\" ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+.ie \n(.g .ds Aq \(aq
+.el       .ds Aq '
 .\" -----------------------------------------------------------------
 .\" * set default formatting
 .\" -----------------------------------------------------------------
@@ -21,23 +30,25 @@
 .SH "NAME"
 ping_pong \- measures the ping\-pong byte range lock latency
 .SH "SYNOPSIS"
-.HP \w'\fBping_pong\ [options]\ <file>\ <num_locks>\fR\ 'u
-\fBping_pong [options] <file> <num_locks>\fR
 .HP \w'\fBping_pong\fR\ 'u
-\fBping_pong\fR [\-r] [\-w] [\-m] [\-c]
+\fBping_pong\fR {\-r | \-w | \-rw} [\-m] [\-c] {\fIFILENAME\fR} {\fINUM\-LOCKS\fR}
 .SH "DESCRIPTION"
 .PP
-This measures the ping\-pong byte range lock latency\&. It is especially useful on a cluster of nodes sharing a common lock manager as it will give some indication of the lock managers performance under stress\&.
+ping_pong measures the byte range lock latency\&. It is especially useful on a cluster of nodes sharing a common lock manager as it will give some indication of the lock manager\*(Aqs performance under stress\&.
+.PP
+FILENAME is a file on shared storage to use for byte range locking tests\&.
+.PP
+NUM\-LOCKS is the number of byte range locks, so needs to be (strictly) greater than the number of nodes in the cluster\&.
 .SH "OPTIONS"
 .PP
 \-r
 .RS 4
-do reads
+test read performance
 .RE
 .PP
 \-w
 .RS 4
-do writes
+test write performance
 .RE
 .PP
 \-m
@@ -91,29 +102,21 @@ Testing IO coherence
 .\}
 .SH "SEE ALSO"
 .PP
-
-\m[blue]\fB\%https://wiki.samba.org/index.php/Ping_pong\fR\m[], ctdb(1), ctdbd(1)
-.SH "COPYRIGHT/LICENSE"
+\fBctdb\fR(7),
+\m[blue]\fB\%https://wiki.samba.org/index.php/Ping_pong\fR\m[]
+.SH "AUTHOR"
+.br
+.PP
+This documentation was written by Mathieu Parent
+.SH "COPYRIGHT"
+.br
+Copyright \(co 2002 Andrew Tridgell
+.br
+.PP
+This program is free software; you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation; either version 3 of the License, or (at your option) any later version\&.
+.PP
+This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE\&. See the GNU General Public License for more details\&.
+.PP
+You should have received a copy of the GNU General Public License along with this program; if not, see
+\m[blue]\fB\%http://www.gnu.org/licenses\fR\m[]\&.
 .sp
-.if n \{\
-.RS 4
-.\}
-.nf
-Copyright (C) Andrew Tridgell 2002
-
-This program is free software; you can redistribute it and/or modify
-it under the terms of the GNU General Public License as published by
-the Free Software Foundation; either version 3 of the License, or (at
-your option) any later version\&.
-
-This program is distributed in the hope that it will be useful, but
-WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE\&.  See the GNU
-General Public License for more details\&.
-
-You should have received a copy of the GNU General Public License
-along with this program; if not, see http://www\&.gnu\&.org/licenses/\&.
-.fi
-.if n \{\
-.RE
-.\}

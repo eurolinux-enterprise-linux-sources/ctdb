@@ -21,7 +21,7 @@
 #include "system/filesys.h"
 #include "system/wait.h"
 #include "db_wrap.h"
-#include "lib/tdb/include/tdb.h"
+#include "tdb.h"
 #include "../include/ctdb_private.h"
 #include "lib/util/dlinklist.h"
 
@@ -38,38 +38,46 @@ struct ctdb_traverse_local_handle {
 	pid_t child;
 	uint64_t srvid;
 	uint32_t client_reqid;
+	uint32_t reqid;
+	int srcnode;
 	void *private_data;
 	ctdb_traverse_fn_t callback;
-	struct timeval start_time;
-	struct ctdb_queue *queue;
 	bool withemptyrecords;
+	struct tevent_fd *fde;
+	int records_failed;
+	int records_sent;
 };
 
 /*
-  called when data is available from the child
+ * called when traverse is completed by child or on error
  */
-static void ctdb_traverse_local_handler(uint8_t *rawdata, size_t length, void *private_data)
+static void ctdb_traverse_child_handler(struct tevent_context *ev, struct tevent_fd *fde,
+					uint16_t flags, void *private_data)
 {
-	struct ctdb_traverse_local_handle *h = talloc_get_type(private_data, 
-							       struct ctdb_traverse_local_handle);
-	TDB_DATA key, data;
+	struct ctdb_traverse_local_handle *h = talloc_get_type(private_data,
+							struct ctdb_traverse_local_handle);
 	ctdb_traverse_fn_t callback = h->callback;
 	void *p = h->private_data;
-	struct ctdb_rec_data *tdata = (struct ctdb_rec_data *)rawdata;
+	int res;
+	ssize_t n;
 
-	if (rawdata == NULL || length < 4 || length != tdata->length) {
-		/* end of traverse */
-		talloc_free(h);
-		callback(p, tdb_null, tdb_null);
-		return;
+	/* Read the number of records sent by traverse child */
+	n = read(h->fd[0], &res, sizeof(res));
+	if (n < 0 || n != sizeof(res)) {
+		/* Traverse child failed */
+		DEBUG(DEBUG_ERR, ("Local traverse failed db:%s reqid:%d\n",
+				  h->ctdb_db->db_name, h->reqid));
+	} else if (res < 0) {
+		/* Traverse failed */
+		res = -res;
+		DEBUG(DEBUG_ERR, ("Local traverse failed db:%s reqid:%d records:%d\n",
+				  h->ctdb_db->db_name, h->reqid, res));
+	} else {
+		DEBUG(DEBUG_INFO, ("Local traverse end db:%s reqid:%d records:%d\n",
+				   h->ctdb_db->db_name, h->reqid, res));
 	}
 
-	key.dsize = tdata->keylen;
-	key.dptr  = &tdata->data[0];
-	data.dsize = tdata->datalen;
-	data.dptr = &tdata->data[tdata->keylen];
-
-	callback(p, key, data);	
+	callback(p, tdb_null, tdb_null);
 }
 
 /*
@@ -87,10 +95,12 @@ static int traverse_local_destructor(struct ctdb_traverse_local_handle *h)
  */
 static int ctdb_traverse_local_fn(struct tdb_context *tdb, TDB_DATA key, TDB_DATA data, void *p)
 {
-	struct ctdb_traverse_local_handle *h = talloc_get_type(p, 
+	struct ctdb_traverse_local_handle *h = talloc_get_type(p,
 							       struct ctdb_traverse_local_handle);
 	struct ctdb_rec_data *d;
 	struct ctdb_ltdb_header *hdr;
+	int res, status;
+	TDB_DATA outdata;
 
 	hdr = (struct ctdb_ltdb_header *)data.dptr;
 
@@ -108,15 +118,24 @@ static int ctdb_traverse_local_fn(struct tdb_context *tdb, TDB_DATA key, TDB_DAT
 		}
 	}
 
-	d = ctdb_marshall_record(h, 0, key, NULL, data);
+	d = ctdb_marshall_record(h, h->reqid, key, NULL, data);
 	if (d == NULL) {
 		/* error handling is tricky in this child code .... */
+		h->records_failed++;
 		return -1;
 	}
 
-	if (write(h->fd[1], (uint8_t *)d, d->length) != d->length) {
+	outdata.dptr = (uint8_t *)d;
+	outdata.dsize = d->length;
+
+	res = ctdb_control(h->ctdb_db->ctdb, h->srcnode, 0, CTDB_CONTROL_TRAVERSE_DATA,
+			   CTDB_CTRL_FLAG_NOREPLY, outdata, NULL, NULL, &status, NULL, NULL);
+	if (res != 0 || status != 0) {
+		h->records_failed++;
 		return -1;
 	}
+
+	h->records_sent++;
 	return 0;
 }
 
@@ -169,15 +188,66 @@ static struct ctdb_traverse_local_handle *ctdb_traverse_local(struct ctdb_db_con
 	h->private_data = all_state;
 	h->ctdb_db = ctdb_db;
 	h->client_reqid = all_state->client_reqid;
+	h->reqid = all_state->reqid;
 	h->srvid = all_state->srvid;
+	h->srcnode = all_state->srcnode;
 	h->withemptyrecords = all_state->withemptyrecords;
 
 	if (h->child == 0) {
 		/* start the traverse in the child */
+		int res, status;
+		pid_t parent = getpid();
+		struct ctdb_context *ctdb = ctdb_db->ctdb;
+		struct ctdb_rec_data *d;
+		TDB_DATA outdata;
+
 		close(h->fd[0]);
-		debug_extra = talloc_asprintf(NULL, "traverse_local-%s:",
-					      ctdb_db->db_name);
-		tdb_traverse_read(ctdb_db->ltdb->tdb, ctdb_traverse_local_fn, h);
+
+		ctdb_set_process_name("ctdb_traverse");
+		if (switch_from_server_to_client(ctdb, "traverse_local-%s:",
+						 ctdb_db->db_name) != 0) {
+			DEBUG(DEBUG_CRIT, ("Failed to switch traverse child into client mode\n"));
+			_exit(0);
+		}
+
+		d = ctdb_marshall_record(h, h->reqid, tdb_null, NULL, tdb_null);
+		if (d == NULL) {
+			res = 0;
+			write(h->fd[1], &res, sizeof(int));
+			_exit(0);
+		}
+
+		res = tdb_traverse_read(ctdb_db->ltdb->tdb, ctdb_traverse_local_fn, h);
+		if (res == -1 || h->records_failed > 0) {
+			/* traverse failed */
+			res = -(h->records_sent);
+		} else {
+			res = h->records_sent;
+		}
+
+		/* Wait till all the data is flushed from output queue */
+		while (ctdb_queue_length(ctdb->daemon.queue) > 0) {
+			tevent_loop_once(ctdb->ev);
+		}
+
+		/* End traverse by sending empty record */
+		outdata.dptr = (uint8_t *)d;
+		outdata.dsize = d->length;
+		ret = ctdb_control(ctdb, h->srcnode, 0,
+				   CTDB_CONTROL_TRAVERSE_DATA,
+				   CTDB_CTRL_FLAG_NOREPLY, outdata,
+				   NULL, NULL, &status, NULL, NULL);
+		if (ret == -1 || status == -1) {
+			if (res > 0) {
+				res = -res;
+			}
+		}
+
+		write(h->fd[1], &res, sizeof(res));
+
+		while (ctdb_kill(ctdb, parent, 0) == 0 || errno != ESRCH) {
+			sleep(5);
+		}
 		_exit(0);
 	}
 
@@ -188,20 +258,14 @@ static struct ctdb_traverse_local_handle *ctdb_traverse_local(struct ctdb_db_con
 
 	DLIST_ADD(ctdb_db->traverse, h);
 
-	/*
-	  setup a packet queue between the child and the parent. This
-	  copes with all the async and packet boundary issues
-	 */
-	DEBUG(DEBUG_DEBUG, (__location__ " Created PIPE FD:%d to child traverse\n", h->fd[0]));
-
-	h->queue = ctdb_queue_setup(ctdb_db->ctdb, h, h->fd[0], 0, ctdb_traverse_local_handler, h,
-				    "to-ctdbd");
-	if (h->queue == NULL) {
+	h->fde = tevent_add_fd(ctdb_db->ctdb->ev, h, h->fd[0], EVENT_FD_READ,
+			       ctdb_traverse_child_handler, h);
+	if (h->fde == NULL) {
+		close(h->fd[0]);
 		talloc_free(h);
 		return NULL;
 	}
-
-	h->start_time = timeval_current();
+	tevent_fd_set_auto_close(h->fde);
 
 	return h;
 }
@@ -214,6 +278,7 @@ struct ctdb_traverse_all_handle {
 	ctdb_traverse_fn_t callback;
 	void *private_data;
 	uint32_t null_count;
+	bool timedout;
 };
 
 /*
@@ -231,6 +296,14 @@ struct ctdb_traverse_all {
 	uint32_t pnn;
 	uint32_t client_reqid;
 	uint64_t srvid;
+};
+
+struct ctdb_traverse_all_ext {
+	uint32_t db_id;
+	uint32_t reqid;
+	uint32_t pnn;
+	uint32_t client_reqid;
+	uint64_t srvid;
 	bool withemptyrecords;
 };
 
@@ -243,6 +316,7 @@ static void ctdb_traverse_all_timeout(struct event_context *ev, struct timed_eve
 	DEBUG(DEBUG_ERR,(__location__ " Traverse all timeout on database:%s\n", state->ctdb_db->db_name));
 	CTDB_INCREMENT_STAT(state->ctdb, timeouts.traverse);
 
+	state->timedout = true;
 	state->callback(state->private_data, tdb_null, tdb_null);
 }
 
@@ -255,13 +329,14 @@ struct traverse_start_state {
 	uint32_t db_id;
 	uint64_t srvid;
 	bool withemptyrecords;
+	int num_records;
 };
 
 
 /*
   setup a cluster-wide non-blocking traverse of a ctdb. The
   callback function will be called on every record in the local
-  ltdb. To stop the travserse, talloc_free() the traverse_handle.
+  ltdb. To stop the traverse, talloc_free() the traverse_handle.
 
   The traverse is finished when the callback is called with tdb_null
   for key and data
@@ -275,6 +350,7 @@ static struct ctdb_traverse_all_handle *ctdb_daemon_traverse_all(struct ctdb_db_
 	int ret;
 	TDB_DATA data;
 	struct ctdb_traverse_all r;
+	struct ctdb_traverse_all_ext r_ext;
 	uint32_t destination;
 
 	state = talloc(start_state, struct ctdb_traverse_all_handle);
@@ -288,18 +364,30 @@ static struct ctdb_traverse_all_handle *ctdb_daemon_traverse_all(struct ctdb_db_
 	state->callback     = callback;
 	state->private_data = start_state;
 	state->null_count   = 0;
+	state->timedout     = false;
 	
 	talloc_set_destructor(state, ctdb_traverse_all_destructor);
 
-	r.db_id = ctdb_db->db_id;
-	r.reqid = state->reqid;
-	r.pnn   = ctdb->pnn;
-	r.client_reqid = start_state->reqid;
-	r.srvid = start_state->srvid;
-	r.withemptyrecords = start_state->withemptyrecords;
+	if (start_state->withemptyrecords) {
+		r_ext.db_id = ctdb_db->db_id;
+		r_ext.reqid = state->reqid;
+		r_ext.pnn   = ctdb->pnn;
+		r_ext.client_reqid = start_state->reqid;
+		r_ext.srvid = start_state->srvid;
+		r_ext.withemptyrecords = start_state->withemptyrecords;
 
-	data.dptr = (uint8_t *)&r;
-	data.dsize = sizeof(r);
+		data.dptr = (uint8_t *)&r_ext;
+		data.dsize = sizeof(r_ext);
+	} else {
+		r.db_id = ctdb_db->db_id;
+		r.reqid = state->reqid;
+		r.pnn   = ctdb->pnn;
+		r.client_reqid = start_state->reqid;
+		r.srvid = start_state->srvid;
+
+		data.dptr = (uint8_t *)&r;
+		data.dsize = sizeof(r);
+	}
 
 	if (ctdb_db->persistent == 0) {
 		/* normal database, traverse all nodes */	  
@@ -328,14 +416,24 @@ static struct ctdb_traverse_all_handle *ctdb_daemon_traverse_all(struct ctdb_db_
 	 * node, or if it is a persistent database, just tell the local
 	 * node
 	 */
-	ret = ctdb_daemon_send_control(ctdb, destination, 0, 
-			       CTDB_CONTROL_TRAVERSE_ALL,
-			       0, CTDB_CTRL_FLAG_NOREPLY, data, NULL, NULL);
+
+	if (start_state->withemptyrecords) {
+		ret = ctdb_daemon_send_control(ctdb, destination, 0,
+				       CTDB_CONTROL_TRAVERSE_ALL_EXT,
+				       0, CTDB_CTRL_FLAG_NOREPLY, data, NULL, NULL);
+	} else {
+		ret = ctdb_daemon_send_control(ctdb, destination, 0,
+				       CTDB_CONTROL_TRAVERSE_ALL,
+				       0, CTDB_CTRL_FLAG_NOREPLY, data, NULL, NULL);
+	}
 
 	if (ret != 0) {
 		talloc_free(state);
 		return NULL;
 	}
+
+	DEBUG(DEBUG_NOTICE,("Starting traverse on DB %s (id %d)\n",
+			    ctdb_db->db_name, state->reqid));
 
 	/* timeout the traverse */
 	event_add_timed(ctdb->ev, state, 
@@ -346,35 +444,64 @@ static struct ctdb_traverse_all_handle *ctdb_daemon_traverse_all(struct ctdb_db_
 }
 
 /*
-  called for each record during a traverse all 
+  called when local traverse ends
  */
 static void traverse_all_callback(void *p, TDB_DATA key, TDB_DATA data)
 {
 	struct traverse_all_state *state = talloc_get_type(p, struct traverse_all_state);
-	int ret;
-	struct ctdb_rec_data *d;
-	TDB_DATA cdata;
 
-	d = ctdb_marshall_record(state, state->reqid, key, NULL, data);
-	if (d == NULL) {
-		/* darn .... */
-		DEBUG(DEBUG_ERR,("Out of memory in traverse_all_callback\n"));
-		return;
+	/* we're done */
+	talloc_free(state);
+}
+
+/*
+ * extended version to take the "withemptyrecords" parameter"
+ */
+int32_t ctdb_control_traverse_all_ext(struct ctdb_context *ctdb, TDB_DATA data, TDB_DATA *outdata)
+{
+	struct ctdb_traverse_all_ext *c = (struct ctdb_traverse_all_ext *)data.dptr;
+	struct traverse_all_state *state;
+	struct ctdb_db_context *ctdb_db;
+
+	if (data.dsize != sizeof(struct ctdb_traverse_all_ext)) {
+		DEBUG(DEBUG_ERR,(__location__ " Invalid size in ctdb_control_traverse_all_ext\n"));
+		return -1;
 	}
 
-	cdata.dptr = (uint8_t *)d;
-	cdata.dsize = d->length;
-
-	ret = ctdb_daemon_send_control(state->ctdb, state->srcnode, 0, CTDB_CONTROL_TRAVERSE_DATA,
-				       0, CTDB_CTRL_FLAG_NOREPLY, cdata, NULL, NULL);
-	if (ret != 0) {
-		DEBUG(DEBUG_ERR,("Failed to send traverse data\n"));
+	ctdb_db = find_ctdb_db(ctdb, c->db_id);
+	if (ctdb_db == NULL) {
+		return -1;
 	}
 
-	if (key.dsize == 0 && data.dsize == 0) {
-		/* we're done */
+	if (ctdb_db->unhealthy_reason) {
+		if (ctdb->tunable.allow_unhealthy_db_read == 0) {
+			DEBUG(DEBUG_ERR,("db(%s) unhealty in ctdb_control_traverse_all: %s\n",
+					ctdb_db->db_name, ctdb_db->unhealthy_reason));
+			return -1;
+		}
+		DEBUG(DEBUG_WARNING,("warn: db(%s) unhealty in ctdb_control_traverse_all: %s\n",
+				     ctdb_db->db_name, ctdb_db->unhealthy_reason));
+	}
+
+	state = talloc(ctdb_db, struct traverse_all_state);
+	if (state == NULL) {
+		return -1;
+	}
+
+	state->reqid = c->reqid;
+	state->srcnode = c->pnn;
+	state->ctdb = ctdb;
+	state->client_reqid = c->client_reqid;
+	state->srvid = c->srvid;
+	state->withemptyrecords = c->withemptyrecords;
+
+	state->h = ctdb_traverse_local(ctdb_db, traverse_all_callback, state);
+	if (state->h == NULL) {
 		talloc_free(state);
+		return -1;
 	}
+
+	return 0;
 }
 
 /*
@@ -418,7 +545,7 @@ int32_t ctdb_control_traverse_all(struct ctdb_context *ctdb, TDB_DATA data, TDB_
 	state->ctdb = ctdb;
 	state->client_reqid = c->client_reqid;
 	state->srvid = c->srvid;
-	state->withemptyrecords = c->withemptyrecords;
+	state->withemptyrecords = false;
 
 	state->h = ctdb_traverse_local(ctdb_db, traverse_all_callback, state);
 	if (state->h == NULL) {
@@ -549,9 +676,20 @@ static void traverse_start_callback(void *p, TDB_DATA key, TDB_DATA data)
 
 	ctdb_dispatch_message(state->ctdb, state->srvid, cdata);
 	if (key.dsize == 0 && data.dsize == 0) {
-		/* end of traverse */
-		talloc_set_destructor(state, NULL);
-		talloc_free(state);
+		DEBUG(DEBUG_NOTICE, ("Ending traverse on DB %s (id %d), records %d\n",
+				     state->h->ctdb_db->db_name, state->h->reqid,
+				     state->num_records));
+
+	    	if (state->h->timedout) {
+		    	/* timed out, send TRAVERSE_KILL control */
+			talloc_free(state);
+		} else {
+			/* end of traverse */
+			talloc_set_destructor(state, NULL);
+			talloc_free(state);
+		}
+	} else {
+		state->num_records++;
 	}
 }
 
@@ -607,6 +745,7 @@ int32_t ctdb_control_traverse_start_ext(struct ctdb_context *ctdb,
 	state->db_id = d->db_id;
 	state->ctdb = ctdb;
 	state->withemptyrecords = d->withemptyrecords;
+	state->num_records = 0;
 
 	state->h = ctdb_daemon_traverse_all(ctdb_db, traverse_start_callback, state);
 	if (state->h == NULL) {

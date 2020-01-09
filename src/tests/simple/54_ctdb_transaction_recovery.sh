@@ -28,7 +28,7 @@ recovery_loop()
 
 	while true ; do
 		echo Recovery $COUNT
-		ctdb recover
+		try_command_on_node 0 $CTDB recover
 		sleep 2
 		COUNT=$((COUNT + 1))
 	done
@@ -62,5 +62,5 @@ echo "Starting recovery loop"
 recovery_loop_start
 
 echo "Running ctdb_transaction on all $num_nodes nodes."
-try_command_on_node -v -pq all "$t & $t"
+try_command_on_node -v -p all "$t & $t"
 

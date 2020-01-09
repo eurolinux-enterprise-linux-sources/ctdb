@@ -90,6 +90,7 @@ void ctdb_run_notification_script(struct ctdb_context *ctdb, const char *event)
 	if (child == 0) {
 		int ret;
 
+		ctdb_set_process_name("ctdb_notification");
 		debug_extra = talloc_asprintf(NULL, "notification-%s:", event);
 		ret = ctdb_run_notification_script_child(ctdb, event);
 		if (ret != 0) {
@@ -112,7 +113,7 @@ static void ctdb_health_callback(struct ctdb_context *ctdb, int status, void *p)
 	uint32_t next_interval;
 	int ret;
 	TDB_DATA rddata;
-	struct takeover_run_reply rd;
+	struct srvid_request rd;
 	const char *state_str = NULL;
 
 	c.pnn = ctdb->pnn;
@@ -204,7 +205,7 @@ static void ctdb_startup_callback(struct ctdb_context *ctdb, int status, void *p
 		DEBUG(DEBUG_ERR,("startup event failed\n"));
 	} else if (status == 0) {
 		DEBUG(DEBUG_NOTICE,("startup event OK - enabling monitoring\n"));
-		ctdb->done_startup = true;
+		ctdb_set_runstate(ctdb, CTDB_RUNSTATE_RUNNING);
 		ctdb->monitor->next_interval = 2;
 		ctdb_run_notification_script(ctdb, "startup");
 	}
@@ -294,20 +295,12 @@ static void ctdb_wait_until_recovered(struct event_context *ev, struct timed_eve
 		DEBUG(DEBUG_ALERT,(__location__
 				  "ctdb_recheck_persistent_health() failed (%llu times) - prepare shutdown\n",
 				  (unsigned long long)ctdb->db_persistent_check_errors));
-		ctdb_stop_recoverd(ctdb);
-		ctdb_stop_keepalive(ctdb);
-		ctdb_stop_monitoring(ctdb);
-		ctdb_release_all_ips(ctdb);
-		if (ctdb->methods != NULL) {
-			ctdb->methods->shutdown(ctdb);
-		}
-		ctdb_event_script(ctdb, CTDB_EVENT_SHUTDOWN);
-		DEBUG(DEBUG_ALERT,("ctdb_recheck_persistent_health() failed - Stopping CTDB daemon\n"));
-		exit(11);
+		ctdb_shutdown_sequence(ctdb, 11);
+		/* In case above returns due to duplicate shutdown */
+		return;
 	}
 	ctdb->db_persistent_check_errors = 0;
 
-	DEBUG(DEBUG_NOTICE,(__location__ " Recoveries finished. Running the \"startup\" event.\n"));
 	event_add_timed(ctdb->ev, ctdb->monitor->monitor_context,
 			     timeval_current(),
 			     ctdb_check_health, ctdb);
@@ -323,15 +316,25 @@ static void ctdb_check_health(struct event_context *ev, struct timed_event *te,
 	struct ctdb_context *ctdb = talloc_get_type(private_data, struct ctdb_context);
 	int ret = 0;
 
+	if (ctdb->runstate < CTDB_RUNSTATE_STARTUP) {
+		DEBUG(DEBUG_NOTICE,("Not yet in startup runstate. Wait one more second\n"));
+		event_add_timed(ctdb->ev, ctdb->monitor->monitor_context,
+				timeval_current_ofs(1, 0), 
+				ctdb_check_health, ctdb);
+		return;
+	}
+	
 	if (ctdb->recovery_mode != CTDB_RECOVERY_NORMAL ||
-	    (ctdb->monitor->monitoring_mode == CTDB_MONITORING_DISABLED && ctdb->done_startup)) {
+	    (ctdb->monitor->monitoring_mode == CTDB_MONITORING_DISABLED &&
+	     ctdb->runstate == CTDB_RUNSTATE_RUNNING)) {
 		event_add_timed(ctdb->ev, ctdb->monitor->monitor_context,
 				timeval_current_ofs(ctdb->monitor->next_interval, 0), 
 				ctdb_check_health, ctdb);
 		return;
 	}
 	
-	if (!ctdb->done_startup) {
+	if (ctdb->runstate == CTDB_RUNSTATE_STARTUP) {
+		DEBUG(DEBUG_NOTICE,("Recoveries finished. Running the \"startup\" event.\n"));
 		ret = ctdb_event_script_callback(ctdb, 
 						 ctdb->monitor->monitor_context, ctdb_startup_callback, 
 						 ctdb, false,
@@ -477,7 +480,7 @@ int32_t ctdb_control_modflags(struct ctdb_context *ctdb, TDB_DATA indata)
 
 	DEBUG(DEBUG_INFO, ("Control modflags on node %u - flags now 0x%x\n", c->pnn, node->flags));
 
-	if (node->flags == 0 && !ctdb->done_startup) {
+	if (node->flags == 0 && ctdb->runstate <= CTDB_RUNSTATE_STARTUP) {
 		DEBUG(DEBUG_ERR, (__location__ " Node %u became healthy - force recovery for startup\n",
 				  c->pnn));
 		ctdb->recovery_mode = CTDB_RECOVERY_ACTIVE;
@@ -489,7 +492,7 @@ int32_t ctdb_control_modflags(struct ctdb_context *ctdb, TDB_DATA indata)
 
 	/* if we have become banned, we should go into recovery mode */
 	if ((node->flags & NODE_FLAGS_BANNED) && !(c->old_flags & NODE_FLAGS_BANNED) && (node->pnn == ctdb->pnn)) {
-		return ctdb_local_node_got_banned(ctdb);
+		ctdb_local_node_got_banned(ctdb);
 	}
 	
 	return 0;

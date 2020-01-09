@@ -115,6 +115,17 @@ setup_generic ()
     rm -f "$FAKE_IP_STATE"/*/*
     rm -f "$FAKE_IP_STATE"/* 2>/dev/null || true
     rmdir "$FAKE_IP_STATE"/* 2>/dev/null || true
+
+
+    export CTDB_DBDIR="${EVENTSCRIPTS_TESTS_VAR_DIR}/db"
+    mkdir -p "${CTDB_DBDIR}/persistent"
+
+    export FAKE_TDBTOOL_SUPPORTS_CHECK="yes"
+    export FAKE_TDB_IS_OK
+    export FAKE_DATE_OUTPUT
+
+    export FAKE_NETSTAT_TCP_ESTABLISHED FAKE_TCP_LISTEN FAKE_NETSTAT_UNIX_LISTEN
+    export FAKE_NETSTAT_TCP_ESTABLISHED_FILE=$(mktemp --tmpdir="$EVENTSCRIPTS_TESTS_VAR_DIR")
 }
 
 tcp_port_down ()
@@ -275,9 +286,10 @@ setup_ctdb ()
     export FAKE_CTDB_PNN="${2:-0}"
     echo "Setting up CTDB with PNN ${FAKE_CTDB_PNN}"
 
+    export CTDB_PUBLIC_ADDRESSES="${CTDB_BASE}/public_addresses"
     if [ -n "$3" ] ; then
 	echo "Setting up CTDB_PUBLIC_ADDRESSES: $3"
-	export CTDB_PUBLIC_ADDRESSES=$(mktemp)
+	CTDB_PUBLIC_ADDRESSES=$(mktemp)
 	for _i in $3 ; do
 	    _ip="${_i%@*}"
 	    _ifaces="${_i#*@}"
@@ -295,6 +307,53 @@ setup_ctdb ()
     export FAKE_CTDB_SCRIPTSTATUS="$FAKE_CTDB_STATE/scriptstatus"
     mkdir -p "$FAKE_CTDB_SCRIPTSTATUS"
     rm -f "$FAKE_CTDB_SCRIPTSTATUS"/*
+
+    export CTDB_PARTIALLY_ONLINE_INTERFACES
+}
+
+setup_memcheck ()
+{
+    setup_ctdb
+
+    _swap_total="5857276"
+
+    if [ "$1" = "bad" ] ; then
+	_swap_free="   4352"
+	_mem_cached=" 112"
+	_mem_free=" 468"
+    else
+	_swap_free="$_swap_total"
+	_mem_cached="1112"
+	_mem_free="1468"
+    fi
+
+    export FAKE_PROC_MEMINFO="\
+MemTotal:        3940712 kB
+MemFree:          225268 kB
+Buffers:          146120 kB
+Cached:          1139348 kB
+SwapCached:        56016 kB
+Active:          2422104 kB
+Inactive:        1019928 kB
+Active(anon):    1917580 kB
+Inactive(anon):   523080 kB
+Active(file):     504524 kB
+Inactive(file):   496848 kB
+Unevictable:        4844 kB
+Mlocked:            4844 kB
+SwapTotal:       ${_swap_total} kB
+SwapFree:        ${_swap_free} kB
+..."
+
+    export FAKE_FREE_M="\
+             total       used       free     shared    buffers     cached
+Mem:          3848       3634        213          0        142       ${_mem_cached}
+-/+ buffers/cache:       2379       ${_mem_free}
+Swap:         5719        246       5473"
+
+    export CTDB_MONITOR_FREE_MEMORY
+    export CTDB_MONITOR_FREE_MEMORY_WARN
+    export CTDB_CHECK_SWAP_IS_NOT_USED
 }
 
 ctdb_get_interfaces ()
@@ -368,6 +427,8 @@ ctdb_fake_scriptstatus ()
 
 setup_ctdb_policy_routing ()
 {
+    service_name="per_ip_routing"
+
     export CTDB_PER_IP_ROUTING_CONF="$CTDB_BASE/policy_routing"
     export CTDB_PER_IP_ROUTING_RULE_PREF=100
     export CTDB_PER_IP_ROUTING_TABLE_ID_LOW=1000
@@ -455,11 +516,13 @@ setup_samba ()
 {
     setup_ctdb
 
+    service_name="samba"
+
     if [ "$1" != "down" ] ; then
 
 	debug "Marking Samba services as up, listening and managed by CTDB"
         # Get into known state.
-	eventscript_call ctdb_service_managed "samba"
+	eventscript_call ctdb_service_managed
 
         # All possible service names for all known distros.
 	for i in "smb" "nmb" "samba" ; do
@@ -479,7 +542,7 @@ setup_samba ()
     else
 	debug "Marking Samba services as down, not listening and not managed by CTDB"
         # Get into known state.
-	eventscript_call ctdb_service_unmanaged "samba"
+	eventscript_call ctdb_service_unmanaged
 
         # All possible service names for all known distros.
 	for i in "smb" "nmb" "samba" ; do
@@ -503,11 +566,13 @@ setup_winbind ()
 {
     setup_ctdb
 
+    service_name="winbind"
+
     if [ "$1" != "down" ] ; then
 
 	debug "Marking Winbind service as up and managed by CTDB"
         # Get into known state.
-	eventscript_call ctdb_service_managed "winbind"
+	eventscript_call ctdb_service_managed
 
 	service "winbind" force-started
 
@@ -518,7 +583,7 @@ setup_winbind ()
     else
 	debug "Marking Winbind service as down and not managed by CTDB"
         # Get into known state.
-	eventscript_call ctdb_service_unmanaged "winbind"
+	eventscript_call ctdb_service_unmanaged
 
 	service "winbind" force-stopped
 
@@ -543,30 +608,22 @@ setup_nfs ()
 {
     setup_ctdb
 
+    service_name="nfs"
+
     export FAKE_RPCINFO_SERVICES=""
 
     export CTDB_NFS_SKIP_SHARE_CHECK="no"
-    export CTDB_NFS_SKIP_KNFSD_ALIVE_CHECK="no"
+
+    export CTDB_MONITOR_NFS_THREAD_COUNT RPCNFSDCOUNT FAKE_NFSD_THREAD_PIDS
+    export CTDB_NFS_DUMP_STUCK_THREADS
 
     # Reset the failcounts for nfs services.
     eventscript_call eval rm -f '$ctdb_fail_dir/nfs_*'
 
-    rpc_fail_limits_file="${EVENTSCRIPTS_TESTS_VAR_DIR}/rpc_fail_limits"
-
-    # Force this file to exist so tests can be individually run.
-    if [ ! -f "$rpc_fail_limits_file" ] ; then
-	# This is gross... but is needed to fake through the nfs monitor event.
-	eventscript_call ctdb_service_managed "nfs"
-	service "nfs" force-started  # might not be enough
-	CTDB_RC_LOCAL="$CTDB_BASE/rc.local.nfs.monitor.get-limits" \
-	    CTDB_MANAGES_NFS="yes" \
-	    "${CTDB_BASE}/events.d/60.nfs" "monitor" >"$rpc_fail_limits_file"
-    fi
-    
     if [ "$1" != "down" ] ; then
 	debug "Setting up NFS environment: all RPC services up, NFS managed by CTDB"
 
-	eventscript_call ctdb_service_managed "nfs"
+	eventscript_call ctdb_service_managed
 	service "nfs" force-started  # might not be enough
 
 	export CTDB_MANAGED_SERVICES="foo nfs bar"
@@ -575,13 +632,27 @@ setup_nfs ()
     else
 	debug "Setting up NFS environment: all RPC services down, NFS not managed by CTDB"
 
-	eventscript_call ctdb_service_unmanaged "nfs"
+	eventscript_call ctdb_service_unmanaged
 	service "nfs" force-stopped  # might not be enough
 	eventscript_call startstop_nfs stop
 
 	export CTDB_MANAGED_SERVICES="foo bar"
 	unset CTDB_MANAGES_NFS
     fi
+}
+
+setup_nfs_ganesha ()
+{
+    setup_nfs "$@"
+    export CTDB_NFS_SERVER_MODE="ganesha"
+    if [ "$1" != "down" ] ; then
+	export CTDB_MANAGES_NFS="yes"
+    fi
+
+    # We do not support testing the Ganesha-nfsd-specific part of the
+    # eventscript.
+    export CTDB_SKIP_GANESHA_NFSD_CHECK="yes"
+    export CTDB_NFS_SKIP_SHARE_CHECK="yes"
 }
 
 rpc_services_down ()
@@ -640,33 +711,26 @@ rpc_set_service_failure_response ()
     # Default
     ok_null
 
-    _ts=$(sed -n -e "s@^${_progname} @@p" "$rpc_fail_limits_file")
+    _file=$(ls "${CTDB_BASE}/nfs-rpc-checks.d/"[0-9][0-9]."${_progname}.check")
+    [ -r "$_file" ] || die "RPC check file \"$_file\" does not exist or is not unique"
 
-    while [ -n "$_ts" ] ; do
-	# Get the triple: operator, fail limit and actions.
-	_op="${_ts%% *}" ; _ts="${_ts#* }"
-	_li="${_ts%% *}" ; _ts="${_ts#* }"
-	# We've lost some of the quoting but we can simulate
-	# because we know an operator is always the first in a
-	# triple.
-  	_actions=""
-	while [ -n "$_ts" ] ; do
-	    # If this is an operator then we've got all of the
-	    # actions.
-	    case "$_ts" in
-		-*) break ;;
-	    esac
+    while read _op _li _actions ; do
+	# Skip comments
+	case "$_op" in
+	    \#*) continue ;;
+	esac
 
-	    _actions="${_actions}${_actions:+ }${_ts%% *}"
-	    # Special case for end of list.
-	    if [ "$_ts" != "${_ts#* }" ] ; then
-		_ts="${_ts#* }"
-	    else
-		_ts=""
+	_hit=false
+	if [ "$_op" != "%" ] ; then
+	    if [ $_numfails $_op $_li ] ; then
+		_hit=true
 	    fi
-	done
-
-	if [ "$_numfails" "$_op" "$_li" ] ; then
+	else
+	    if [ $(($_numfails $_op $_li)) -eq 0 ] ; then
+		_hit=true
+	    fi
+	fi
+	if $_hit ; then
 	    _out=""
 	    _rc=0
 	    for _action in $_actions ; do
@@ -675,7 +739,7 @@ rpc_set_service_failure_response ()
 			_ver=1
 			_pn="$_progname"
 			case "$_progname" in
-			    knfsd) _ver=3 ; _pn="nfs" ;;
+			    nfsd) _ver=3 ; _pn="nfs" ;;
 			    lockd) _ver=4 ; _pn="nlockmgr" ;;
 			    statd) _pn="status" ;;
 			esac
@@ -684,35 +748,38 @@ ERROR: $_pn failed RPC check:
 rpcinfo: RPC: Program not registered
 program $_pn version $_ver is not available"
 			;;
-		    restart|restart:*)
-			_opts=""
+		    restart*)
 			_p="rpc.${_progname}"
-			case "$_progname" in
-			    statd)
-				_opts="${STATD_HOSTNAME:+ -n }${STATD_HOSTNAME}"
-				;;
+			case "$_action" in
+			    *:b) _bg="&" ;;
+			    *)   _bg=""  ;;
 			esac
-			case "${_progname}${_action#restart}" in
-			    knfsd)
+			case "$_progname" in
+			    nfsd)
 				_t="\
-Trying to restart NFS service
-Starting nfslock: OK
-Starting nfs: OK"
+Trying to restart NFS service"
+
+				if [ -n "$CTDB_NFS_DUMP_STUCK_THREADS" ] ; then
+				    for _pid in $FAKE_NFSD_THREAD_PIDS ; do
+					_t="\
+$_t
+${_bg}Stack trace for stuck nfsd thread [${_pid}]:
+${_bg}[<ffffffff87654321>] fake_stack_trace_for_pid_${_pid}/stack+0x0/0xff"
+				    done
+				fi
+
+				_t="\
+${_t}
+${_bg}Starting nfslock: OK
+${_bg}Starting nfs: OK"
 				;;
-			    knfsd:bs)
-				_t="Trying to restart NFS service"
-				;;
-			    lockd|lockd:b)
+			    lockd)
 				_t="\
 Trying to restart lock manager service
-Stopping nfslock: OK
-Starting nfslock: OK"
-				;;
-			    lockd:*)
-				_t="Trying to restart lock manager service"
+${_bg}Starting nfslock: OK"
 				;;
 			    *)
-				_t="Trying to restart $_progname [${_p}${_opts}]"
+				_t="Trying to restart $_progname [${_p}]"
 			esac
 			_out="${_out}${_out:+${_nl}}${_t}"
 			;;
@@ -723,7 +790,7 @@ Starting nfslock: OK"
 	    required_result $_rc "$_out"
 	    return
 	fi
-    done
+    done <"$_file"
 }
 
 ######################################################################
@@ -732,12 +799,14 @@ Starting nfslock: OK"
 
 setup_vsftpd ()
 {
+    service_name="vsftpd"
+
     if [ "$1" != "down" ] ; then
 	die "setup_vsftpd up not implemented!!!"
     else
 	debug "Setting up VSFTPD environment: service down, not managed by CTDB"
 
-	eventscript_call ctdb_service_unmanaged vsftpd
+	eventscript_call ctdb_service_unmanaged
 	service vsftpd force-stopped
 
 	export CTDB_MANAGED_SERVICES="foo"
@@ -756,14 +825,37 @@ setup_httpd ()
     else
 	debug "Setting up HTTPD environment: service down, not managed by CTDB"
 
-	for i in "apache2" "httpd" ; do
-	    eventscript_call ctdb_service_unmanaged "$i"
-	    service "$i" force-stopped
+	for service_name in "apache2" "httpd" ; do
+	    eventscript_call ctdb_service_unmanaged
+	    service "$service_name" force-stopped
 	done
 
 	export CTDB_MANAGED_SERVICES="foo"
 	unset CTDB_MANAGES_HTTPD
     fi
+}
+
+######################################################################
+
+# multipathd fakery
+
+setup_multipathd ()
+{
+    for i ; do
+	case "$i" in
+	    \!*)
+		_t="${i#!}"
+		echo "Marking ${_t} as having no active paths"
+		FAKE_MULTIPATH_FAILURES="${FAKE_MULTIPATH_FAILURES}${FAKE_MULTIPATH+FAILURES:+ }${_t}"
+		;;
+	    *)
+		_t="$i"		
+	esac
+	CTDB_MONITOR_MPDEVICES="${CTDB_MONITOR_MPDEVICES}${CTDB_MONITOR_MPDEVICES:+ }${_t}"
+    done
+
+    export CTDB_MONITOR_MPDEVICES FAKE_MULTIPATH_FAILURES
+    export FAKE_SLEEP_FORCE=0.1
 }
 
 ######################################################################
@@ -810,11 +902,6 @@ EOF
 
 # Any args are passed to the eventscript.
 
-# Eventscript tracing can be done by setting:
-#   EVENTSCRIPTS_TESTS_TRACE="sh -x"
-
-# or similar.  This will almost certainly make a test fail but is
-# useful for debugging.
 simple_test ()
 {
     [ -n "$event" ] || die 'simple_test: $event not set'
@@ -822,11 +909,13 @@ simple_test ()
     _extra_header=$(_extra_header)
 
     echo "Running eventscript \"$script $event${1:+ }$*\""
-    _trace=""
+    _shell=""
     if $TEST_COMMAND_TRACE ; then
-	_trace="sh -x"
+	_shell="sh -x"
+    else
+	_shell="sh"
     fi
-    _out=$($_trace "${CTDB_BASE}/events.d/$script" "$event" "$@" 2>&1)
+    _out=$($_shell "${CTDB_BASE}/events.d/$script" "$event" "$@" 2>&1)
 
     result_check "$_extra_header"
 }
@@ -919,7 +1008,13 @@ iterate_test ()
 	    shift 2
 	fi
 
-	_out=$($EVENTSCRIPTS_TESTS_TRACE "${CTDB_BASE}/events.d/$script" "$event" $args 2>&1)
+	_shell=""
+	if $TEST_COMMAND_TRACE ; then
+	    _shell="sh -x"
+	else
+	    _shell="sh"
+	fi
+	_out=$($_shell "${CTDB_BASE}/events.d/$script" "$event" $args 2>&1)
 	_rc=$?
 
     if [ -n "$OUT_FILTER" ] ; then

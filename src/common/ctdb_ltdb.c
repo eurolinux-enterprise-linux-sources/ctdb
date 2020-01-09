@@ -19,7 +19,7 @@
 */
 
 #include "includes.h"
-#include "lib/tdb/include/tdb.h"
+#include "tdb.h"
 #include "system/network.h"
 #include "system/filesys.h"
 #include "../include/ctdb_private.h"
@@ -66,7 +66,6 @@ static void ltdb_initial_header(struct ctdb_db_context *ctdb_db,
 	/* initial dmaster is the lmaster */
 	header->dmaster = ctdb_lmaster(ctdb_db->ctdb, &key);
 	header->flags = CTDB_REC_FLAG_AUTOMATIC;
-	header->laccessor = header->dmaster;
 }
 
 
@@ -98,7 +97,12 @@ int ctdb_ltdb_fetch(struct ctdb_db_context *ctdb_db,
 		if (data) {
 			*data = d2;
 		}
-		ctdb_ltdb_store(ctdb_db, key, header, d2);
+		if (ctdb_db->persistent || header->dmaster == ctdb_db->ctdb->pnn) {
+			if (ctdb_ltdb_store(ctdb_db, key, header, d2) != 0) {
+				DEBUG(DEBUG_NOTICE,
+				      (__location__ "failed to store initial header\n"));
+			}
+		}
 		return 0;
 	}
 

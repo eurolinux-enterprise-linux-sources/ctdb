@@ -21,7 +21,7 @@
 #define _CTDBD_TEST_C
 
 #include "includes.h"
-#include "lib/tdb/include/tdb.h"
+#include "tdb.h"
 #include "ctdb_private.h"
 
 /*
@@ -30,8 +30,6 @@
  */
 int script_log_level;
 bool fast_start;
-void ctdb_load_nodes_file(struct ctdb_context *ctdb) {}
-
 
 /* UTIL_OBJ */
 #include "lib/util/idtree.c"

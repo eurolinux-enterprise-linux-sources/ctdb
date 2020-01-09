@@ -18,7 +18,7 @@
 */
 
 #include "includes.h"
-#include "lib/tdb/include/tdb.h"
+#include "tdb.h"
 #include "system/network.h"
 #include "system/filesys.h"
 #include "system/dir.h"
@@ -82,7 +82,7 @@ static int ctdb_ltdb_store_server(struct ctdb_db_context *ctdb_db,
 	 */
 	if (data.dsize != 0) {
 		keep = true;
-	} else if (header->flags & (CTDB_REC_RO_HAVE_DELEGATIONS|CTDB_REC_RO_HAVE_READONLY|CTDB_REC_RO_REVOKING_READONLY|CTDB_REC_RO_REVOKE_COMPLETE)) {
+	} else if (header->flags & CTDB_REC_RO_FLAGS) {
 		keep = true;
 	} else if (ctdb_db->persistent) {
 		keep = true;
@@ -125,12 +125,15 @@ static int ctdb_ltdb_store_server(struct ctdb_db_context *ctdb_db,
 	}
 
 	if (keep) {
-		if ((data.dsize == 0) &&
-		    !ctdb_db->persistent &&
+		if (!ctdb_db->persistent &&
 		    (ctdb_db->ctdb->pnn == header->dmaster) &&
-		    !(header->flags & (CTDB_REC_RO_HAVE_DELEGATIONS|CTDB_REC_RO_HAVE_READONLY|CTDB_REC_RO_REVOKING_READONLY|CTDB_REC_RO_REVOKE_COMPLETE)))
+		    !(header->flags & CTDB_REC_RO_FLAGS))
 		{
-			schedule_for_deletion = true;
+			header->rsn++;
+
+			if (data.dsize == 0) {
+				schedule_for_deletion = true;
+			}
 		}
 		remove_from_delete_queue = !schedule_for_deletion;
 	}
@@ -653,7 +656,7 @@ int32_t ctdb_control_db_set_healthy(struct ctdb_context *ctdb, TDB_DATA indata)
 		return -1;
 	}
 
-	if (may_recover && !ctdb->done_startup) {
+	if (may_recover && ctdb->runstate == CTDB_RUNSTATE_STARTUP) {
 		DEBUG(DEBUG_ERR, (__location__ " db %s become healthy  - force recovery for startup\n",
 				  ctdb_db->db_name));
 		ctdb->recovery_mode = CTDB_RECOVERY_ACTIVE;
@@ -703,7 +706,7 @@ int ctdb_set_db_readonly(struct ctdb_context *ctdb, struct ctdb_db_context *ctdb
 	}
 
 	if (ctdb_db->persistent) {
-		DEBUG(DEBUG_ERR,("Trying to set persistent database with readonly property\n"));
+		DEBUG(DEBUG_ERR,("Persistent databases do not support readonly property\n"));
 		return -1;
 	}
 
@@ -725,6 +728,9 @@ int ctdb_set_db_readonly(struct ctdb_context *ctdb, struct ctdb_db_context *ctdb
 	DEBUG(DEBUG_NOTICE,("OPENED tracking database : '%s'\n", ropath));
 
 	ctdb_db->readonly = true;
+
+	DEBUG(DEBUG_NOTICE, ("Readonly property set on DB %s\n", ctdb_db->db_name));
+
 	talloc_free(ropath);
 	return 0;
 }
@@ -791,7 +797,7 @@ static int ctdb_local_attach(struct ctdb_context *ctdb, const char *db_name,
 		if (ctdb->max_persistent_check_errors > 0) {
 			remaining_tries = 1;
 		}
-		if (ctdb->done_startup) {
+		if (ctdb->runstate == CTDB_RUNSTATE_RUNNING) {
 			remaining_tries = 0;
 		}
 
@@ -990,8 +996,9 @@ again:
 	}
 
 
-	DEBUG(DEBUG_INFO,("Attached to database '%s'\n", ctdb_db->db_path));
-	
+	DEBUG(DEBUG_NOTICE,("Attached to database '%s' with flags 0x%x\n",
+			    ctdb_db->db_path, tdb_flags));
+
 	/* success */
 	return 0;
 }
@@ -1079,13 +1086,13 @@ int32_t ctdb_control_db_attach(struct ctdb_context *ctdb, TDB_DATA indata,
 		   databases
 		*/
 		if (node->flags & NODE_FLAGS_INACTIVE) {
-			DEBUG(DEBUG_ERR,("DB Attach to database %s refused since node is inactive (disconnected or banned)\n", db_name));
+			DEBUG(DEBUG_ERR,("DB Attach to database %s refused since node is inactive (flags=0x%x)\n", db_name, node->flags));
 			return -1;
 		}
 
-		if (ctdb->recovery_mode == CTDB_RECOVERY_ACTIVE
-		 && client->pid != ctdb->recoverd_pid
-		 && !ctdb->done_startup) {
+		if (ctdb->recovery_mode == CTDB_RECOVERY_ACTIVE &&
+		    client->pid != ctdb->recoverd_pid &&
+		    ctdb->runstate < CTDB_RUNSTATE_RUNNING) {
 			struct ctdb_deferred_attach_context *da_ctx = talloc(client, struct ctdb_deferred_attach_context);
 
 			if (da_ctx == NULL) {
@@ -1180,7 +1187,10 @@ static int ctdb_attach_persistent(struct ctdb_context *ctdb,
 		int invalid_name = 0;
 		
 		s = talloc_strdup(ctdb, de->d_name);
-		CTDB_NO_MEMORY(ctdb, s);
+		if (s == NULL) {
+			closedir(d);
+			CTDB_NO_MEMORY(ctdb, s);
+		}
 
 		/* only accept names ending in .tdb */
 		p = strstr(s, ".tdb.");
@@ -1224,40 +1234,6 @@ int ctdb_attach_databases(struct ctdb_context *ctdb)
 	char *persistent_health_path = NULL;
 	char *unhealthy_reason = NULL;
 	bool first_try = true;
-
-	if (ctdb->db_directory == NULL) {
-		ctdb->db_directory = VARDIR "/ctdb";
-	}
-	if (ctdb->db_directory_persistent == NULL) {
-		ctdb->db_directory_persistent = VARDIR "/ctdb/persistent";
-	}
-	if (ctdb->db_directory_state == NULL) {
-		ctdb->db_directory_state = VARDIR "/ctdb/state";
-	}
-
-	/* make sure the db directory exists */
-	ret = mkdir(ctdb->db_directory, 0700);
-	if (ret == -1 && errno != EEXIST) {
-		DEBUG(DEBUG_CRIT,(__location__ " Unable to create ctdb directory '%s'\n",
-			 ctdb->db_directory));
-		return -1;
-	}
-
-	/* make sure the persistent db directory exists */
-	ret = mkdir(ctdb->db_directory_persistent, 0700);
-	if (ret == -1 && errno != EEXIST) {
-		DEBUG(DEBUG_CRIT,(__location__ " Unable to create ctdb persistent directory '%s'\n",
-			 ctdb->db_directory_persistent));
-		return -1;
-	}
-
-	/* make sure the internal state db directory exists */
-	ret = mkdir(ctdb->db_directory_state, 0700);
-	if (ret == -1 && errno != EEXIST) {
-		DEBUG(DEBUG_CRIT,(__location__ " Unable to create ctdb state directory '%s'\n",
-			 ctdb->db_directory_state));
-		return -1;
-	}
 
 	persistent_health_path = talloc_asprintf(ctdb, "%s/%s.%u",
 						 ctdb->db_directory_state,
@@ -1474,9 +1450,6 @@ int32_t ctdb_control_set_db_priority(struct ctdb_context *ctdb, TDB_DATA indata)
 
 int ctdb_set_db_sticky(struct ctdb_context *ctdb, struct ctdb_db_context *ctdb_db)
 {
-
-	DEBUG(DEBUG_NOTICE,("set db sticky %s\n", ctdb_db->db_name));
-
 	if (ctdb_db->sticky) {
 		return 0;
 	}
@@ -1490,6 +1463,8 @@ int ctdb_set_db_sticky(struct ctdb_context *ctdb, struct ctdb_db_context *ctdb_d
 
 	ctdb_db->sticky = true;
 
+	DEBUG(DEBUG_NOTICE,("set db sticky %s\n", ctdb_db->db_name));
+
 	return 0;
 }
 
@@ -1498,7 +1473,7 @@ int32_t ctdb_control_get_db_statistics(struct ctdb_context *ctdb,
 				TDB_DATA *outdata)
 {
 	struct ctdb_db_context *ctdb_db;
-	struct ctdb_db_statistics_wire *stats;
+	struct ctdb_db_statistics *stats;
 	int i;
 	int len;
 	char *ptr;
@@ -1509,33 +1484,25 @@ int32_t ctdb_control_get_db_statistics(struct ctdb_context *ctdb,
 		return -1;
 	}
 
-	len = offsetof(struct ctdb_db_statistics_wire, hot_keys);
+	len = offsetof(struct ctdb_db_statistics, hot_keys_wire);
 	for (i = 0; i < MAX_HOT_KEYS; i++) {
-		len += 8 + ctdb_db->statistics.hot_keys[i].key.dsize;
+		len += ctdb_db->statistics.hot_keys[i].key.dsize;
 	}
 
 	stats = talloc_size(outdata, len);
 	if (stats == NULL) {
-		DEBUG(DEBUG_ERR,("Failed to allocate db statistics wire structure\n"));
+		DEBUG(DEBUG_ERR,("Failed to allocate db statistics structure\n"));
 		return -1;
 	}
 
-	stats->db_ro_delegations = ctdb_db->statistics.db_ro_delegations;
-	stats->db_ro_revokes     = ctdb_db->statistics.db_ro_revokes;
-	for (i = 0; i < MAX_COUNT_BUCKETS; i++) {
-		stats->hop_count_bucket[i] = ctdb_db->statistics.hop_count_bucket[i];
-	}
+	*stats = ctdb_db->statistics;
+
 	stats->num_hot_keys = MAX_HOT_KEYS;
 
-	ptr = &stats->hot_keys[0];
+	ptr = &stats->hot_keys_wire[0];
 	for (i = 0; i < MAX_HOT_KEYS; i++) {
-		*(uint32_t *)ptr = ctdb_db->statistics.hot_keys[i].count;
-		ptr += 4;
-
-		*(uint32_t *)ptr = ctdb_db->statistics.hot_keys[i].key.dsize;
-		ptr += 4;
-
-		memcpy(ptr, ctdb_db->statistics.hot_keys[i].key.dptr, ctdb_db->statistics.hot_keys[i].key.dsize);
+		memcpy(ptr, ctdb_db->statistics.hot_keys[i].key.dptr,
+		       ctdb_db->statistics.hot_keys[i].key.dsize);
 		ptr += ctdb_db->statistics.hot_keys[i].key.dsize;
 	}
 

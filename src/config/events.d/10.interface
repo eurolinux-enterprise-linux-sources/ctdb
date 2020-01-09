@@ -44,9 +44,9 @@ get_all_interfaces ()
     [ "$CTDB_PUBLIC_INTERFACE" ] && all_interfaces="$CTDB_PUBLIC_INTERFACE $all_interfaces"
     [ "$CTDB_NATGW_PUBLIC_IFACE" ] && all_interfaces="$CTDB_NATGW_PUBLIC_IFACE $all_interfaces"
 
-    # Get the configured interfaces for each IP.  That is, for all but
-    # the 1st line, get the last field with commas changed to spaces.
-    ctdb_ifaces=$(ctdb -Y ip -v | sed -e '1d' -e 's/:$//' -e 's/^.*://' -e 's/,/ /g')
+    # Get the interfaces for which CTDB has public IPs configured.
+    # That is, for all but the 1st line, get the 1st field.
+    ctdb_ifaces=$(ctdb -Y ifaces | sed -e '1d' -e 's@^:@@' -e 's@:.*@@')
 
     # Add $ctdb_interfaces and uniquify
     all_interfaces=$(echo $all_interfaces $ctdb_ifaces | tr ' ' '\n' | sort -u)
@@ -65,8 +65,9 @@ monitor_interfaces()
 	# problem with an interface then set fail=true and continue.
 	for iface in $all_interfaces ; do
 
-	    ip addr show $iface 2>/dev/null >/dev/null || {
-		echo "WARNING: Interface $iface does not exist but it is used by public addresses."
+	    ip link show $iface 2>/dev/null >/dev/null || {
+		echo "ERROR: Interface $iface does not exist but it is used by public addresses."
+		mark_down $iface
 		continue
 	    }
 
@@ -259,17 +260,6 @@ case "$1" in
 
 	tickle_tcp_connections $ip
 
-	;;
-
-
-     ###########################################
-     # called when ctdbd has finished a recovery
-     recovered)
-	;;
-
-     ####################################
-     # called when ctdbd is shutting down
-     shutdown)
 	;;
 
      monitor)

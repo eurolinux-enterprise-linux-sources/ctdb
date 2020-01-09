@@ -8,8 +8,8 @@ Options:
   -s		Print a summary of tests results after running all tests
   -l		Use local daemons for integration tests
   -e		Exit on the first test failure
-  -V <dir>	Use <dir> as $TEST_VAR_DIR
-  -C		Clean up - kill daemons and remove $TEST_VAR_DIR when done
+  -V <dir>	Use <dir> as TEST_VAR_DIR
+  -C		Clean up - kill daemons and remove TEST_VAR_DIR when done
   -v		Verbose - print test output for non-failures (only some tests)
   -A		Use "cat -A" to print test output (only some tests)
   -D		Show diff between failed/expected test output (some tests only)
@@ -140,8 +140,26 @@ tests_passed=0
 tests_failed=0
 summary=""
 
-rows=$(if tty -s ; then stty size ; else echo x 80 ; fi | sed -e 's@.* @@' -e 's@^0$@80@')
-ww=$((rows - 7))
+if ! which mktemp >/dev/null 2>&1 ; then
+    # Not perfect, but it will do...
+    mktemp ()
+    {
+	_dir=false
+	if [ "$1" = "-d" ] ; then
+	    _dir=true
+	fi
+	_t="${TMPDIR:-/tmp}/tmp.$$.$RANDOM"
+	(
+	    umask 077
+	    if $_dir ; then
+		mkdir "$_t"
+	    else
+		>"$_t"
+	    fi
+	)
+	echo "$_t"
+    }
+fi
 
 tf=$(mktemp)
 sf=$(mktemp)
@@ -157,13 +175,16 @@ run_one_test ()
 
     ctdb_test_run "$_f" | tee "$tf" | show_progress
     status=$?
+    if [ $status -eq 0 ] ; then
+	tests_passed=$(($tests_passed + 1))
+    else
+	tests_failed=$(($tests_failed + 1))
+    fi
     if $with_summary ; then
 	if [ $status -eq 0 ] ; then
-	    tests_passed=$(($tests_passed + 1))
 	    _t=" PASSED "
 	else
 	    _t="*FAILED*"
-	    tests_failed=$(($tests_failed + 1))
 	fi
 	if $with_desc ; then
 	    desc=$(tail -n +4 $tf | head -n 1)
@@ -243,10 +264,10 @@ else
     echo "Not cleaning up TEST_VAR_DIR=$TEST_VAR_DIR"
 fi
 
-if [ $tests_failed -gt 0 ] ; then
-    if $no_header || $exit_on_fail ; then
-	exit $status
-    else
-	exit 1
-    fi
+if $no_header || $exit_on_fail ; then
+    exit $status
+elif [ $tests_failed -gt 0 ] ; then
+    exit 1
+else
+    exit 0
 fi
