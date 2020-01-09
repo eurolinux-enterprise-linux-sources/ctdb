@@ -1,0 +1,156 @@
+From f2ed3abd1e5759680f917605f5d4152f1888a276 Mon Sep 17 00:00:00 2001
+From: Sumit Bose <sbose@redhat.com>
+Date: Thu, 13 Oct 2016 10:58:58 +0200
+Subject: [PATCH 2/2] ctdb-common: Use documented names for protocol family in
+ socket()
+
+Instead of using PF_*, use AF_*.
+
+https://bugzilla.samba.org/show_bug.cgi?id=11705
+
+Signed-off-by: Amitay Isaacs <amitay@gmail.com>
+Reviewed-by: Volker Lendecke <vl@samba.org>
+(cherry picked from Samba commit 9f94620a308a3b17c1886c2c4807b34b8d5edacb)
+---
+ common/system_freebsd.c   | 2 +-
+ common/system_gnu.c       | 2 +-
+ common/system_kfreebsd.c  | 2 +-
+ common/system_linux.c     | 8 ++++----
+ tools/ctdb.c              | 4 ++--
+ utils/smnotify/smnotify.c | 6 +++---
+ 6 files changed, 12 insertions(+), 12 deletions(-)
+
+diff --git a/common/system_freebsd.c b/common/system_freebsd.c
+index d026864..02f7cce 100644
+--- a/common/system_freebsd.c
++++ b/common/system_freebsd.c
+@@ -208,7 +208,7 @@ int ctdb_sys_send_tcp(const ctdb_sock_addr *dest,
+ 		ip6pkt.tcp.th_win   = htons(1234);
+ 		ip6pkt.tcp.th_sum   = tcp_checksum6((uint16_t *)&ip6pkt.tcp, sizeof(ip6pkt.tcp), &ip6pkt.ip6);
+ 
+-		s = socket(PF_INET6, SOCK_RAW, IPPROTO_RAW);
++		s = socket(AF_INET6, SOCK_RAW, IPPROTO_RAW);
+ 		if (s == -1) {
+ 			DEBUG(DEBUG_CRIT, (__location__ " Failed to open sending socket\n"));
+ 			return -1;
+diff --git a/common/system_gnu.c b/common/system_gnu.c
+index 8f776c6..1e0ae4c 100644
+--- a/common/system_gnu.c
++++ b/common/system_gnu.c
+@@ -203,7 +203,7 @@ int ctdb_sys_send_tcp(const ctdb_sock_addr *dest,
+ 		ip6pkt.tcp.window   = htons(1234);
+ 		ip6pkt.tcp.check    = tcp_checksum6((uint16_t *)&ip6pkt.tcp, sizeof(ip6pkt.tcp), &ip6pkt.ip6);
+ 
+-		s = socket(PF_INET6, SOCK_RAW, IPPROTO_RAW);
++		s = socket(AF_INET6, SOCK_RAW, IPPROTO_RAW);
+ 		if (s == -1) {
+ 			DEBUG(DEBUG_CRIT, (__location__ " Failed to open sending socket\n"));
+ 			return -1;
+diff --git a/common/system_kfreebsd.c b/common/system_kfreebsd.c
+index 7d9182c..7cb6d92 100644
+--- a/common/system_kfreebsd.c
++++ b/common/system_kfreebsd.c
+@@ -203,7 +203,7 @@ int ctdb_sys_send_tcp(const ctdb_sock_addr *dest,
+ 		ip6pkt.tcp.window   = htons(1234);
+ 		ip6pkt.tcp.check    = tcp_checksum6((uint16_t *)&ip6pkt.tcp, sizeof(ip6pkt.tcp), &ip6pkt.ip6);
+ 
+-		s = socket(PF_INET6, SOCK_RAW, IPPROTO_RAW);
++		s = socket(AF_INET6, SOCK_RAW, IPPROTO_RAW);
+ 		if (s == -1) {
+ 			DEBUG(DEBUG_CRIT, (__location__ " Failed to open sending socket\n"));
+ 			return -1;
+diff --git a/common/system_linux.c b/common/system_linux.c
+index 11966f2..660c870 100644
+--- a/common/system_linux.c
++++ b/common/system_linux.c
+@@ -88,7 +88,7 @@ int ctdb_sys_send_arp(const ctdb_sock_addr *addr, const char *iface)
+ 
+ 	switch (addr->ip.sin_family) {
+ 	case AF_INET:
+-		s = socket(PF_PACKET, SOCK_RAW, ETHERTYPE_ARP);
++		s = socket(AF_PACKET, SOCK_RAW, ETHERTYPE_ARP);
+ 		if (s == -1){
+ 			DEBUG(DEBUG_CRIT,(__location__ " failed to open raw socket\n"));
+ 			return -1;
+@@ -182,7 +182,7 @@ int ctdb_sys_send_arp(const ctdb_sock_addr *addr, const char *iface)
+ 		close(s);
+ 		break;
+ 	case AF_INET6:
+-		s = socket(PF_PACKET, SOCK_RAW, ETHERTYPE_ARP);
++		s = socket(AF_PACKET, SOCK_RAW, ETHERTYPE_ARP);
+ 		if (s == -1){
+ 			DEBUG(DEBUG_CRIT,(__location__ " failed to open raw socket\n"));
+ 			return -1;
+@@ -387,7 +387,7 @@ int ctdb_sys_send_tcp(const ctdb_sock_addr *dest,
+ 		ip6pkt.tcp.window   = htons(1234);
+ 		ip6pkt.tcp.check    = tcp_checksum6((uint16_t *)&ip6pkt.tcp, sizeof(ip6pkt.tcp), &ip6pkt.ip6);
+ 
+-		s = socket(PF_INET6, SOCK_RAW, IPPROTO_RAW);
++		s = socket(AF_INET6, SOCK_RAW, IPPROTO_RAW);
+ 		if (s == -1) {
+ 			DEBUG(DEBUG_CRIT, (__location__ " Failed to open sending socket\n"));
+ 			return -1;
+@@ -549,7 +549,7 @@ bool ctdb_sys_check_iface_exists(const char *iface)
+ 	int s;
+ 	struct ifreq ifr;
+ 
+-	s = socket(PF_PACKET, SOCK_RAW, 0);
++	s = socket(AF_PACKET, SOCK_RAW, 0);
+ 	if (s == -1){
+ 		/* We dont know if the interface exists, so assume yes */
+ 		DEBUG(DEBUG_CRIT,(__location__ " failed to open raw socket\n"));
+diff --git a/tools/ctdb.c b/tools/ctdb.c
+index 7b046c4..70ef667 100644
+--- a/tools/ctdb.c
++++ b/tools/ctdb.c
+@@ -4445,7 +4445,7 @@ static int control_chktcpport(struct ctdb_context *ctdb, int argc, const char **
+ 
+ 	port = atoi(argv[0]);
+ 
+-	s = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP);
++	s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+ 	if (s == -1) {
+ 		printf("Failed to open local socket\n");
+ 		return errno;
+@@ -4457,7 +4457,7 @@ static int control_chktcpport(struct ctdb_context *ctdb, int argc, const char **
+ 	}
+ 
+ 	bzero(&sin, sizeof(sin));
+-	sin.sin_family = PF_INET;
++	sin.sin_family = AF_INET;
+ 	sin.sin_port   = htons(port);
+ 	ret = bind(s, (struct sockaddr *)&sin, sizeof(sin));
+ 	close(s);
+diff --git a/utils/smnotify/smnotify.c b/utils/smnotify/smnotify.c
+index d7fd546..d5c5a4c 100644
+--- a/utils/smnotify/smnotify.c
++++ b/utils/smnotify/smnotify.c
+@@ -43,14 +43,14 @@ static int create_socket(const char *addr, int port)
+ 	int s;
+         struct sockaddr_in sock_in;
+ 
+-	s = socket(PF_INET, SOCK_DGRAM, IPPROTO_UDP);
++	s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+ 	if (s == -1) {
+ 		printf("Failed to open local socket\n");
+ 		exit(10);
+ 	}
+ 
+ 	bzero(&sock_in, sizeof(sock_in));
+-	sock_in.sin_family = PF_INET;
++	sock_in.sin_family = AF_INET;
+ 	sock_in.sin_port   = htons(port);
+ 	inet_aton(addr, &sock_in.sin_addr);
+ 	if (bind(s, (struct sockaddr *)&sock_in, sizeof(sock_in)) == -1) {
+@@ -124,7 +124,7 @@ int main(int argc, const char *argv[])
+ 
+ 	/* Setup a sockaddr_in for the client we want to notify */
+ 	bzero(&sock_cl, sizeof(sock_cl));
+-	sock_cl.sin_family = PF_INET;
++	sock_cl.sin_family = AF_INET;
+ 	sock_cl.sin_port   = htons(clientport);
+ 	inet_aton(client, &sock_cl.sin_addr);
+ 
+-- 
+2.7.4
+

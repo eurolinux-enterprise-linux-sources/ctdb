@@ -6,12 +6,15 @@
 Summary: A Clustered Database based on Samba's Trivial Database (TDB)
 Name: ctdb
 Version: 2.5.1
-Release: 1%{?dist}
+Release: 2%{?dist}
 License: GPLv3+
 Group: System Environment/Daemons
 URL: http://ctdb.samba.org/
 
 Source0: https://ftp.samba.org/pub/ctdb/%{name}-%{version}.tar.gz
+
+Patch1: 0001-ctdb-common-Protocol-argument-must-be-in-host-order-.patch
+Patch2: 0002-ctdb-common-Use-documented-names-for-protocol-family.patch
 
 Requires: chkconfig coreutils psmisc
 Requires: fileutils sed
@@ -90,6 +93,9 @@ and use CTDB instead.
 %setup -q
 # setup the init script and sysconfig file
 %setup -T -D -n ctdb-%{version} -q
+%patch1 -p1 -b .host_order
+%patch2 -p1 -b .use_AF
+
 
 %build
 
@@ -258,6 +264,9 @@ fi
 %doc tests/README
 
 %changelog
+* Thu Oct 13 2016 Sumit Bose <sbose@redhat.com> - 2.5.1-2
+ - Resolves: rhbz#1370367
+
 * Fri May 23 2014 Sumit Bose <sbose@redhat.com> - 2.5.1-1
  - Update to ctdb version 2.5.1
  - Resolves: rhbz#1061630
