@@ -1,0 +1,134 @@
+#!/bin/sh
+############################
+# main event script for ctdb
+#
+# This script is called with one of the following sets of arguments
+#     startup    : called when ctdb starts
+#     shutdown   : called when ctdb shuts down
+#     takeip     : called when an IP address is taken over
+#     releaseip  : called when an IP address is released
+#     recovered  : called when ctdb has finished a recovery event
+
+[ -n "$CTDB_BASE" ] || \
+    export CTDB_BASE=$(cd -P $(dirname "$0") ; dirname "$PWD")
+
+. $CTDB_BASE/functions
+loadconfig
+
+ctdb_setup_service_state_dir "ctdb"
+
+#
+update_config_from_tdb() {
+
+    # Pull optional ctdb configuration data out of config.tdb
+    _key="public_addresses:node#$(ctdb -t 1 xpnn|sed -e 's/.*://')"
+    _t="$service_state_dir/public_addresses"
+    rm -f "$_t"
+
+    if ctdb pfetch config.tdb "$_key" "$_t" 2>/dev/null && \
+	[ -s "$_t" -a -n "$CTDB_PUBLIC_ADDRESSES"] && \
+	! cmp -s "$_t" "$CTDB_PUBLIC_ADDRESSES" ; then
+
+	echo "CTDB public address configuration has changed."
+	echo "Extracting new configuration from database."
+	diff "$_t" "$CTDB_PUBLIC_ADDRESSES"
+	cp "$_t" "$CTDB_PUBLIC_ADDRESSES"
+	echo "Restarting CTDB"
+	service ctdb restart &
+    fi
+}
+
+set_ctdb_variables () {
+    # set any tunables from the config file
+    set | grep ^CTDB_SET_ | cut -d_ -f3- | 
+    while read v; do
+	varname=`echo $v | cut -d= -f1`
+	value=`echo $v | cut -d= -f2`
+	ctdb setvar $varname $value || return 1
+	echo "Set $varname to $value"
+    done
+}
+
+wait_until_ready () {
+    _timeout="${1:-10}" # default is 10 seconds
+
+    _count=0
+    while ! ctdb ping >/dev/null 2>&1 ; do
+	if [ $_count -ge $_timeout ] ; then
+	    return 1
+	fi
+	sleep 1
+	_count=$(($_count + 1))
+    done
+}
+
+ctdb_check_args "$@"
+
+case "$1" in 
+     init)
+        # make sure we have a blank state directory for the scripts to work with
+	rm -rf $CTDB_VARDIR/state
+	# Look at the pattern - this should not be -rf!!!
+	rm -f $ctdb_managed_dir/*
+	mkdir -p $CTDB_VARDIR/state || {
+	    ret=$?
+	    echo "mkdir -p $CTDB_VARDIR/state - failed - $ret"
+	    exit $ret
+	}
+	;;
+
+     setup)
+        # Make sure CTDB daemon is ready to process requests
+	wait_until_ready || die "CTDB did not become ready for setup"
+	# Set any tunables from the config file
+	set_ctdb_variables || die "Failed to set CTDB tunables"
+	;;
+
+    startup)
+	update_config_from_tdb &
+	;;
+    monitor)
+	# Inherit the debug level from ctdbd on each monitor run.  If
+	# there's a more urgent need then override CTDB_CURRENT_DEBUGLEVEL
+	# using a file in $CTDB_BASE/rc.local.d/.
+        ctdb_set_current_debuglevel create
+
+	# We should never enter swap, so SwapTotal == SwapFree.
+	[ "$CTDB_CHECK_SWAP_IS_NOT_USED" = "yes" ] && {
+	    if [ -n "`grep '^Swap\(Total\|Free\)' /proc/meminfo | uniq -s 10 -u`" ]; then
+		echo We are swapping:
+		cat /proc/meminfo
+		ps auxfww
+	    fi
+	}
+
+	# warn when we get low on memory
+	[ -z "$CTDB_MONITOR_FREE_MEMORY_WARN" ] || {
+		FREE_MEM=`free -m | grep "buffers/cache" | while read A B C D ;do echo -n $D ; done`
+		[ `expr "$FREE_MEM" "<" "$CTDB_MONITOR_FREE_MEMORY_WARN"` != "0" ] && {
+			echo "Running low on memory. Free:$FREE_MEM while CTDB treshold is $CTDB_MONITOR_FREE_MEMORY_WARN"
+		}
+	}
+
+	# monitor that we are not running out of memory
+	[ -z "$CTDB_MONITOR_FREE_MEMORY" ] || {
+		FREE_MEM=`free -m | grep "buffers/cache" | while read A B C D ;do echo -n $D ; done`
+		[ `expr "$FREE_MEM" "<" "$CTDB_MONITOR_FREE_MEMORY"` != "0" ] && {
+			echo "OOM. Free:$FREE_MEM while CTDB treshold is $CTDB_MONITOR_FREE_MEMORY"
+			cat /proc/meminfo
+			ps auxfww
+			echo m > /proc/sysrq-trigger
+			ctdb disable
+			sleep 3
+			ctdb shutdown
+		}
+	}
+	;;
+
+    *)
+	ctdb_standard_event_handler "$@"
+	;;
+esac
+
+# all OK
+exit 0

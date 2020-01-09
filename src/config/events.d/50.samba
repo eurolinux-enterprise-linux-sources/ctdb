@@ -1,0 +1,223 @@
+#!/bin/sh
+# ctdb event script for Samba
+
+[ -n "$CTDB_BASE" ] || \
+    export CTDB_BASE=$(cd -P $(dirname "$0") ; dirname "$PWD")
+
+. $CTDB_BASE/functions
+
+detect_init_style
+
+case $CTDB_INIT_STYLE in
+	suse)
+		CTDB_SERVICE_SMB=${CTDB_SERVICE_SMB:-smb}
+		CTDB_SERVICE_NMB=${CTDB_SERVICE_NMB:-nmb}
+		;;
+	debian)
+		CTDB_SERVICE_SMB=${CTDB_SERVICE_SMB:-samba}
+		CTDB_SERVICE_NMB=${CTDB_SERVICE_NMB:-""}
+		;;
+	*)
+		# Use redhat style as default:
+		CTDB_SERVICE_SMB=${CTDB_SERVICE_SMB:-smb}
+		CTDB_SERVICE_NMB=${CTDB_SERVICE_NMB:-""}
+		;;
+esac
+
+service_name="samba"
+
+loadconfig
+
+ctdb_setup_service_state_dir
+
+service_start ()
+{
+    # make sure samba is not already started
+    service "$CTDB_SERVICE_SMB" stop > /dev/null 2>&1
+    if [ -n "$CTDB_SERVICE_NMB" ] ; then
+	service "$CTDB_SERVICE_NMB" stop > /dev/null 2>&1
+    fi
+    killall -0 -q smbd && {
+	sleep 1
+	# make absolutely sure samba is dead
+	killall -q -9 smbd
+    }
+    killall -0 -q nmbd && {
+	sleep 1
+	# make absolutely sure samba is dead
+	killall -q -9 nmbd
+    }
+
+    # start Samba service. Start it reniced, as under very heavy load
+    # the number of smbd processes will mean that it leaves few cycles
+    # for anything else
+    net serverid wipe
+
+    if [ -n "$CTDB_SERVICE_NMB" ] ; then
+	nice_service "$CTDB_SERVICE_NMB" start || die "Failed to start nmbd"
+    fi
+
+    nice_service "$CTDB_SERVICE_SMB" start || die "Failed to start samba"
+}
+
+service_stop ()
+{
+    service "$CTDB_SERVICE_SMB" stop
+    if [ -n "$CTDB_SERVICE_NMB" ] ; then
+	service "$CTDB_SERVICE_NMB" stop
+    fi
+}
+
+# set default samba cleanup period - in minutes
+[ -z "$SAMBA_CLEANUP_PERIOD" ] && {
+    SAMBA_CLEANUP_PERIOD=10
+}
+
+# we keep a cached copy of smb.conf here
+smbconf_cache="$service_state_dir/smb.conf.cache"
+
+
+#############################################
+# update the smb.conf cache in the foreground
+testparm_foreground_update() {
+    testparm -s 2> /dev/null | egrep -v 'registry.shares.=|include.=' > "$smbconf_cache"
+}
+
+#############################################
+# update the smb.conf cache in the background
+testparm_background_update() {
+    # if the cache doesn't exist, then update in the foreground
+    [ -f $smbconf_cache ] || {
+	testparm_foreground_update
+    }
+    # otherwise do a background update
+    (
+	tmpfile="${smbconf_cache}.$$"
+	testparm -s > $tmpfile 2> /dev/null &
+	# remember the pid of the teamparm process
+	pid="$!"
+	# give it 10 seconds to run
+	timeleft=10
+	while [ $timeleft -gt 0 ]; do
+	    timeleft=$(($timeleft - 1))
+	    # see if the process still exists
+	    kill -0 $pid > /dev/null 2>&1 || {
+		# it doesn't exist, grab its exit status
+		wait $pid
+		[ $? = 0 ] || {
+		    echo "50.samba: smb.conf background update exited with status $?"
+		    rm -f "${tmpfile}"
+		    exit 1
+		}		
+		# put the new smb.conf contents in the cache (atomic rename)
+		# make sure we remove references to the registry while doing 
+		# this to ensure that running testparm on the cache does
+		# not use the registry
+		egrep -v 'registry.shares.=|include.=' < "$tmpfile" > "${tmpfile}.2"
+		rm -f "$tmpfile"
+		mv -f "${tmpfile}.2" "$smbconf_cache" || {
+		    echo "50.samba: failed to update background cache"
+		    rm -f "${tmpfile}.2"
+		    exit 1
+		}
+		exit 0
+	    }
+	    # keep waiting for testparm to finish
+	    sleep 1
+	done
+	# it took more than 10 seconds - kill it off
+	rm -f "${tmpfile}"
+	kill -9 "$pid" > /dev/null 2>&1
+	echo "50.samba: timed out updating smbconf cache in background"
+	exit 1
+    ) &
+}
+
+##################################################
+# show the testparm output using a cached smb.conf 
+# to avoid registry access
+testparm_cat() {
+    [ -f $smbconf_cache ] || {
+	testparm_foreground_update
+    }
+    testparm -v -s "$smbconf_cache" "$@" 2>/dev/null
+}
+
+list_samba_shares ()
+{
+    testparm_cat |
+    sed -n -e 's@^[[:space:]]*path[[:space:]]*=[[:space:]]@@p' |
+    sed -e 's/"//g'
+}
+
+
+###########################
+# periodic cleanup function
+periodic_cleanup() {
+    # running smbstatus scrubs any dead entries from the connections
+    # and sessionid database
+    # echo "Running periodic cleanup of samba databases"
+    smbstatus -np > /dev/null 2>&1 &
+}
+
+###########################
+
+ctdb_start_stop_service
+
+is_ctdb_managed_service || exit 0
+
+ctdb_service_check_reconfigure
+
+###########################
+
+case "$1" in 
+     startup)
+	ctdb_service_start
+	;;
+	
+     shutdown)
+	ctdb_service_stop
+	;;
+
+     monitor)
+	# Create a dummy file to track when we need to do periodic cleanup
+	# of samba databases
+	periodic_cleanup_file="$service_state_dir/periodic_cleanup"
+	[ -f "$periodic_cleanup_file" ] || {
+		touch "$periodic_cleanup_file"
+	}
+	[ `find "$periodic_cleanup_file" -mmin +$SAMBA_CLEANUP_PERIOD | wc -l` -eq 1 ] && {
+		# Cleanup the databases
+	    	periodic_cleanup
+		touch "$periodic_cleanup_file"
+	}
+
+	if [ "$CTDB_SAMBA_SKIP_SHARE_CHECK" != "yes" ] ; then
+	    testparm_background_update
+
+	    testparm_cat | egrep '^WARNING|^ERROR|^Unknown' && {
+		testparm_foreground_update
+		testparm_cat | egrep '^WARNING|^ERROR|^Unknown' && \
+		    die "ERROR: testparm shows smb.conf is not clean"
+	    }
+			
+	    list_samba_shares | ctdb_check_directories_probe || {
+		testparm_foreground_update
+		list_samba_shares |
+		ctdb_check_directories
+	    } || exit $?
+	fi
+
+	smb_ports="$CTDB_SAMBA_CHECK_PORTS"
+	if [ -z "$smb_ports" ] ; then
+	    smb_ports=`testparm_cat --parameter-name="smb ports"`
+	fi
+	ctdb_check_tcp_ports $smb_ports || exit $?
+	;;
+
+    *)
+	ctdb_standard_event_handler "$@"
+	;;
+esac
+
+exit 0

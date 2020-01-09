@@ -1,0 +1,26 @@
+From ccaaefc992543d37655867aea644d8d54dae26b6 Mon Sep 17 00:00:00 2001
+From: Sumit Bose <sbose@redhat.com>
+Date: Mon, 25 Mar 2013 12:28:31 +0100
+Subject: [PATCH] Fix for tevent autoconf check
+
+The list of include files is the 4th argument of AC_CHECK_DECL.
+---
+ lib/tevent/libtevent.m4 | 2 +-
+ 1 Datei geändert, 1 Zeile hinzugefügt(+), 1 Zeile entfernt(-)
+
+diff --git a/lib/tevent/libtevent.m4 b/lib/tevent/libtevent.m4
+index 2141af6..fc06a9d 100644
+--- a/lib/tevent/libtevent.m4
++++ b/lib/tevent/libtevent.m4
+@@ -11,7 +11,7 @@ AC_SUBST(TEVENT_CFLAGS)
+ if test x"$INCLUDED_TEVENT" != x"yes" ; then
+     AC_CHECK_HEADERS(tevent.h)
+     AC_CHECK_LIB(tevent, tevent_context_init, [ TEVENT_LIBS="-ltevent" ])
+-    AC_CHECK_DECLS([TEVENT_TRACE_BEFORE_WAIT], [[#include <tevent.h>]])
++    AC_CHECK_DECLS([TEVENT_TRACE_BEFORE_WAIT],,, [[#include <tevent.h>]])
+     if test x"$ac_cv_header_tevent_h" = x"no" -o \
+ 	x"$ac_cv_lib_tevent_tevent_context_init" = x"no" -o \
+ 	x"$ac_cv_have_decl_TEVENT_TRACE_BEFORE_WAIT" = x"no" ; then
+-- 
+1.7.11.7
+

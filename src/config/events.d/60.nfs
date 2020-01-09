@@ -1,0 +1,131 @@
+#!/bin/sh
+# script to manage nfs in a clustered environment
+
+[ -n "$CTDB_BASE" ] || \
+    export CTDB_BASE=$(cd -P $(dirname "$0") ; dirname "$PWD")
+
+. $CTDB_BASE/functions
+
+service_name="nfs"
+service_start ()
+{
+    startstop_nfs stop
+    startstop_nfs start
+    set_proc "sys/net/ipv4/tcp_tw_recycle" 1
+}
+service_stop ()
+{
+    startstop_nfs stop
+}
+service_reconfigure ()
+{
+    # if the ips have been reallocated, we must restart the lockmanager
+    # across all nodes and ping all statd listeners
+    [ -x $CTDB_BASE/statd-callout ] && {
+	$CTDB_BASE/statd-callout notify &
+    } >/dev/null 2>&1
+}
+
+loadconfig
+
+[ "$NFS_SERVER_MODE" != "ganesha" ] || exit 0
+
+ctdb_setup_service_state_dir
+
+statd_update_trigger="$service_state_dir/update-trigger"
+# We want this file to always exist.  The corner case is when
+# auto-start/stop is switched off, NFS is added as a managed service
+# some time after ctdbd is started and someone else starts the NFS
+# service for us.  In this case this file might not otherwise exist
+# when we get to a monitor event.
+touch "$statd_update_trigger"
+
+ctdb_start_stop_service
+
+is_ctdb_managed_service || exit 0
+
+ctdb_service_check_reconfigure
+
+case "$1" in 
+     init)
+	# read statd from persistent database
+	;;
+     startup)
+	ctdb_service_start
+	;;
+
+     shutdown)
+	ctdb_service_stop
+	;;
+
+     takeip)
+	ctdb_service_set_reconfigure
+	;;
+
+     releaseip)
+	ctdb_service_set_reconfigure
+	;;
+
+      monitor)
+	# Check that directories for shares actually exist.
+	[ "$CTDB_NFS_SKIP_SHARE_CHECK" = "yes" ] || {
+	    exportfs -v | grep '^/' | 
+	    sed -r -e 's@[[:space:]]+[^[:space:]()]+\([^[:space:]()]+\)$@@' | 
+	    sort -u | 
+	    ctdb_check_directories 
+	} || exit $?
+
+	update_tickles 2049
+
+	# check that statd responds to rpc requests
+	# if statd is not running we try to restart it
+	# we only do this IF we have a rpc.statd command.
+	# For platforms where rpc.statd does not exist, we skip
+	# the check completely
+        p="rpc.statd"
+        which $p >/dev/null 2>/dev/null && \
+	    nfs_check_rpc_service "statd" \
+	        -ge 6 "verbose unhealthy" \
+	        -eq 4 "verbose restart" \
+		-eq 2 "restart:bs"
+
+	# check that NFS responds to rpc requests
+	if [ "$CTDB_NFS_SKIP_KNFSD_ALIVE_CHECK" != "yes" ] ; then
+	    nfs_check_rpc_service "knfsd" \
+		-ge 6 "verbose unhealthy" \
+		-eq 4 "verbose restart" \
+		-eq 2 "restart:bs"
+	fi
+
+	# check that lockd responds to rpc requests
+	nfs_check_rpc_service "lockd" \
+	    -ge 15 "verbose restart:b unhealthy" \
+	    -eq 10 "restart:bs"
+
+	# mountd is sometimes not started correctly on RHEL5
+	nfs_check_rpc_service "mountd" \
+	    -ge 10 "verbose restart:b unhealthy" \
+	    -eq 5 "restart:b"
+
+	# rquotad is sometimes not started correctly on RHEL5
+	# not a critical service so we dont flag the node as unhealthy
+	nfs_check_rpc_service "rquotad" \
+	    -gt 0 "verbose restart:b"
+
+	# once every 600 seconds, update the statd state database for which
+	# clients need notifications
+	LAST_UPDATE=`stat --printf="%Y" "$statd_update_trigger"`
+	CURRENT_TIME=`date +"%s"`
+	[ $CURRENT_TIME -ge $(($LAST_UPDATE + 600)) ] && {
+	    touch "$statd_update_trigger"
+	    $CTDB_BASE/statd-callout updatelocal &
+	    $CTDB_BASE/statd-callout updateremote &
+	}
+       	;;
+
+    *)
+	ctdb_standard_event_handler "$@"
+	;;
+esac
+
+exit 0
