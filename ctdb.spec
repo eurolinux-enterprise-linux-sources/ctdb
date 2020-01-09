@@ -3,7 +3,7 @@
 Summary: A Clustered Database based on Samba's Trivial Database (TDB)
 Name: ctdb
 Version: 1.0.114.3
-Release: 3%{?dist}
+Release: 4%{?dist}
 License: GPLv3+
 Group: System Environment/Daemons
 URL: http://ctdb.samba.org/
@@ -24,7 +24,7 @@ Requires: chkconfig coreutils psmisc
 Requires: fileutils sed
 Requires: tdb-tools
 Requires(preun): chkconfig initscripts
-Requires(post): chkconfig
+Requires(post): chkconfig policycoreutils
 Requires(postun): initscripts
 
 BuildRoot: %(mktemp -ud %{_tmppath}/%{name}-%{version}-%{release}-XXXXXX)
@@ -100,6 +100,8 @@ rm -rf %{buildroot}
 
 %post
 /sbin/chkconfig --add ctdb
+/bin/mkdir -p /var/ctdb
+/sbin/restorecon -R /var/ctdb
 
 %preun
 if [ "$1" -eq "0" ] ; then
@@ -146,6 +148,10 @@ fi
 %{_libdir}/pkgconfig/ctdb.pc
 
 %changelog
+* Thu Mar 01 2012 Sumit Bose <sbose@redhat.com> - 1.0.114.3-4
+ - Resolves: rhbz#794888 - /var/ctdb gets created with incorrect selinux
+   context
+
 * Thu Sep 01 2011 Sumit Bose <sbose@redhat.com> - 1.0.114.3-3
  - Resolves: rhbz#727913 - Coverity scan revealed defects
 
